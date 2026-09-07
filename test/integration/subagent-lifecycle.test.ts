@@ -280,7 +280,7 @@ for (const backend of backends) {
 
     // ── Agent discovery ──
 
-    it("subagent discovers project-local test agents", async () => {
+    it("subagent discovers global test agents", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
       trackTempFile(env, markerFile);
@@ -301,7 +301,7 @@ for (const backend of backends) {
 
       startPi(surface, env.dir, task);
 
-      // The test-echo agent (discovered from project .pi/agents/) should work
+      // The test-echo agent from isolated global config should work
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
     });

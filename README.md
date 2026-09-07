@@ -38,7 +38,7 @@ PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:i
 
 The full suite launches real Pi sessions and can take several minutes. `PI_TEST_TIMEOUT` is the per-test timeout in milliseconds; use at least `180000` for the lifecycle suite.
 
-`PI_TEST_MODEL` is applied to both the parent Pi sessions and the project-local test subagents created by the harness.
+`PI_TEST_MODEL` is applied to both parent Pi sessions and test subagents created by the harness.
 
 ## Install
 
@@ -88,19 +88,9 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
 
-### Bundled Agents
+### Named Agents
 
-| Agent             | Default runtime       | Role                                                                                     |
-| ----------------- | --------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Config, then parent   | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Config, then parent   | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Config, then parent   | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Config, then parent   | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Config, then parent   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
-
-Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. For a named agent, callers should omit `model` and `thinking` so those configured defaults apply. Passing either field explicitly is a one-off override and takes precedence over agent frontmatter.
-
-Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location. The discovered names, descriptions, and runtime defaults are included in the subagent tool guidance so the orchestrator can select by role instead of treating one agent as a generic default.
+Named agents load only from `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). Agent names, descriptions, and runtime defaults are included in subagent tool guidance.
 
 ### Supported Harness CLIs
 
@@ -328,7 +318,7 @@ This always forks the current session into a subagent with full conversation con
 
 ## Custom Agents
 
-Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Keep the filename and frontmatter `name` aligned (for example, `researcher.md` must declare `name: researcher`) so discovery and direct invocation agree:
+Place a `.md` file in `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). Keep filename and frontmatter `name` aligned (for example, `researcher.md` must declare `name: researcher`) so discovery and direct invocation agree:
 
 ```markdown
 ---
@@ -365,8 +355,6 @@ You are a specialized agent that does X...
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
 ---
-
-Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
 
 ### `session-mode`
 

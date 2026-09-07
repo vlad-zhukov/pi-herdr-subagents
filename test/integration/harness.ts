@@ -132,6 +132,8 @@ export async function waitForFocusedSurface(
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
+  /** Isolated global Pi configuration directory. */
+  agentDir: string;
   /** Active mux backend for this test run */
   backend: MuxBackend;
   /** Dedicated workspace owned by this test environment. */
@@ -160,11 +162,12 @@ function createTestWorkspace(cwd: string): string {
 
 /**
  * Create an isolated test environment with test agent definitions.
- * The temp dir has `.pi/agents/` containing copies of all test agents.
+ * Isolated global config contains copies of all test agents.
  */
 export function createTestEnv(backend: MuxBackend): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
-  const agentsDir = join(dir, ".pi", "agents");
+  const agentDir = join(dir, "agent");
+  const agentsDir = join(agentDir, "agents");
   const previousWorkspaceId = process.env.HERDR_WORKSPACE_ID;
   if (!previousWorkspaceId) throw new Error("HERDR_WORKSPACE_ID is required for integration tests");
   const workspaceId = createTestWorkspace(dir);
@@ -173,7 +176,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   process.env.HERDR_WORKSPACE_ID = workspaceId;
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir and pin
+  // Copy test agent definitions into isolated global config and pin
   // every child subagent to the same model selected for the outer Pi sessions.
   // Without this rewrite, fixture frontmatter can silently bypass PI_TEST_MODEL.
   if (existsSync(TEST_AGENTS_SRC)) {
@@ -188,7 +191,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
     }
   }
 
-  return { dir, backend, workspaceId, previousWorkspaceId, surfaces: [], tempFiles: [] };
+  return { dir, agentDir, backend, workspaceId, previousWorkspaceId, surfaces: [], tempFiles: [] };
 }
 
 /**
@@ -260,6 +263,7 @@ export function startPi(
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
     `cd ${shellQuote(testDir)} &&`,
+    `PI_CODING_AGENT_DIR=${shellQuote(join(testDir, "agent"))}`,
     `pi`,
     `-ne`,
     `-e ${shellQuote(EXTENSION_SOURCE)}`,

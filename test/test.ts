@@ -969,10 +969,17 @@ describe("model configuration", () => {
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
-  it("loads session-mode from frontmatter", async () => {
+  it("ignores project-local agents", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "ignored-agent", "name: ignored-agent");
+      assert.equal(testApi.loadAgentDefaults("ignored-agent"), null);
+    });
+  });
+
+  it("loads session-mode from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "lineage-mode-test-agent",
         [
           "name: lineage-mode-test-agent",
@@ -988,9 +995,9 @@ describe("subagent discovery", () => {
   });
 
   it("loads explicit interactive flag from frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "interactive-true-test-agent",
         [
           "name: interactive-true-test-agent",
@@ -999,7 +1006,7 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "interactive-false-test-agent",
         [
           "name: interactive-false-test-agent",
@@ -1017,9 +1024,9 @@ describe("subagent discovery", () => {
   });
 
   it("leaves interactive undefined when not set in frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "interactive-unset-test-agent",
         [
           "name: interactive-unset-test-agent",
@@ -1122,34 +1129,10 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled agents inherit the parent runtime and preserve interaction modes", async () => {
-    await withIsolatedAgentEnv(() => {
-      const expectedInteraction = {
-        scout: false,
-        worker: false,
-        reviewer: false,
-        planner: true,
-        "visual-tester": false,
-      } as const;
-
-      for (const [name, interactive] of Object.entries(expectedInteraction)) {
-        const defs = testApi.loadAgentDefaults(name);
-        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-        assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
-        assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
-        assert.equal(
-          testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-          interactive,
-          `${name} should preserve its interaction mode`,
-        );
-      }
-    });
-  });
-
   it("ignores invalid session-mode values", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "invalid-mode-test-agent",
         [
           "name: invalid-mode-test-agent",
@@ -1252,9 +1235,9 @@ describe("subagent discovery", () => {
   });
 
   it("lists visible agents from discovery", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "visible-discovery-test-agent",
         [
           "name: visible-discovery-test-agent",
@@ -1278,9 +1261,9 @@ describe("subagent discovery", () => {
   });
 
   it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "hidden-discovery-test-agent",
         [
           "name: hidden-discovery-test-agent",
@@ -1311,28 +1294,18 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("lets a hidden project agent shadow a visible global agent", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+  it("keeps hidden global agents directly loadable", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
         globalAgentsDir,
         "shadowed-discovery-test-agent",
         [
           "name: shadowed-discovery-test-agent",
-          "description: Global visible agent",
+          "description: Hidden global agent",
           "model: anthropic/test-global",
-        ].join("\n"),
-        "You are the global visible agent.",
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "shadowed-discovery-test-agent",
-        [
-          "name: shadowed-discovery-test-agent",
-          "description: Project hidden agent",
-          "model: anthropic/test-project",
           "disable-model-invocation: true",
         ].join("\n"),
-        "You are the project hidden agent.",
+        "You are the hidden global agent.",
       );
 
       const { api, registeredTools } = createMockExtensionApi();
@@ -1348,17 +1321,17 @@ describe("subagent discovery", () => {
       assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
 
       const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
-      assert.ok(loaded, "expected project override to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-project");
-      assert.equal(loaded.body, "You are the project hidden agent.");
+      assert.ok(loaded, "expected hidden global agent to remain directly loadable");
+      assert.equal(loaded.model, "anthropic/test-global");
+      assert.equal(loaded.body, "You are the hidden global agent.");
       assert.equal(loaded.disableModelInvocation, true);
     });
   });
 
   it("resolves loadAgentDefaults by the frontmatter name the catalog advertises, not the filename", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "renamed-file-test-agent",
         [
           "name: aliased-test-agent",
@@ -1396,15 +1369,15 @@ describe("subagent discovery", () => {
   });
 
   it("discoverAgentDefinitions skips an unreadable entry instead of aborting discovery", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "readable-sibling-test-agent",
         ["name: readable-sibling-test-agent", "description: Should still be discovered"].join("\n"),
       );
       // A directory ending in .md passes the file filter but throws EISDIR on
       // read — previously this aborted discoverAgentDefinitions() entirely.
-      mkdirSync(join(projectAgentsDir, "broken-entry-test-agent.md"));
+      mkdirSync(join(globalAgentsDir, "broken-entry-test-agent.md"));
 
       const agents = testApi.discoverAgentDefinitions();
       assert.ok(
@@ -1415,9 +1388,9 @@ describe("subagent discovery", () => {
   });
 
   it("strips surrounding quotes from a quoted command: frontmatter value", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "quoted-command-test-agent",
         [
           "name: quoted-command-test-agent",
@@ -1431,9 +1404,9 @@ describe("subagent discovery", () => {
   });
 
   it("leaves an unquoted command: frontmatter value untouched", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
-        projectAgentsDir,
+        globalAgentsDir,
         "unquoted-command-test-agent",
         ["name: unquoted-command-test-agent", "command: aider --model {model} --message {task}"].join("\n"),
       );
@@ -1447,7 +1420,7 @@ describe("subagent discovery", () => {
     const agents = [
       {
         name: "config-override-test-agent",
-        source: "project" as const,
+        source: "global" as const,
         description: "Agent without a frontmatter model",
         disableModelInvocation: false,
       },
