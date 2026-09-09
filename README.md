@@ -346,7 +346,7 @@ You are a specialized agent that does X...
 | `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit the parent                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
-| `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
+| `session-mode` | string | Default child-session mode: `lineage-only` when omitted; `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
@@ -360,8 +360,8 @@ You are a specialized agent that does X...
 
 Choose how a subagent session starts:
 
-- `standalone` — default fresh session with no lineage link to the caller
-- `lineage-only` — fresh blank child session with `parentSession` linkage, but no copied turns from the caller
+- `standalone` — fresh session with no lineage link to the caller
+- `lineage-only` — default fresh blank child session with `parentSession` linkage, but no copied turns from the caller
 - `fork` — linked child session seeded with the caller's prior conversation context
 
 `lineage-only` is useful when you want session discovery and fork lineage UX to show the relationship later, but you do **not** want the child to inherit the parent's turns.

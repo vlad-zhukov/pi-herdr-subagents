@@ -1147,10 +1147,23 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("resolves session mode with fork override precedence", () => {
-    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
+  it("defaults missing session mode to lineage-only", () => {
+    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "lineage-only");
     assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
+      testApi.resolveEffectiveSessionMode(
+        { name: "A", task: "T" },
+        { sessionMode: "standalone" },
+      ),
+      "standalone",
+    );
+  });
+
+  it("resolves session mode with fork override precedence", () => {
+    assert.equal(
+      testApi.resolveEffectiveSessionMode(
+        { name: "A", task: "T" },
+        { sessionMode: "lineage-only" },
+      ),
       "lineage-only",
     );
     assert.equal(
@@ -1164,11 +1177,23 @@ describe("subagent discovery", () => {
 
   it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
     assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
-      sessionMode: "standalone",
-      seededSessionMode: null,
+      sessionMode: "lineage-only",
+      seededSessionMode: "lineage-only",
       inheritsConversationContext: false,
       taskDelivery: "artifact",
     });
+    assert.deepEqual(
+      testApi.resolveLaunchBehavior(
+        { name: "A", task: "T" },
+        { sessionMode: "standalone" },
+      ),
+      {
+        sessionMode: "standalone",
+        seededSessionMode: null,
+        inheritsConversationContext: false,
+        taskDelivery: "artifact",
+      },
+    );
     assert.deepEqual(
       testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
       {
