@@ -109,7 +109,8 @@ function buildSubagentRoutingGuidelines(
   return [
     "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
     "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over agent frontmatter.",
-    "For a bare spawn, omit model and thinking to inherit the parent runtime.",
+    "For an explicit bare fork, omit model and thinking to inherit the parent runtime.",
+    "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); otherwise omit it. Bare child spawns without agent are rejected unless fork: true is set.",
     "When an intentional runtime override is necessary, prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, and high+ for architecture, concurrency, security, or hard diagnosis.",
     "When overriding a subagent model, use an exact authenticated provider/model-id from the live catalog below. Do not invent aliases or fuzzy names.",
     agentCatalog ?? "Available named subagent catalog becomes available after session start.",
@@ -161,7 +162,7 @@ const SubagentParams = Type.Object({
   fork: Type.Optional(
     Type.Boolean({
       description:
-        "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+        "Use only when the user explicitly requests a current-session fork (for example /iterate). Force full-context fork mode, overriding any agent session-mode; bare child spawns without agent require fork: true. Omit for normal named-agent calls.",
     }),
   ),
   interactive: Type.Optional(
@@ -179,6 +180,13 @@ const SubagentParams = Type.Object({
 });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
+
+const BARE_SUBAGENT_FORK_ERROR =
+  "Bare subagents require fork: true. Use a named agent, or set fork: true only when the user explicitly requests a current-session fork.";
+
+function validateSubagentRequest(params: Pick<Static<typeof SubagentParams>, "agent" | "fork">): string | null {
+  return !params.agent?.trim() && params.fork !== true ? BARE_SUBAGENT_FORK_ERROR : null;
+}
 
 interface AgentDefaults {
   model?: string;
@@ -1067,6 +1075,7 @@ export const __test__ = {
   buildAvailableAgentCatalog,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
+  validateSubagentRequest,
   resolveEffectiveAutoExit,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
@@ -1482,6 +1491,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal herdr pane. " +
+        "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); do not choose it yourself. " +
+        "Bare child spawns without agent are rejected unless fork: true is set. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1489,6 +1500,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal herdr pane. " +
+        "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); do not choose it yourself. " +
+        "Bare child spawns without agent are rejected unless fork: true is set. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1498,6 +1511,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const validationError = validateSubagentRequest(params);
+        if (validationError) {
+          return {
+            content: [{ type: "text", text: validationError }],
+            details: { error: validationError },
+          };
+        }
+
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {

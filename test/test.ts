@@ -2139,6 +2139,36 @@ describe("tool registration", () => {
     assert.equal(denied.has("subagent_resume"), true);
   });
 
+  it("blocks bare spawns unless an explicit fork is requested", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagent = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagent);
+    assert.match(subagent.description, /fork: true only when the user explicitly requests/i);
+    assert.match(subagent.description, /bare child spawns without agent are rejected unless fork: true/i);
+
+    for (const params of [
+      { name: "Bare", task: "T" },
+      { name: "Bare", task: "T", fork: false },
+      { name: "Bare", task: "T", agent: " " },
+    ]) {
+      const result = await subagent.execute(
+        "test-call",
+        params,
+        new AbortController().signal,
+        undefined,
+        {},
+      );
+      assert.match(result.content[0].text, /bare subagents require fork: true/i);
+      assert.equal(result.details.error, result.content[0].text);
+    }
+
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(testApi.validateSubagentRequest({ agent: "worker" }), null);
+    assert.equal(testApi.validateSubagentRequest({ fork: true }), null);
+  });
+
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);

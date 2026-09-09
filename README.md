@@ -204,7 +204,7 @@ The copyable example is model-neutral, so it works without requiring credentials
 // Named agent with defaults from agent definition or config.json
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
-// Force a full-context fork for this spawn
+// Full-context fork only when user explicitly requests it (e.g. /iterate)
 subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." });
 
 // Agent defaults can choose a different session-mode via frontmatter
@@ -221,7 +221,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
-| `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
+| `fork`                 | boolean | `false`        | Use only for an explicitly requested current-session fork; overrides agent `session-mode`; bare calls without `agent` require `fork: true` |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | agent, configured, or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | agent or parent | Pi thinking level (`off` through `max`); resolution is tool argument → agent frontmatter → parent |
