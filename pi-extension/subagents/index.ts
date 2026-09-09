@@ -193,7 +193,6 @@ interface AgentDefaults {
   tools?: string;
   skills?: string;
   thinking?: string;
-  denyTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
@@ -226,30 +225,9 @@ const SPAWNING_TOOLS = new Set([
   "subagent_resume",
 ]);
 
-/**
- * Resolve the effective set of denied tool names from agent defaults.
- * Missing or false `spawning` expands to all SPAWNING_TOOLS.
- * `deny-tools` adds individual tool names on top.
- */
-function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
-  const denied = new Set<string>();
-
-  // Child sessions cannot spawn by default. `spawning: true` opts in.
-  if (!agentDefs || agentDefs.spawning !== true) {
-    for (const t of SPAWNING_TOOLS) denied.add(t);
-  }
-
-  // deny-tools: explicit list
-  if (agentDefs?.denyTools) {
-    for (const t of agentDefs.denyTools
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)) {
-      denied.add(t);
-    }
-  }
-
-  return denied;
+/** Child sessions may spawn only when explicitly enabled in agent frontmatter. */
+function resolveSpawning(agentDefs: AgentDefaults | null): boolean {
+  return agentDefs?.spawning === true;
 }
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
@@ -302,7 +280,6 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
-    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
@@ -1080,7 +1057,7 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   observeRunningSubagent,
-  resolveDenyTools,
+  resolveSpawning,
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
@@ -1199,7 +1176,7 @@ async function launchSubagent(
   const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
+  const spawning = resolveSpawning(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1223,7 +1200,7 @@ async function launchSubagent(
     effectiveInteractive,
     inheritsConversationContext,
     taskDelivery: launchBehavior.taskDelivery,
-    denySet,
+    spawning,
     identity,
     identityInSystemPrompt: Boolean(identityInSystemPrompt),
     systemPromptMode,
@@ -1473,15 +1450,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
   });
 
-  // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
-  const deniedTools = new Set(
-    (process.env.PI_SUBAGENT_ID ? process.env.PI_DENY_TOOLS ?? "" : "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-
-  const shouldRegister = (name: string) => !deniedTools.has(name);
+  // Base session retains all lifecycle tools. Child sessions opt in via spawning.
+  const spawningEnabled =
+    !process.env.PI_SUBAGENT_ID || process.env.PI_SUBAGENT_SPAWNING === "1";
+  const shouldRegister = (name: string) => spawningEnabled || !SPAWNING_TOOLS.has(name);
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))

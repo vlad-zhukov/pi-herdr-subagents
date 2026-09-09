@@ -47,7 +47,7 @@ export interface SubagentLaunchContext {
   effectiveInteractive: boolean;
   inheritsConversationContext: boolean;
   taskDelivery: "direct" | "artifact";
-  denySet?: Set<string>;
+  spawning: boolean;
   identity?: string | null;
   identityInSystemPrompt?: boolean;
   systemPromptMode?: string;

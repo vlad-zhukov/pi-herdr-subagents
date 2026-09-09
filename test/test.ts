@@ -70,16 +70,16 @@ import {
 // Tool-registration behavior is environment-sensitive for child subagents.
 // Isolate the unit suite from inherited parent/child capability variables.
 const inheritedSubagentId = process.env.PI_SUBAGENT_ID;
-const inheritedDenyTools = process.env.PI_DENY_TOOLS;
+const inheritedSpawning = process.env.PI_SUBAGENT_SPAWNING;
 before(() => {
   delete process.env.PI_SUBAGENT_ID;
-  delete process.env.PI_DENY_TOOLS;
+  delete process.env.PI_SUBAGENT_SPAWNING;
 });
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
-  if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
-  else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+  if (inheritedSpawning == null) delete process.env.PI_SUBAGENT_SPAWNING;
+  else process.env.PI_SUBAGENT_SPAWNING = inheritedSpawning;
 });
 
 // --- Helpers ---
@@ -991,6 +991,25 @@ describe("subagent discovery", () => {
       const loaded = testApi.loadAgentDefaults("lineage-mode-test-agent");
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.sessionMode, "lineage-only");
+    });
+  });
+
+  it("ignores removed deny-tools frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(
+        globalAgentsDir,
+        "removed-deny-tools-test-agent",
+        [
+          "name: removed-deny-tools-test-agent",
+          "spawning: true",
+          "deny-tools: subagent",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("removed-deny-tools-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal((loaded as any).denyTools, undefined);
+      assert.equal(testApi.resolveSpawning(loaded), true);
     });
   });
 
@@ -2114,31 +2133,59 @@ describe("tool registration", () => {
     assert.match(subagent.promptGuidelines.join("\n"), /inherit the parent runtime/);
   });
 
-  it("ignores an inherited deny list in a parent process", () => {
+  it("keeps lifecycle tools in the base process", () => {
     delete process.env.PI_SUBAGENT_ID;
-    process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt,subagent_resume,subagents_list";
+    process.env.PI_SUBAGENT_SPAWNING = "0";
     try {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
       assert.equal(registeredTools.some((tool) => tool.name === "subagent"), true);
       assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+      assert.equal(registeredTools.some((tool) => tool.name === "subagents_list"), true);
+      assert.equal(registeredTools.some((tool) => tool.name === "subagent_resume"), true);
     } finally {
-      delete process.env.PI_DENY_TOOLS;
+      delete process.env.PI_SUBAGENT_SPAWNING;
     }
   });
 
-  it("applies the deny list inside a child subagent process", () => {
+  it("gates all lifecycle tools in a child process with spawning", () => {
     process.env.PI_SUBAGENT_ID = "child-test";
-    process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt";
+    process.env.PI_SUBAGENT_SPAWNING = "0";
     try {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
-      assert.equal(registeredTools.some((tool) => tool.name === "subagent"), false);
-      assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), false);
-      assert.equal(registeredTools.some((tool) => tool.name === "subagents_list"), true);
+      for (const name of [
+        "subagent",
+        "subagent_interrupt",
+        "subagents_list",
+        "subagent_resume",
+      ]) {
+        assert.equal(registeredTools.some((tool) => tool.name === name), false);
+      }
+      assert.equal(registeredTools.some((tool) => tool.name === "set_tab_title"), true);
     } finally {
       delete process.env.PI_SUBAGENT_ID;
-      delete process.env.PI_DENY_TOOLS;
+      delete process.env.PI_SUBAGENT_SPAWNING;
+    }
+  });
+
+  it("allows all lifecycle tools in a child with spawning enabled", () => {
+    process.env.PI_SUBAGENT_ID = "child-test";
+    process.env.PI_SUBAGENT_SPAWNING = "1";
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      for (const name of [
+        "subagent",
+        "subagent_interrupt",
+        "subagents_list",
+        "subagent_resume",
+      ]) {
+        assert.equal(registeredTools.some((tool) => tool.name === name), true);
+      }
+    } finally {
+      delete process.env.PI_SUBAGENT_ID;
+      delete process.env.PI_SUBAGENT_SPAWNING;
     }
   });
 
@@ -2157,20 +2204,10 @@ describe("tool registration", () => {
 
   it("defaults child spawning off and allows explicit opt-in", () => {
     const testApi = (subagentsModule as any).__test__;
-    const spawningTools = [
-      "subagent",
-      "subagent_interrupt",
-      "subagents_list",
-      "subagent_resume",
-    ];
-
-    for (const agentDefs of [null, {}, { spawning: false }]) {
-      const denied = testApi.resolveDenyTools(agentDefs);
-      for (const tool of spawningTools) assert.equal(denied.has(tool), true);
-    }
-
-    const allowed = testApi.resolveDenyTools({ spawning: true });
-    for (const tool of spawningTools) assert.equal(allowed.has(tool), false);
+    assert.equal(testApi.resolveSpawning(null), false);
+    assert.equal(testApi.resolveSpawning({}), false);
+    assert.equal(testApi.resolveSpawning({ spawning: false }), false);
+    assert.equal(testApi.resolveSpawning({ spawning: true }), true);
   });
 
   it("blocks bare spawns unless an explicit fork is requested", async () => {

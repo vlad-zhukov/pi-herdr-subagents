@@ -44,6 +44,7 @@ function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): Su
     effectiveCwd: "/tmp/project",
     effectiveAutoExit: true,
     effectiveInteractive: false,
+    spawning: false,
     inheritsConversationContext: true,
     taskDelivery: "direct",
     subagentsDir: "/path/to/subagents",
@@ -134,7 +135,13 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
+    assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=0"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+  });
+
+  it("passes enabled spawning capability to child environment", () => {
+    const built = driver.buildCommand(createMockLaunchContext({ spawning: true }));
+    assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=1"));
   });
 });
 

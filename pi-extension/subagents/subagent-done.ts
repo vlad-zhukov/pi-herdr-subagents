@@ -75,22 +75,13 @@ export function buildCompletionSidecar(messages: any[] | undefined):
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
 }
 
-export function parseDeniedTools(rawValue: string | undefined): string[] {
-  return (rawValue ?? "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-}
-
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
-  let denied: string[] = [];
   let expanded = false;
 
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
-  const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
@@ -107,7 +98,6 @@ export default function (pi: ExtensionAPI) {
         const agentTag = label ? theme.bold(theme.fg("accent", `[${label}]`)) : "";
 
         if (expanded) {
-          // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
           const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
 
@@ -115,16 +105,8 @@ export default function (pi: ExtensionAPI) {
             .map((name: string) => theme.fg("dim", name))
             .join(theme.fg("muted", ", "));
 
-          let deniedLine = "";
-          if (denied.length > 0) {
-            const deniedList = denied
-              .map((name: string) => theme.fg("error", name))
-              .join(theme.fg("muted", ", "));
-            deniedLine = "\n" + theme.fg("muted", "denied: ") + deniedList;
-          }
-
           const content = new Text(
-            `${agentTag}${countInfo}${hint}\n${toolList}${deniedLine}`,
+            `${agentTag}${countInfo}${hint}\n${toolList}`,
             0,
             0,
           );
@@ -132,13 +114,9 @@ export default function (pi: ExtensionAPI) {
         } else {
           // Collapsed: one-line summary
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
-          const deniedInfo =
-            denied.length > 0
-              ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
-              : "";
           const hint = theme.fg("muted", "  (Ctrl+J to expand)");
 
-          const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
+          const content = new Text(`${agentTag}${countInfo}${hint}`, 0, 0);
           box.addChild(content);
         }
 
@@ -157,7 +135,6 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
-    denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
   });

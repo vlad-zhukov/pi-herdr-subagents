@@ -69,7 +69,7 @@ export class PiHarnessDriver implements HarnessDriver {
       localAgentDir,
       effectiveAutoExit,
       taskDelivery,
-      denySet,
+      spawning,
       identity,
       identityInSystemPrompt,
       systemPromptMode,
@@ -121,9 +121,7 @@ export class PiHarnessDriver implements HarnessDriver {
       envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
     }
 
-    if (denySet && denySet.size > 0) {
-      envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
-    }
+    envParts.push(`PI_SUBAGENT_SPAWNING=${spawning ? "1" : "0"}`);
     envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
     if (params.agent) {
       envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
