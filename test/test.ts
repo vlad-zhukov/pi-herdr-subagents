@@ -2155,13 +2155,22 @@ describe("tool registration", () => {
     });
   });
 
-  it("expands spawning false to deny subagent interruption", () => {
+  it("defaults child spawning off and allows explicit opt-in", () => {
     const testApi = (subagentsModule as any).__test__;
-    const denied = testApi.resolveDenyTools({ spawning: false });
+    const spawningTools = [
+      "subagent",
+      "subagent_interrupt",
+      "subagents_list",
+      "subagent_resume",
+    ];
 
-    assert.equal(denied.has("subagent"), true);
-    assert.equal(denied.has("subagent_interrupt"), true);
-    assert.equal(denied.has("subagent_resume"), true);
+    for (const agentDefs of [null, {}, { spawning: false }]) {
+      const denied = testApi.resolveDenyTools(agentDefs);
+      for (const tool of spawningTools) assert.equal(denied.has(tool), true);
+    }
+
+    const allowed = testApi.resolveDenyTools({ spawning: true });
+    for (const tool of spawningTools) assert.equal(allowed.has(tool), false);
   });
 
   it("blocks bare spawns unless an explicit fork is requested", async () => {

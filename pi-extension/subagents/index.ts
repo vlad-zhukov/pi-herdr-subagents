@@ -218,7 +218,7 @@ interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
 }
 
-/** Tools that are gated by `spawning: false` */
+/** Tools controlled by child `spawning` capability. */
 const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
@@ -228,20 +228,19 @@ const SPAWNING_TOOLS = new Set([
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
- * `spawning: false` expands to all SPAWNING_TOOLS.
+ * Missing or false `spawning` expands to all SPAWNING_TOOLS.
  * `deny-tools` adds individual tool names on top.
  */
 function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   const denied = new Set<string>();
-  if (!agentDefs) return denied;
 
-  // spawning: false → deny all spawning tools
-  if (agentDefs.spawning === false) {
+  // Child sessions cannot spawn by default. `spawning: true` opts in.
+  if (!agentDefs || agentDefs.spawning !== true) {
     for (const t of SPAWNING_TOOLS) denied.add(t);
   }
 
   // deny-tools: explicit list
-  if (agentDefs.denyTools) {
+  if (agentDefs?.denyTools) {
     for (const t of agentDefs.denyTools
       .split(",")
       .map((s) => s.trim())
