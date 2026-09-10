@@ -178,7 +178,7 @@ If `PI_CODING_AGENT_DIR` is set, use `$PI_CODING_AGENT_DIR/agents/config.json` i
   "models": {
     "default": "your-provider/your-default-model",
     "agents": {
-      "scout": "your-provider/your-fast-model",
+      "scout": "your-provider/your-fast-model#low",
       "reviewer": "your-provider/your-review-model"
     }
   }
@@ -187,7 +187,7 @@ If `PI_CODING_AGENT_DIR` is set, use `$PI_CODING_AGENT_DIR/agents/config.json` i
 
 `status.enabled` controls live status supervision. Status notifications cap at four lines (`lineLimit: 4`); extra lines collapse into an overflow summary. This limit is fixed.
 
-`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
+`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Append `#off`, `#minimal`, `#low`, `#medium`, `#high`, `#xhigh`, or `#max` to set thinking (for example, `openai-codex/gpt-5.6-line#xhigh`). Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Explicit `thinking` tool arguments take precedence over config thinking, which takes precedence over agent frontmatter and the parent level. Model values must be exact authenticated `provider/model-id` references, optionally followed by a thinking suffix.
 
 The model config is optional. Missing config leaves model selection unchanged and falls back to the parent model.
 
@@ -219,7 +219,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `fork`                 | boolean | `false`        | Use only for an explicitly requested current-session fork; overrides agent `session-mode`; bare calls without `agent` require `fork: true` |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | agent, configured, or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
-| `thinking`             | string  | agent or parent | Pi thinking level (`off` through `max`); resolution is tool argument → agent frontmatter → parent |
+| `thinking`             | string  | config, agent, or parent | Pi thinking level (`off` through `max`); resolution is tool argument → config suffix → agent frontmatter → parent |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
@@ -338,7 +338,7 @@ You are a specialized agent that does X...
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Optional exact authenticated model default; omit to inherit the parent                                                                                                                                                                                                      |
-| `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit the parent                                                                                                                                                                                                                                 |
+| `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit config or parent                                                                                                                                                                                                                             |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `lineage-only` when omitted; `standalone`, `lineage-only`, or `fork` |

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { isThinkingLevel, THINKING_LEVELS, type ThinkingLevel } from "./runtime-routing.ts";
 
 /** Resolve the global Pi agent directory, respecting PI_CODING_AGENT_DIR. */
 export function getAgentConfigDir(): string {
@@ -18,6 +19,35 @@ export interface ModelConfig {
 
 function invalidModelConfig(source: string, message: string): never {
   throw new Error(`Invalid subagent model config in ${source}: ${message}`);
+}
+
+interface ConfiguredModel {
+  model: string;
+  thinking?: ThinkingLevel;
+}
+
+function parseConfiguredModel(value: string, source: string, field: string): ConfiguredModel {
+  const separator = value.lastIndexOf("#");
+  if (separator < 0) return { model: value };
+
+  const model = value.slice(0, separator).trim();
+  const thinking = value.slice(separator + 1).trim();
+  if (!model) invalidModelConfig(source, `${field} must include a model before #`);
+  if (!isThinkingLevel(thinking)) {
+    invalidModelConfig(
+      source,
+      `${field} thinking suffix must be one of: ${THINKING_LEVELS.join(", ")}`,
+    );
+  }
+  return { model, thinking };
+}
+
+function configuredModelValue(
+  agentName: string | undefined,
+  config: ModelConfig,
+): string | undefined {
+  if (agentName && Object.hasOwn(config.agents, agentName)) return config.agents[agentName];
+  return config.default;
 }
 
 export function parseModelConfig(rawConfig: unknown, source = "config.json"): ModelConfig {
@@ -45,6 +75,7 @@ export function parseModelConfig(rawConfig: unknown, source = "config.json"): Mo
       invalidModelConfig(source, "models.default must be a non-empty string");
     }
     defaultModel = value.default.trim();
+    parseConfiguredModel(defaultModel, source, "models.default");
   }
 
   const agents: Record<string, string> = {};
@@ -56,8 +87,10 @@ export function parseModelConfig(rawConfig: unknown, source = "config.json"): Mo
       if (typeof model !== "string" || model.trim() === "") {
         invalidModelConfig(source, `models.agents.${agent} must be a non-empty string`);
       }
+      const normalized = model.trim();
+      parseConfiguredModel(normalized, source, `models.agents.${agent}`);
       Object.defineProperty(agents, agent, {
-        value: model.trim(),
+        value: normalized,
         enumerable: true,
         writable: true,
         configurable: true,
@@ -74,10 +107,20 @@ export function resolveModelDefault(
   config: ModelConfig,
 ): string | undefined {
   if (agentModel) return agentModel;
-  if (agentName && Object.hasOwn(config.agents, agentName)) {
-    return config.agents[agentName];
-  }
-  return config.default;
+  const configured = configuredModelValue(agentName, config);
+  return configured ? parseConfiguredModel(configured, "config.json", "models").model : undefined;
+}
+
+/** Configured thinking suffix overrides named-agent frontmatter. */
+export function resolveThinkingDefault(
+  agentName: string | undefined,
+  agentThinking: string | undefined,
+  config: ModelConfig,
+): string | undefined {
+  const configured = configuredModelValue(agentName, config);
+  return configured
+    ? parseConfiguredModel(configured, "config.json", "models").thinking ?? agentThinking
+    : agentThinking;
 }
 
 export function loadModelConfig(configPath = getDefaultModelConfigPath()): ModelConfig {

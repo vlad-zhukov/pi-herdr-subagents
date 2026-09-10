@@ -29,6 +29,7 @@ import {
   loadModelConfig,
   parseModelConfig,
   resolveModelDefault,
+  resolveThinkingDefault,
 } from "../pi-extension/subagents/model-config.ts";
 import {
   advanceStatusState,
@@ -932,6 +933,29 @@ describe("model configuration", () => {
         default: "anthropic/claude-sonnet-4-6",
         agents: { scout: "openai/gpt-5-mini" },
       },
+    );
+  });
+
+  it("supports thinking suffixes and lets config override agent frontmatter", () => {
+    const config = parseModelConfig({
+      models: {
+        default: "openai-codex/gpt-5.6-line#high",
+        agents: { scout: "openai-codex/gpt-5.6-line#xhigh" },
+      },
+    });
+
+    assert.equal(
+      resolveModelDefault("scout", undefined, config),
+      "openai-codex/gpt-5.6-line",
+    );
+    assert.equal(resolveThinkingDefault("scout", "low", config), "xhigh");
+    assert.equal(resolveThinkingDefault("reviewer", "low", config), "high");
+  });
+
+  it("rejects invalid thinking suffixes", () => {
+    assert.throws(
+      () => parseModelConfig({ models: { default: "fake/model#turbo" } }),
+      /thinking suffix must be one of/,
     );
   });
 

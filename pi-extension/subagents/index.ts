@@ -42,6 +42,7 @@ import {
   getAgentConfigDir,
   loadModelConfig,
   resolveModelDefault,
+  resolveThinkingDefault,
   type ModelConfig,
 } from "./model-config.ts";
 
@@ -128,7 +129,7 @@ const ThinkingLevelSchema = Type.Union(
   THINKING_LEVELS.map((level) => Type.Literal(level)),
   {
     description:
-      "Pi thinking level. Omit to use a named agent's thinking default, then the parent level. Passing a value explicitly overrides agent frontmatter for this spawn.",
+      "Pi thinking level. Omit to use config or a named agent's thinking default, then the parent level. Passing a value explicitly overrides config and agent frontmatter for this spawn.",
   },
 );
 
@@ -147,7 +148,7 @@ const SubagentParams = Type.Object({
   model: Type.Optional(
     Type.String({
       description:
-        "Exact authenticated provider/model-id. Omit to use a named agent's model default, then the configured or parent model. Passing a value explicitly overrides agent frontmatter for this spawn.",
+        "Exact authenticated provider/model-id. Omit to use a named agent's model default, then the configured or parent model. Passing a value explicitly overrides config and agent frontmatter for this spawn.",
     }),
   ),
   thinking: Type.Optional(ThinkingLevelSchema),
@@ -333,9 +334,10 @@ function buildAvailableAgentCatalog(
 
   for (const agent of visible) {
     const effectiveModel = resolveModelDefault(agent.name, agent.model, config);
+    const effectiveThinking = resolveThinkingDefault(agent.name, agent.thinking, config);
     const defaults = [
       effectiveModel ? `model ${effectiveModel}` : undefined,
-      agent.thinking ? `thinking ${agent.thinking}` : undefined,
+      effectiveThinking ? `thinking ${effectiveThinking}` : undefined,
     ].filter(Boolean);
     const runtime = defaults.length > 0 ? `; defaults: ${defaults.join(", ")}` : "";
     const description = agent.description ? ` — ${agent.description}` : "";
@@ -1106,7 +1108,7 @@ async function launchSubagent(
     { model: params.model, thinking: params.thinking },
     {
       model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
-      thinking: agentDefs?.thinking,
+      thinking: resolveThinkingDefault(params.agent, agentDefs?.thinking, modelConfig),
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
     wrapPiModelRegistry(ctx.modelRegistry),
@@ -1416,7 +1418,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runtime.modelCatalog = buildAuthenticatedModelCatalog(
       wrapPiModelRegistry(ctx.modelRegistry),
       24,
-      ctx.scopedModels.map(({ model }) => model),
+      ctx.scopedModels?.map(({ model }) => model) ?? [],
     );
     runtime.agentCatalog = buildAvailableAgentCatalog(
       discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation),
