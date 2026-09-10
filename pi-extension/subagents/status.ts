@@ -1,15 +1,15 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { getAgentConfigDir } from "./model-config.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
 
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
+function getDefaultStatusConfigPath(): string {
+  return join(getAgentConfigDir(), "agents", "config.json");
+}
 
 export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
 export type SubagentStatusSource = string;
@@ -150,12 +150,16 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
   };
 }
 
-function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
+function readStatusConfigFile(configPath: string, examplePath?: string): { sourcePath: string; rawConfig: string } {
   try {
     return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
   } catch (error) {
     const errno = error as NodeJS.ErrnoException;
     if (errno.code !== "ENOENT") throw error;
+  }
+
+  if (!examplePath) {
+    throw new Error(`Missing subagent status config. Expected ${configPath}.`);
   }
 
   try {
@@ -171,10 +175,23 @@ function readStatusConfigFile(configPath: string, examplePath: string): { source
   }
 }
 
+const DEFAULT_STATUS_CONFIG: StatusConfig = {
+  enabled: true,
+  lineLimit: DEFAULT_STATUS_LINE_LIMIT,
+};
+
 export function loadStatusConfig(
-  configPath = DEFAULT_STATUS_CONFIG_PATH,
-  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
+  configPath = getDefaultStatusConfigPath(),
+  examplePath?: string,
 ): StatusConfig {
+  if (
+    examplePath == null &&
+    configPath === getDefaultStatusConfigPath() &&
+    !existsSync(configPath)
+  ) {
+    return DEFAULT_STATUS_CONFIG;
+  }
+
   const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
 
   let parsed: unknown;

@@ -533,12 +533,23 @@ describe("status.ts", () => {
   });
 
   it("loads a valid config file", () => {
-    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
+    const examplePath = fileURLToPath(new URL("../agents/config.json", import.meta.url));
     const config = loadStatusConfig(examplePath);
 
     assert.deepEqual(config, {
       enabled: true,
       lineLimit: 4,
+    });
+  });
+
+  it("loads status config beside global agent definitions", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeFileSync(
+        join(globalAgentsDir, "config.json"),
+        JSON.stringify({ status: { enabled: false }, models: { agents: {} } }),
+      );
+
+      assert.equal(loadStatusConfig().enabled, false);
     });
   });
 
@@ -927,6 +938,25 @@ describe("model configuration", () => {
   it("loads no model overrides when config.json is absent", () => {
     const config = loadModelConfig(join(createTestDir(), "missing-config.json"));
     assert.deepEqual(config, { agents: {} });
+  });
+
+  it("loads model config beside global agent definitions", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeFileSync(
+        join(globalAgentsDir, "config.json"),
+        JSON.stringify({
+          models: {
+            default: "fake/global",
+            agents: { scout: "fake/scout" },
+          },
+        }),
+      );
+
+      assert.deepEqual(loadModelConfig(), {
+        default: "fake/global",
+        agents: { scout: "fake/scout" },
+      });
+    });
   });
 
   it("resolves frontmatter, per-agent, global, and parent fallback precedence", () => {

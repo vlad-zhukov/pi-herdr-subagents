@@ -11,7 +11,6 @@ import {
   existsSync,
   mkdirSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import {
   isTerminalAvailable,
   terminalSetupHint,
@@ -39,7 +38,12 @@ import {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
-import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import {
+  getAgentConfigDir,
+  loadModelConfig,
+  resolveModelDefault,
+  type ModelConfig,
+} from "./model-config.ts";
 
 import {
   findLastAssistantMessage,
@@ -228,11 +232,6 @@ const SPAWNING_TOOLS = new Set([
 /** Child sessions may spawn only when explicitly enabled in agent frontmatter. */
 function resolveSpawning(agentDefs: AgentDefaults | null): boolean {
   return agentDefs?.spawning === true;
-}
-
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
-function getAgentConfigDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {

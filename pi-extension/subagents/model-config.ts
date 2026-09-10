@@ -1,9 +1,15 @@
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_MODEL_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+/** Resolve the global Pi agent directory, respecting PI_CODING_AGENT_DIR. */
+export function getAgentConfigDir(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+function getDefaultModelConfigPath(): string {
+  return join(getAgentConfigDir(), "agents", "config.json");
+}
 
 export interface ModelConfig {
   default?: string;
@@ -74,7 +80,7 @@ export function resolveModelDefault(
   return config.default;
 }
 
-export function loadModelConfig(configPath = DEFAULT_MODEL_CONFIG_PATH): ModelConfig {
+export function loadModelConfig(configPath = getDefaultModelConfigPath()): ModelConfig {
   let raw: string;
   try {
     raw = readFileSync(configPath, "utf8");

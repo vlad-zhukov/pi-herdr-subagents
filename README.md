@@ -161,27 +161,20 @@ A fixed internal watchdog marks a run as `stalled` when pane inspection fails or
 
 #### Configuration
 
-Status display is controlled by `config.json` in the extension directory. Copy `config.json.example` to get started:
+Status and model routing config live beside named agent definitions. Copy the example into your global agent directory:
 
 ```bash
-cp config.json.example config.json
+mkdir -p ~/.pi/agent/agents
+cp agents/config.json ~/.pi/agent/agents/config.json
 ```
+
+If `PI_CODING_AGENT_DIR` is set, use `$PI_CODING_AGENT_DIR/agents/config.json` instead. Configure models with exact IDs from your authenticated model catalog:
 
 ```json
 {
   "status": {
     "enabled": true
   },
-  "models": {
-    "agents": {}
-  }
-}
-```
-
-The copyable example is model-neutral, so it works without requiring credentials for a specific provider. To configure models, replace the empty section with exact IDs from your authenticated model catalog:
-
-```json
-{
   "models": {
     "default": "your-provider/your-default-model",
     "agents": {
@@ -192,9 +185,11 @@ The copyable example is model-neutral, so it works without requiring credentials
 }
 ```
 
+`status.enabled` controls live status supervision. Status notifications cap at four lines (`lineLimit: 4`); extra lines collapse into an overflow summary. This limit is fixed.
+
 `models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
 
-`config.json` is gitignored so local overrides don't get committed.
+The model config is optional. Missing config leaves model selection unchanged and falls back to the parent model.
 
 ---
 
