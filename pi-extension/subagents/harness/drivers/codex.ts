@@ -47,7 +47,7 @@ export class CodexHarnessDriver implements HarnessDriver {
       cmdParts.push("--reasoning-effort", shellQuote(effectiveThinking));
     }
 
-    const sp = params.systemPrompt ?? agentDefs?.body;
+    const sp = agentDefs?.body;
     if (sp) {
       cmdParts.push("--system-prompt", shellQuote(sp));
     }

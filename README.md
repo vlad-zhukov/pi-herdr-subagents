@@ -187,9 +187,9 @@ If `PI_CODING_AGENT_DIR` is set, use `$PI_CODING_AGENT_DIR/agents/config.json` i
 
 `status.enabled` controls live status supervision. Status notifications cap at four lines (`lineLimit: 4`); extra lines collapse into an overflow summary. This limit is fixed.
 
-`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Append `#off`, `#minimal`, `#low`, `#medium`, `#high`, `#xhigh`, or `#max` to set thinking (for example, `openai-codex/gpt-5.6-line#xhigh`). Explicit `model` tool arguments take precedence, followed by `models.agents`, `models.default`, and the parent model. Explicit `thinking` tool arguments take precedence over the thinking suffix on the selected config model, followed by the parent level. Model values must be exact authenticated `provider/model-id` references, optionally followed by a thinking suffix.
+`models.default` sets the model for subagents without a per-agent entry. `models.agents` sets per-agent models, keyed by the name passed to `subagent({ agent: ... })`. Append `#off`, `#minimal`, `#low`, `#medium`, `#high`, `#xhigh`, or `#max` to set thinking (for example, `openai-codex/gpt-5.6-line#xhigh`). Model values must be exact authenticated `provider/model-id` references, optionally followed by a thinking suffix. Subagent tool calls do not accept runtime or prompt overrides.
 
-The model config is optional. Missing config leaves model selection unchanged and makes thinking inherit the parent level.
+The model config is optional. Missing config makes model and thinking inherit the parent runtime.
 
 ---
 
@@ -218,12 +218,9 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Load role, tools, skills, and lifecycle defaults from agent definition                           |
 | `fork`                 | boolean | `false`        | Use only for an explicitly requested current-session fork; overrides agent `session-mode`; bare calls without `agent` require `fork: true` |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`; resolution is tool argument → `models.agents` → `models.default` → parent |
-| `thinking`             | string  | config or parent | Pi thinking level (`off` through `max`); resolution is tool argument → thinking suffix on selected config model → parent |
-| `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
-| `skills`               | string  | —              | Comma-separated skill names                                                                       |
-| `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+
+Runtime and role prompts come from `config.json` and named agent definitions. `model`, `thinking`, `systemPrompt`, `skills`, and `tools` are not valid `subagent()` parameters; old calls fail schema validation.
 
 ---
 

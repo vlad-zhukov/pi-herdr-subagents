@@ -42,7 +42,7 @@ export class GrokHarnessDriver implements HarnessDriver {
       cmdParts.push("--model", shellQuote(effectiveModel));
     }
 
-    const sp = params.systemPrompt ?? agentDefs?.body;
+    const sp = agentDefs?.body;
     if (sp) {
       cmdParts.push("--system-prompt", shellQuote(sp));
     }

@@ -40,9 +40,8 @@ function parseFrontmatter(content: string) {
 function simulateRouting(
   agentBody: string | undefined,
   systemPromptMode: "append" | "replace" | undefined,
-  paramSystemPrompt: string | undefined,
 ) {
-  const identity = agentBody ?? paramSystemPrompt ?? null;
+  const identity = agentBody ?? null;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
 
@@ -100,29 +99,29 @@ assert(r4.systemPromptMode === undefined, "system-prompt: foobar → mode is und
 // --- Test 2: Identity routing ---
 console.log("\n🧪 Identity routing (system prompt vs user message)");
 
-const s1 = simulateRouting("You are X.", "replace", undefined);
+const s1 = simulateRouting("You are X.", "replace");
 assert(s1.roleBlock === "", "replace mode: roleBlock empty (not in task)");
 assert(s1.cliFlag === "--system-prompt", "replace mode: uses --system-prompt flag");
 
-const s2 = simulateRouting("You are X.", "append", undefined);
+const s2 = simulateRouting("You are X.", "append");
 assert(s2.roleBlock === "", "append mode: roleBlock empty (not in task)");
 assert(s2.cliFlag === "--append-system-prompt", "append mode: uses --append-system-prompt flag");
 
-const s3 = simulateRouting("You are X.", undefined, undefined);
+const s3 = simulateRouting("You are X.", undefined);
 assert(s3.roleBlock === "\n\nYou are X.", "no mode: roleBlock contains identity");
 assert(s3.cliFlag === null, "no mode: no CLI flag");
 
-const s4 = simulateRouting(undefined, undefined, undefined);
+const s4 = simulateRouting(undefined, undefined);
 assert(s4.roleBlock === "", "no identity: roleBlock empty");
 assert(s4.cliFlag === null, "no identity: no CLI flag");
 
-const s5 = simulateRouting(undefined, "replace", undefined);
+const s5 = simulateRouting(undefined, "replace");
 assert(s5.roleBlock === "", "mode set but no body: roleBlock empty");
 assert(s5.cliFlag === null, "mode set but no body: no CLI flag");
 
-const s6 = simulateRouting(undefined, "replace", "Param identity");
-assert(s6.cliFlag === "--system-prompt", "mode + param systemPrompt: uses CLI flag");
-assert(s6.roleBlock === "", "mode + param systemPrompt: roleBlock empty");
+const s6 = simulateRouting(undefined, "replace");
+assert(s6.cliFlag === null, "mode without body: no CLI flag");
+assert(s6.roleBlock === "", "mode without body: roleBlock empty");
 
 // --- Test 3: End-to-end with temp agent files ---
 console.log("\n🧪 End-to-end with temp agent files");

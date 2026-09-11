@@ -23,8 +23,8 @@ function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): Su
     modelId: "claude-sonnet-4-5",
     model: "anthropic/claude-sonnet-4-5",
     thinking: "medium",
-    modelSource: "request",
-    thinkingSource: "request",
+    modelSource: "config",
+    thinkingSource: "config",
   };
 
   return {
@@ -281,7 +281,7 @@ describe("Claude Harness Driver", () => {
         modelId: "sonnet",
         model: "anthropic/sonnet",
         thinking: "high",
-        modelSource: "request",
+        modelSource: "config",
         thinkingSource: "request",
       }, "medium"),
       /Thinking-level overrides are not supported for Claude CLI subagents/,
@@ -294,7 +294,7 @@ describe("Claude Harness Driver", () => {
       modelId: "sonnet",
       model: "anthropic/sonnet",
       thinking: "medium",
-      modelSource: "request",
+      modelSource: "config",
       thinkingSource: "parent",
     }, "medium"));
   });

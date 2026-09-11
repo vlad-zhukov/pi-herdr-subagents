@@ -7,7 +7,7 @@ import {
   resolveRuntimePlan,
   wrapPiModelRegistry,
   type ParentRuntime,
-  type RuntimeRequest,
+  type RuntimeDefaults,
 } from "../pi-extension/subagents/runtime-routing.ts";
 
 const parent: ParentRuntime = {
@@ -51,12 +51,12 @@ function registry(entries = [model("fake", "parent"), model("other", "fast")]) {
   });
 }
 
-function resolve(request: RuntimeRequest = {}, defaults: RuntimeRequest = {}) {
-  return resolveRuntimePlan(request, defaults, parent, registry());
+function resolve(defaults: RuntimeDefaults = {}) {
+  return resolveRuntimePlan(defaults, parent, registry());
 }
 
 describe("runtime routing", () => {
-  it("inherits the parent model and thinking when no override is requested", () => {
+  it("inherits the parent model and thinking when no config is present", () => {
     assert.deepEqual(resolve(), {
       provider: "fake",
       modelId: "parent",
@@ -67,21 +67,16 @@ describe("runtime routing", () => {
     });
   });
 
-  it("resolves tool-call fields over configured defaults independently", () => {
+  it("resolves configured model and thinking together", () => {
     assert.deepEqual(
-      resolve(
-        { thinking: "high" },
-        { model: "other/fast", thinking: "low" },
-      ),
+      resolve({ model: "other/fast", thinking: "high" }),
       {
         provider: "other",
         modelId: "fast",
         model: "other/fast",
         thinking: "high",
-        modelSource: "agent",
-        thinkingSource: "request",
-        requestedModel: "other/fast",
-        requestedThinking: "high",
+        modelSource: "config",
+        thinkingSource: "config",
       },
     );
   });
@@ -90,7 +85,6 @@ describe("runtime routing", () => {
     const nested = model("other", "family/reasoner");
     const plan = resolveRuntimePlan(
       { model: "other/family/reasoner" },
-      {},
       parent,
       registry([model("fake", "parent"), nested]),
     );
@@ -98,27 +92,26 @@ describe("runtime routing", () => {
     assert.equal(plan.modelId, "family/reasoner");
   });
 
-  it("rejects fuzzy, unknown, and unauthenticated explicit models", () => {
-    for (const request of [
+  it("rejects fuzzy, unknown, and unauthenticated configured models", () => {
+    for (const defaults of [
       { model: "fast" },
       { model: "other/missing" },
       { model: "other/unauthed" },
     ]) {
       const entries = [model("fake", "parent"), model("other", "unauthed")];
       assert.throws(
-        () => resolveRuntimePlan(request, {}, parent, registry(entries)),
+        () => resolveRuntimePlan(defaults, parent, registry(entries)),
         RuntimeResolutionError,
       );
     }
   });
 
-  it("rejects unsupported explicit thinking with supported alternatives", () => {
+  it("rejects unsupported configured thinking with supported alternatives", () => {
     const plain = model("other", "plain", { reasoning: false });
     assert.throws(
       () =>
         resolveRuntimePlan(
           { model: "other/plain", thinking: "high" },
-          {},
           parent,
           registry([model("fake", "parent"), plain]),
         ),
@@ -126,11 +119,10 @@ describe("runtime routing", () => {
     );
   });
 
-  it("uses configured default thinking when the request omits it", () => {
-    const plan = resolveRuntimePlan({}, { thinking: "low" }, parent, registry());
+  it("uses configured thinking when present", () => {
+    const plan = resolveRuntimePlan({ thinking: "low" }, parent, registry());
     assert.equal(plan.thinking, "low");
-    assert.equal(plan.thinkingSource, "agent");
-    assert.equal(plan.requestedThinking, "low");
+    assert.equal(plan.thinkingSource, "config");
   });
 
   it("clamps inherited thinking for a reasoning model with a sparse level map", () => {
@@ -145,7 +137,6 @@ describe("runtime routing", () => {
     });
     const plan = resolveRuntimePlan(
       { model: "other/sparse" },
-      {},
       parent,
       registry([model("fake", "parent"), sparse]),
     );
@@ -161,7 +152,6 @@ describe("runtime routing", () => {
     const plain = model("other", "plain", { reasoning: false });
     const plan = resolveRuntimePlan(
       { model: "other/plain" },
-      {},
       parent,
       registry([model("fake", "parent"), plain]),
     );
@@ -234,10 +224,7 @@ describe("authenticated model catalog", () => {
     assert.match(catalog, /200k context/);
     assert.match(catalog, /other\/plain/);
     assert.match(catalog, /non-reasoning/);
-    assert.match(
-      catalog,
-      /Named agents keep their configured runtime when model and thinking overrides are omitted/,
-    );
+    assert.match(catalog, /Configure named-agent models in config\.json/);
   });
 
   it("uses scoped models when provided", () => {

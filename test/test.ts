@@ -2166,12 +2166,16 @@ describe("tool registration", () => {
         guidance,
         /researcher.*Researches external topics using authoritative sources/,
       );
-      assert.match(guidance, /omit.*model.*thinking.*named agent.*config/i);
-      assert.doesNotMatch(guidance, /frontmatter.*(?:model|thinking)/i);
-      assert.match(
-        subagent.parameters.properties.thinking.description,
-        /config.*thinking.*suffix/i,
-      );
+      assert.match(guidance, /runtime comes from config/i);
+      assert.doesNotMatch(guidance, /one-off.*override/i);
+      assert.equal(subagent.parameters.additionalProperties, false);
+      for (const removed of ["model", "thinking", "systemPrompt", "skills", "tools"]) {
+        assert.equal(
+          subagent.parameters.properties[removed],
+          undefined,
+          `${removed} must not be a subagent parameter`,
+        );
+      }
     });
   });
 
@@ -2201,7 +2205,7 @@ describe("tool registration", () => {
     });
 
     assert.match(subagent.promptGuidelines.join("\n"), /fake\/fast/);
-    assert.match(subagent.promptGuidelines.join("\n"), /inherit the parent runtime/);
+    assert.match(subagent.promptGuidelines.join("\n"), /inherit the parent model and thinking level/);
   });
 
   it("keeps lifecycle tools in the base process", () => {

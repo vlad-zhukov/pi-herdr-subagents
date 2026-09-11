@@ -7,10 +7,7 @@ export interface SubagentLaunchParams {
   task: string;
   agent?: string;
   cwd?: string;
-  systemPrompt?: string;
   resumeSessionId?: string;
-  tools?: string;
-  skills?: string;
   interactive?: boolean;
 }
 
@@ -103,7 +100,7 @@ export interface HarnessDriver {
   /** Format the model reference for this CLI */
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string;
 
-  /** Optional validation of runtime plan before launch (e.g. thinking overrides) */
+  /** Optional validation of configured runtime plan before launch */
   validateRuntimePlan?(runtimePlan: ResolvedRuntimePlan, parentThinking: ThinkingLevel): void;
 
   /** Build the execution command line and metadata for launch */

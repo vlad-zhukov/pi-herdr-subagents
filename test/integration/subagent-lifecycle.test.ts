@@ -306,29 +306,28 @@ for (const backend of backends) {
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
     });
 
-    // ── Subagent with custom system prompt ──
+    // ── Subagent with named role instructions ──
 
-    it("passes systemPrompt to subagent", async () => {
+    it("uses named agent body for subagent role instructions", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
+      const markerFile = `/tmp/pi-integ-roleprompt-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `sysprompt-${id}`);
+      const surface = createTrackedSurface(env, `roleprompt-${id}`);
       await sleep(1000);
 
       const task = [
         `Call the subagent tool with these parameters:`,
-        `  name: "SysP-${id}"`,
+        `  name: "Role-${id}"`,
         `  agent: "test-echo"`,
-        `  systemPrompt: "Always start your response with CUSTOM_PROMPT_ACTIVE."`,
-        `  task: "Write 'SYSPROMPT_${id}' to ${markerFile} using bash: echo 'SYSPROMPT_${id}' > '${markerFile}'"`,
-        `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
+        `  task: "Write 'ROLEPROMPT_${id}' to ${markerFile} using bash: echo 'ROLEPROMPT_${id}' > '${markerFile}'"`,
+        `After the subagent completes, say ROLEPROMPT_TEST_DONE.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
-      assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
+      const content = await waitForFile(markerFile, PI_TIMEOUT, /ROLEPROMPT/);
+      assert.ok(content.includes(`ROLEPROMPT_${id}`), `Named agent role test marker should exist`);
     });
   });
 }

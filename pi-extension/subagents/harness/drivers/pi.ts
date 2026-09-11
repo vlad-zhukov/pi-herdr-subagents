@@ -108,7 +108,7 @@ export class PiHarnessDriver implements HarnessDriver {
       parts.push(flag, shellQuote(syspromptPath));
     }
 
-    const effectiveTools = params.tools ?? agentDefs?.tools;
+    const effectiveTools = agentDefs?.tools;
     const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
     if (toolAllowlist) {
       parts.push("--tools", shellQuote(toolAllowlist));
@@ -157,7 +157,7 @@ export class PiHarnessDriver implements HarnessDriver {
       taskArg = `@${artifactPath}`;
     }
 
-    const effectiveSkills = params.skills ?? agentDefs?.skills;
+    const effectiveSkills = agentDefs?.skills;
     const promptArgs = buildPiPromptArgs({
       effectiveSkills,
       taskDelivery,

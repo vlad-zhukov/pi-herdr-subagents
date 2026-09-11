@@ -29,7 +29,6 @@ import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
   wrapPiModelRegistry,
-  THINKING_LEVELS,
   type ResolvedRuntimePlan,
   type ThinkingLevel,
 } from "./runtime-routing.ts";
@@ -113,11 +112,7 @@ function buildSubagentRoutingGuidelines(
 ): string[] {
   return [
     "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
-    "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over config.",
-    "For an explicit bare fork, omit model and thinking to inherit the parent runtime.",
     "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); otherwise omit it. Bare child spawns without agent are rejected unless fork: true is set.",
-    "When an intentional runtime override is necessary, prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, and high+ for architecture, concurrency, security, or hard diagnosis.",
-    "When overriding a subagent model, use an exact authenticated provider/model-id from the live catalog below. Do not invent aliases or fuzzy names.",
     agentCatalog ?? "Available named subagent catalog becomes available after session start.",
     modelCatalog ?? "Authenticated subagent model catalog becomes available after session start.",
   ];
@@ -125,38 +120,14 @@ function buildSubagentRoutingGuidelines(
 
 const subagentRoutingGuidelines = buildSubagentRoutingGuidelines();
 
-const ThinkingLevelSchema = Type.Union(
-  THINKING_LEVELS.map((level) => Type.Literal(level)),
-  {
-    description:
-      "Pi thinking level. Omit to use the selected config model's thinking suffix, then the parent level. Passing a value explicitly overrides config for this spawn.",
-  },
-);
-
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from the available named subagent catalog. Agent frontmatter can provide tools, skills, and role instructions.",
+        "Agent name to load role, tools, skills, and lifecycle defaults from the available named subagent catalog.",
     }),
-  ),
-  systemPrompt: Type.Optional(
-    Type.String({ description: "Appended to system prompt (role instructions)" }),
-  ),
-  model: Type.Optional(
-    Type.String({
-      description:
-        "Exact authenticated provider/model-id. Omit to use models.agents for a named agent, then models.default or the parent model. Passing a value explicitly overrides config for this spawn.",
-    }),
-  ),
-  thinking: Type.Optional(ThinkingLevelSchema),
-  skills: Type.Optional(
-    Type.String({ description: "Comma-separated skills (overrides agent default)" }),
-  ),
-  tools: Type.Optional(
-    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
   ),
   cwd: Type.Optional(
     Type.String({
@@ -179,10 +150,10 @@ const SubagentParams = Type.Object({
   resumeSessionId: Type.Optional(
     Type.String({
       description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
+        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use for retrying cancelled runs.",
     }),
   ),
-});
+}, { additionalProperties: false });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
@@ -325,7 +296,7 @@ function buildAvailableAgentCatalog(
   const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
   const visible = sorted.slice(0, limit);
   const lines = [
-    "Available named subagents (choose by role; omit model/thinking to use config and parent defaults):",
+    "Available named subagents (choose by role; runtime comes from config and parent defaults):",
   ];
 
   for (const agent of visible) {
@@ -1101,7 +1072,6 @@ async function launchSubagent(
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
   const runtimePlan = resolveRuntimePlan(
-    { model: params.model, thinking: params.thinking },
     {
       model: resolveModelDefault(params.agent, modelConfig),
       thinking: resolveThinkingDefault(params.agent, modelConfig),
@@ -1174,7 +1144,7 @@ async function launchSubagent(
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const spawning = resolveSpawning(agentDefs);
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+  const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";

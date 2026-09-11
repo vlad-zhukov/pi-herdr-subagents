@@ -21,9 +21,9 @@ export function isThinkingLevel(value: string): value is ThinkingLevel {
 }
 
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
-export type RuntimeSource = "request" | "agent" | "parent";
+export type RuntimeSource = "config" | "parent";
 
-export interface RuntimeRequest {
+export interface RuntimeDefaults {
   model?: string;
   thinking?: ThinkingLevel;
 }
@@ -63,8 +63,6 @@ export interface ResolvedRuntimePlan {
   thinking: ThinkingLevel;
   modelSource: RuntimeSource;
   thinkingSource: RuntimeSource;
-  requestedModel?: string;
-  requestedThinking?: ThinkingLevel;
   thinkingAdjustment?: {
     from: ThinkingLevel;
     to: ThinkingLevel;
@@ -186,26 +184,21 @@ function formatSupported(model: RoutingModel): string {
   return levels.length > 0 ? levels.join(", ") : "(none)";
 }
 
-function selectField(
-  requestValue: string | undefined,
-  agentValue: string | undefined,
+function selectConfiguredField(
+  configuredValue: string | undefined,
 ): { value?: string; source: RuntimeSource } {
-  if (requestValue != null && requestValue !== "") {
-    return { value: requestValue, source: "request" };
-  }
-  if (agentValue != null && agentValue !== "") {
-    return { value: agentValue, source: "agent" };
+  if (configuredValue != null && configuredValue !== "") {
+    return { value: configuredValue, source: "config" };
   }
   return { source: "parent" };
 }
 
 export function resolveRuntimePlan(
-  request: RuntimeRequest,
-  agentDefaults: RuntimeRequest,
+  configuredDefaults: RuntimeDefaults,
   parent: ParentRuntime,
   registry: ModelRegistryAdapter,
 ): ResolvedRuntimePlan {
-  const modelSelection = selectField(request.model, agentDefaults.model);
+  const modelSelection = selectConfiguredField(configuredDefaults.model);
   let provider = parent.provider;
   let modelId = parent.modelId;
   let selectedModel = registry.find(provider, modelId);
@@ -234,7 +227,7 @@ export function resolveRuntimePlan(
     selectedModel = found;
   }
 
-  const thinkingSelection = selectField(request.thinking, agentDefaults.thinking);
+  const thinkingSelection = selectConfiguredField(configuredDefaults.thinking);
   const preferredThinking = thinkingSelection.value ?? parent.thinking;
   if (!isThinkingLevel(preferredThinking)) {
     throw new RuntimeResolutionError(
@@ -247,7 +240,7 @@ export function resolveRuntimePlan(
   if (thinkingSelection.source !== "parent") {
     if (!selectedModel) {
       throw new RuntimeResolutionError(
-        `model capability information is unavailable; cannot validate explicit thinking ${JSON.stringify(preferredThinking)}`,
+        `model capability information is unavailable; cannot validate configured thinking ${JSON.stringify(preferredThinking)}`,
       );
     }
     const supported = getSupportedThinkingLevels(asPiModel(selectedModel));
@@ -275,8 +268,6 @@ export function resolveRuntimePlan(
     thinking,
     modelSource: modelSelection.source,
     thinkingSource: thinkingSelection.source,
-    ...(modelSelection.value ? { requestedModel: modelSelection.value } : {}),
-    ...(thinkingSelection.value ? { requestedThinking: preferredThinking } : {}),
     ...(thinkingAdjustment ? { thinkingAdjustment } : {}),
   };
 }
@@ -318,7 +309,7 @@ export function buildAuthenticatedModelCatalog(
     lines.push(`- … ${models.length - visibleModels.length} more authenticated models omitted`);
   }
   lines.push(
-    "Named agents keep their configured runtime when model and thinking overrides are omitted; bare spawns inherit the parent runtime. Pass overrides only when intentional.",
+    "Configure named-agent models in config.json; agents without configured runtime inherit the parent model and thinking level.",
   );
   return lines.join("\n");
 }
