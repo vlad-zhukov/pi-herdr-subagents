@@ -176,17 +176,24 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   process.env.HERDR_WORKSPACE_ID = workspaceId;
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into isolated global config and pin
-  // every child subagent to the same model selected for the outer Pi sessions.
-  // Without this rewrite, fixture frontmatter can silently bypass PI_TEST_MODEL.
+  // Keep child runtime selection in shared config, not agent frontmatter.
+  writeFileSync(
+    join(agentsDir, "config.json"),
+    JSON.stringify({
+      status: { enabled: true },
+      models: { default: TEST_MODEL },
+    }, null, 2) + "\n",
+    "utf8",
+  );
+
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        const source = readFileSync(join(TEST_AGENTS_SRC, file), "utf8");
-        const configured = /^model:\s*.*$/m.test(source)
-          ? source.replace(/^model:\s*.*$/m, `model: ${TEST_MODEL}`)
-          : source.replace(/^---\n/, `---\nmodel: ${TEST_MODEL}\n`);
-        writeFileSync(join(agentsDir, file), configured, "utf8");
+        writeFileSync(
+          join(agentsDir, file),
+          readFileSync(join(TEST_AGENTS_SRC, file), "utf8"),
+          "utf8",
+        );
       }
     }
   }

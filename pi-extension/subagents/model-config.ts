@@ -103,24 +103,18 @@ export function parseModelConfig(rawConfig: unknown, source = "config.json"): Mo
 
 export function resolveModelDefault(
   agentName: string | undefined,
-  agentModel: string | undefined,
   config: ModelConfig,
 ): string | undefined {
-  if (agentModel) return agentModel;
   const configured = configuredModelValue(agentName, config);
   return configured ? parseConfiguredModel(configured, "config.json", "models").model : undefined;
 }
 
-/** Configured thinking suffix overrides named-agent frontmatter. */
 export function resolveThinkingDefault(
   agentName: string | undefined,
-  agentThinking: string | undefined,
   config: ModelConfig,
-): string | undefined {
+): ThinkingLevel | undefined {
   const configured = configuredModelValue(agentName, config);
-  return configured
-    ? parseConfiguredModel(configured, "config.json", "models").thinking ?? agentThinking
-    : agentThinking;
+  return configured ? parseConfiguredModel(configured, "config.json", "models").thinking : undefined;
 }
 
 export function loadModelConfig(configPath = getDefaultModelConfigPath()): ModelConfig {

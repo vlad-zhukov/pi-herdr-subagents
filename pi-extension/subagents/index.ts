@@ -113,7 +113,7 @@ function buildSubagentRoutingGuidelines(
 ): string[] {
   return [
     "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
-    "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over agent frontmatter.",
+    "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over config.",
     "For an explicit bare fork, omit model and thinking to inherit the parent runtime.",
     "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); otherwise omit it. Bare child spawns without agent are rejected unless fork: true is set.",
     "When an intentional runtime override is necessary, prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, and high+ for architecture, concurrency, security, or hard diagnosis.",
@@ -129,7 +129,7 @@ const ThinkingLevelSchema = Type.Union(
   THINKING_LEVELS.map((level) => Type.Literal(level)),
   {
     description:
-      "Pi thinking level. Omit to use config or a named agent's thinking default, then the parent level. Passing a value explicitly overrides config and agent frontmatter for this spawn.",
+      "Pi thinking level. Omit to use the selected config model's thinking suffix, then the parent level. Passing a value explicitly overrides config for this spawn.",
   },
 );
 
@@ -139,7 +139,7 @@ const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from the available named subagent catalog. Agent frontmatter can provide model, thinking, tools, skills, and role instructions.",
+        "Agent name to load defaults from the available named subagent catalog. Agent frontmatter can provide tools, skills, and role instructions.",
     }),
   ),
   systemPrompt: Type.Optional(
@@ -148,7 +148,7 @@ const SubagentParams = Type.Object({
   model: Type.Optional(
     Type.String({
       description:
-        "Exact authenticated provider/model-id. Omit to use a named agent's model default, then the configured or parent model. Passing a value explicitly overrides config and agent frontmatter for this spawn.",
+        "Exact authenticated provider/model-id. Omit to use models.agents for a named agent, then models.default or the parent model. Passing a value explicitly overrides config for this spawn.",
     }),
   ),
   thinking: Type.Optional(ThinkingLevelSchema),
@@ -194,10 +194,8 @@ function validateSubagentRequest(params: Pick<Static<typeof SubagentParams>, "ag
 }
 
 interface AgentDefaults {
-  model?: string;
   tools?: string;
   skills?: string;
-  thinking?: string;
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
@@ -270,7 +268,6 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   return {
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
-    model: getFrontmatterValue(frontmatter, "model"),
     tools: getFrontmatterValue(frontmatter, "tools"),
     systemPromptMode:
       systemPromptMode === "replace"
@@ -279,7 +276,6 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           ? "append"
           : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
-    thinking: getFrontmatterValue(frontmatter, "thinking"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
@@ -329,12 +325,12 @@ function buildAvailableAgentCatalog(
   const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
   const visible = sorted.slice(0, limit);
   const lines = [
-    "Available named subagents (choose by role; omit model/thinking to use agent defaults):",
+    "Available named subagents (choose by role; omit model/thinking to use config and parent defaults):",
   ];
 
   for (const agent of visible) {
-    const effectiveModel = resolveModelDefault(agent.name, agent.model, config);
-    const effectiveThinking = resolveThinkingDefault(agent.name, agent.thinking, config);
+    const effectiveModel = resolveModelDefault(agent.name, config);
+    const effectiveThinking = resolveThinkingDefault(agent.name, config);
     const defaults = [
       effectiveModel ? `model ${effectiveModel}` : undefined,
       effectiveThinking ? `thinking ${effectiveThinking}` : undefined,
@@ -1107,8 +1103,8 @@ async function launchSubagent(
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
     {
-      model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
-      thinking: resolveThinkingDefault(params.agent, agentDefs?.thinking, modelConfig),
+      model: resolveModelDefault(params.agent, modelConfig),
+      thinking: resolveThinkingDefault(params.agent, modelConfig),
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
     wrapPiModelRegistry(ctx.modelRegistry),
@@ -1785,8 +1781,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const lines = list.map((a) => {
           const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${model}${desc}`;
+          const model = resolveModelDefault(a.name, modelConfig);
+          const thinking = resolveThinkingDefault(a.name, modelConfig);
+          const runtime = model ? ` [${model}${thinking ? ` · ${thinking}` : ""}]` : "";
+          return `• ${a.name}${runtime}${desc}`;
         });
 
         return {
@@ -1803,8 +1801,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const lines = agents.map((a: any) => {
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${model}${desc}`;
+          const configuredModel = resolveModelDefault(a.name, modelConfig);
+          const configuredThinking = resolveThinkingDefault(a.name, modelConfig);
+          const runtime = configuredModel
+            ? theme.fg("dim", ` [${configuredModel}${configuredThinking ? ` · ${configuredThinking}` : ""}]`)
+            : "";
+          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${runtime}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);
       },

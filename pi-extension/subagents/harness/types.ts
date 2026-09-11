@@ -17,8 +17,6 @@ export interface SubagentLaunchParams {
 export interface AgentDefinition {
   name: string;
   description?: string;
-  model?: string;
-  thinking?: string;
   tools?: string;
   skills?: string;
   sessionMode?: string;

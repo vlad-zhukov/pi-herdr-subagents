@@ -1,7 +1,6 @@
 ---
 name: test-ping
 description: Integration test agent — calls caller_ping instead of completing task
-model: openrouter/free
 tools: read, bash
 spawning: false
 disable-model-invocation: true

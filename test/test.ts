@@ -936,7 +936,7 @@ describe("model configuration", () => {
     );
   });
 
-  it("supports thinking suffixes and lets config override agent frontmatter", () => {
+  it("supports thinking suffixes in configured model values", () => {
     const config = parseModelConfig({
       models: {
         default: "openai-codex/gpt-5.6-line#high",
@@ -945,11 +945,13 @@ describe("model configuration", () => {
     });
 
     assert.equal(
-      resolveModelDefault("scout", undefined, config),
+      resolveModelDefault("scout", config),
       "openai-codex/gpt-5.6-line",
     );
-    assert.equal(resolveThinkingDefault("scout", "low", config), "xhigh");
-    assert.equal(resolveThinkingDefault("reviewer", "low", config), "high");
+    assert.equal(resolveThinkingDefault("scout", config), "xhigh");
+    assert.equal(resolveThinkingDefault("reviewer", config), "high");
+    assert.equal(resolveThinkingDefault("unconfigured", config), "high");
+    assert.equal(resolveThinkingDefault("reviewer", parseModelConfig({ models: { default: "fake/model" } })), undefined);
   });
 
   it("rejects invalid thinking suffixes", () => {
@@ -983,7 +985,7 @@ describe("model configuration", () => {
     });
   });
 
-  it("resolves frontmatter, per-agent, global, and parent fallback precedence", () => {
+  it("resolves per-agent, global, and parent fallback precedence", () => {
     const config = parseModelConfig({
       models: {
         default: "fake/global",
@@ -991,16 +993,16 @@ describe("model configuration", () => {
       },
     });
 
-    assert.equal(resolveModelDefault("scout", "fake/frontmatter", config), "fake/frontmatter");
-    assert.equal(resolveModelDefault("scout", undefined, config), "fake/scout");
-    assert.equal(resolveModelDefault("reviewer", undefined, config), "fake/global");
-    assert.equal(resolveModelDefault(undefined, undefined, { agents: {} }), undefined);
+    assert.equal(resolveModelDefault("scout", config), "fake/scout");
+    assert.equal(resolveModelDefault("reviewer", config), "fake/global");
+    assert.equal(resolveModelDefault(undefined, { agents: {} }), undefined);
+    assert.equal(resolveThinkingDefault("reviewer", config), undefined);
   });
 
   it("does not read inherited object properties as agent model defaults", () => {
     const config = parseModelConfig({ models: { agents: {} } });
     for (const agent of ["constructor", "toString", "__proto__"]) {
-      assert.equal(resolveModelDefault(agent, undefined, config), undefined);
+      assert.equal(resolveModelDefault(agent, config), undefined);
     }
   });
 
@@ -1010,8 +1012,8 @@ describe("model configuration", () => {
         '{"models":{"agents":{"constructor":"fake/constructor","__proto__":"fake/proto"}}}',
       ),
     );
-    assert.equal(resolveModelDefault("constructor", undefined, config), "fake/constructor");
-    assert.equal(resolveModelDefault("__proto__", undefined, config), "fake/proto");
+    assert.equal(resolveModelDefault("constructor", config), "fake/constructor");
+    assert.equal(resolveModelDefault("__proto__", config), "fake/proto");
   });
 
   it("rejects invalid model configuration", () => {
@@ -1030,6 +1032,27 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("ignores removed runtime frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(
+        globalAgentsDir,
+        "removed-runtime-frontmatter-test-agent",
+        [
+          "name: removed-runtime-frontmatter-test-agent",
+          "model: fake/frontmatter",
+          "thinking: max",
+          "tools: read",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("removed-runtime-frontmatter-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.model, undefined);
+      assert.equal(loaded.thinking, undefined);
+      assert.equal(loaded.tools, "read");
+    });
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
@@ -1037,7 +1060,6 @@ describe("subagent discovery", () => {
         "lineage-mode-test-agent",
         [
           "name: lineage-mode-test-agent",
-          "model: anthropic/test-lineage",
           "session-mode: lineage-only",
         ].join("\n"),
       );
@@ -1074,7 +1096,6 @@ describe("subagent discovery", () => {
         "interactive-true-test-agent",
         [
           "name: interactive-true-test-agent",
-          "model: anthropic/test-interactive-true",
           "interactive: true",
         ].join("\n"),
       );
@@ -1083,7 +1104,6 @@ describe("subagent discovery", () => {
         "interactive-false-test-agent",
         [
           "name: interactive-false-test-agent",
-          "model: anthropic/test-interactive-false",
           "interactive: false",
         ].join("\n"),
       );
@@ -1103,7 +1123,6 @@ describe("subagent discovery", () => {
         "interactive-unset-test-agent",
         [
           "name: interactive-unset-test-agent",
-          "model: anthropic/test-interactive-unset",
         ].join("\n"),
       );
 
@@ -1209,7 +1228,6 @@ describe("subagent discovery", () => {
         "invalid-mode-test-agent",
         [
           "name: invalid-mode-test-agent",
-          "model: anthropic/test-invalid",
           "session-mode: sideways",
         ].join("\n"),
       );
@@ -1340,7 +1358,6 @@ describe("subagent discovery", () => {
         [
           "name: visible-discovery-test-agent",
           "description: Visible test agent",
-          "model: anthropic/test-visible",
         ].join("\n"),
       );
 
@@ -1366,7 +1383,6 @@ describe("subagent discovery", () => {
         [
           "name: hidden-discovery-test-agent",
           "description: Hidden test agent",
-          "model: anthropic/test-hidden",
           "disable-model-invocation: true",
         ].join("\n"),
         "You are the hidden agent.",
@@ -1386,7 +1402,8 @@ describe("subagent discovery", () => {
 
       const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
       assert.ok(loaded, "expected hidden agent to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-hidden");
+      assert.equal(loaded.model, undefined);
+      assert.equal(loaded.thinking, undefined);
       assert.equal(loaded.body, "You are the hidden agent.");
       assert.equal(loaded.disableModelInvocation, true);
     });
@@ -1400,7 +1417,6 @@ describe("subagent discovery", () => {
         [
           "name: shadowed-discovery-test-agent",
           "description: Hidden global agent",
-          "model: anthropic/test-global",
           "disable-model-invocation: true",
         ].join("\n"),
         "You are the hidden global agent.",
@@ -1420,7 +1436,8 @@ describe("subagent discovery", () => {
 
       const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
       assert.ok(loaded, "expected hidden global agent to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-global");
+      assert.equal(loaded.model, undefined);
+      assert.equal(loaded.thinking, undefined);
       assert.equal(loaded.body, "You are the hidden global agent.");
       assert.equal(loaded.disableModelInvocation, true);
     });
@@ -1434,7 +1451,6 @@ describe("subagent discovery", () => {
         [
           "name: aliased-test-agent",
           "description: Frontmatter name differs from filename",
-          "model: anthropic/test-aliased",
         ].join("\n"),
         "You are the aliased agent.",
       );
@@ -1455,7 +1471,8 @@ describe("subagent discovery", () => {
         loadedByFrontmatterName,
         "loadAgentDefaults must resolve the same name the catalog advertises",
       );
-      assert.equal(loadedByFrontmatterName.model, "anthropic/test-aliased");
+      assert.equal(loadedByFrontmatterName.model, undefined);
+      assert.equal(loadedByFrontmatterName.thinking, undefined);
 
       const loadedByFilename = testApi.loadAgentDefaults("renamed-file-test-agent");
       assert.equal(
@@ -1514,7 +1531,7 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("buildAvailableAgentCatalog reflects a config.json model override, not just frontmatter", () => {
+  it("buildAvailableAgentCatalog reflects config model and thinking defaults", () => {
     const agents = [
       {
         name: "config-override-test-agent",
@@ -1525,12 +1542,13 @@ describe("subagent discovery", () => {
     ];
 
     const withoutOverride = testApi.buildAvailableAgentCatalog(agents, 24, { agents: {} });
-    assert.doesNotMatch(withoutOverride, /model /);
+    assert.doesNotMatch(withoutOverride, /defaults:/);
 
     const withOverride = testApi.buildAvailableAgentCatalog(agents, 24, {
-      agents: { "config-override-test-agent": "anthropic/test-config-model" },
+      agents: { "config-override-test-agent": "anthropic/test-config-model#low" },
     });
     assert.match(withOverride, /model anthropic\/test-config-model/);
+    assert.match(withOverride, /thinking low/);
   });
 });
 describe("subagent-done.ts", () => {
@@ -2107,7 +2125,7 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
-  it("advertises named agents and tells callers to preserve their runtime defaults", async () => {
+  it("advertises named agents and tells callers to use configured runtime defaults", async () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
         globalAgentsDir,
@@ -2115,8 +2133,6 @@ describe("tool registration", () => {
         [
           "name: researcher",
           "description: Researches external topics using authoritative sources",
-          "model: fake/research",
-          "thinking: max",
         ].join("\n"),
       );
 
@@ -2150,10 +2166,11 @@ describe("tool registration", () => {
         guidance,
         /researcher.*Researches external topics using authoritative sources/,
       );
-      assert.match(guidance, /omit.*model.*thinking.*named agent.*defaults/i);
+      assert.match(guidance, /omit.*model.*thinking.*named agent.*config/i);
+      assert.doesNotMatch(guidance, /frontmatter.*(?:model|thinking)/i);
       assert.match(
         subagent.parameters.properties.thinking.description,
-        /named agent's thinking default/i,
+        /config.*thinking.*suffix/i,
       );
     });
   });
@@ -2216,7 +2233,6 @@ describe("tool registration", () => {
       ]) {
         assert.equal(registeredTools.some((tool) => tool.name === name), false);
       }
-      assert.equal(registeredTools.some((tool) => tool.name === "set_tab_title"), true);
     } finally {
       delete process.env.PI_SUBAGENT_ID;
       delete process.env.PI_SUBAGENT_SPAWNING;

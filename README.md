@@ -187,16 +187,16 @@ If `PI_CODING_AGENT_DIR` is set, use `$PI_CODING_AGENT_DIR/agents/config.json` i
 
 `status.enabled` controls live status supervision. Status notifications cap at four lines (`lineLimit: 4`); extra lines collapse into an overflow summary. This limit is fixed.
 
-`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Append `#off`, `#minimal`, `#low`, `#medium`, `#high`, `#xhigh`, or `#max` to set thinking (for example, `openai-codex/gpt-5.6-line#xhigh`). Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Explicit `thinking` tool arguments take precedence over config thinking, which takes precedence over agent frontmatter and the parent level. Model values must be exact authenticated `provider/model-id` references, optionally followed by a thinking suffix.
+`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Append `#off`, `#minimal`, `#low`, `#medium`, `#high`, `#xhigh`, or `#max` to set thinking (for example, `openai-codex/gpt-5.6-line#xhigh`). Explicit `model` tool arguments take precedence, followed by `models.agents`, `models.default`, and the parent model. Explicit `thinking` tool arguments take precedence over the thinking suffix on the selected config model, followed by the parent level. Model values must be exact authenticated `provider/model-id` references, optionally followed by a thinking suffix.
 
-The model config is optional. Missing config leaves model selection unchanged and falls back to the parent model.
+The model config is optional. Missing config leaves model selection unchanged and makes thinking inherit the parent level.
 
 ---
 
 ## Spawning Subagents
 
 ```typescript
-// Named agent with defaults from agent definition or config.json
+// Named agent with role from definition and runtime from config.json
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
 // Full-context fork only when user explicitly requests it (e.g. /iterate)
@@ -215,11 +215,11 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | ---------------------- | ------- | -------------- | ------------------------------------------------------------------------------------------------- |
 | `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
-| `agent`                | string  | —              | Load defaults from agent definition                                                               |
+| `agent`                | string  | —              | Load role, tools, skills, and lifecycle defaults from agent definition                           |
 | `fork`                 | boolean | `false`        | Use only for an explicitly requested current-session fork; overrides agent `session-mode`; bare calls without `agent` require `fork: true` |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | agent, configured, or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
-| `thinking`             | string  | config, agent, or parent | Pi thinking level (`off` through `max`); resolution is tool argument → config suffix → agent frontmatter → parent |
+| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`; resolution is tool argument → `models.agents` → `models.default` → parent |
+| `thinking`             | string  | config or parent | Pi thinking level (`off` through `max`); resolution is tool argument → thinking suffix on selected config model → parent |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
@@ -319,8 +319,6 @@ Place a `.md` file in `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`).
 ---
 name: my-agent
 description: Does something specific
-model: anthropic/claude-sonnet-4-6
-thinking: minimal
 tools: read, bash, edit, write
 session-mode: lineage-only
 spawning: false
@@ -337,8 +335,6 @@ You are a specialized agent that does X...
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
-| `model`       | string  | Optional exact authenticated model default; omit to inherit the parent                                                                                                                                                                                                      |
-| `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit config or parent                                                                                                                                                                                                                             |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `lineage-only` when omitted; `standalone`, `lineage-only`, or `fork` |
@@ -347,6 +343,8 @@ You are a specialized agent that does X...
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+
+Runtime model selection belongs in `config.json` under `models.agents`; append a thinking suffix to the selected model value when needed. `model` and `thinking` frontmatter fields are ignored.
 
 ---
 

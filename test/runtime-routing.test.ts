@@ -67,7 +67,7 @@ describe("runtime routing", () => {
     });
   });
 
-  it("resolves tool-call fields over agent defaults independently", () => {
+  it("resolves tool-call fields over configured defaults independently", () => {
     assert.deepEqual(
       resolve(
         { thinking: "high" },
@@ -126,7 +126,7 @@ describe("runtime routing", () => {
     );
   });
 
-  it("uses agent-default thinking when the request omits it", () => {
+  it("uses configured default thinking when the request omits it", () => {
     const plan = resolveRuntimePlan({}, { thinking: "low" }, parent, registry());
     assert.equal(plan.thinking, "low");
     assert.equal(plan.thinkingSource, "agent");
