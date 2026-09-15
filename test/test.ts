@@ -11,6 +11,7 @@ import {
   selectCompletionApi,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
+  waitForCompletionOrAbort,
 } from "../pi-extension/subagents/index.ts";
 
 import {
@@ -31,6 +32,10 @@ import {
   resolveModelDefault,
   resolveThinkingDefault,
 } from "../pi-extension/subagents/model-config.ts";
+import {
+  loadOrchestrationConfig,
+  parseOrchestrationConfig,
+} from "../pi-extension/subagents/orchestration-config.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -917,6 +922,47 @@ describe("status.ts", () => {
     assert.match(aggregate, /^Subagent status:/);
     assert.match(aggregate, /\+2 more running\./);
     assert.doesNotMatch(aggregate, /\/tmp|\.jsonl/);
+  });
+});
+
+describe("orchestration configuration", () => {
+  it("defaults to async when orchestration mode is omitted", () => {
+    assert.deepEqual(parseOrchestrationConfig({}), { mode: "async" });
+    assert.deepEqual(parseOrchestrationConfig({ orchestration: {} }), { mode: "async" });
+  });
+
+  it("accepts wait-all", () => {
+    assert.deepEqual(
+      parseOrchestrationConfig({ orchestration: { mode: "wait-all" } }),
+      { mode: "wait-all" },
+    );
+  });
+
+  it("describes each completion mode accurately", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.match(testApi.buildSubagentCompletionGuidance("async"), /returns immediately/i);
+    assert.match(testApi.buildSubagentCompletionGuidance("wait-all"), /waits for terminal/i);
+  });
+
+  it("rejects invalid orchestration configuration", () => {
+    assert.throws(
+      () => parseOrchestrationConfig({ orchestration: { mode: "fan-in" } }),
+      /orchestration\.mode must be "async" or "wait-all"/,
+    );
+    assert.throws(
+      () => parseOrchestrationConfig({ orchestration: { mode: "async", extra: true } }),
+      /orchestration has unsupported key\(s\): extra/,
+    );
+  });
+
+  it("loads orchestration mode beside global agent definitions", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeFileSync(
+        join(globalAgentsDir, "config.json"),
+        JSON.stringify({ orchestration: { mode: "wait-all" } }),
+      );
+      assert.deepEqual(loadOrchestrationConfig(), { mode: "wait-all" });
+    });
   });
 });
 
@@ -2125,6 +2171,15 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("allows sibling subagents in one tool batch to launch concurrently", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagent = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagent);
+    assert.equal(subagent.executionMode, "parallel");
+  });
+
   it("advertises named agents and tells callers to use configured runtime defaults", async () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
@@ -2335,6 +2390,15 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
+  it("lets resumed subagents join parallel wait-all batches", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+    assert.ok(resumeTool, "expected subagent_resume tool to be registered");
+    assert.equal(resumeTool.executionMode, "parallel");
+  });
+
   it("registers subagent_resume with an autoExit override", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -2349,6 +2413,27 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("releases parent wait without aborting subagent completion", async () => {
+    const controller = new AbortController();
+    let finish!: (value: string) => void;
+    const completion = new Promise<string>((resolve) => { finish = resolve; });
+
+    const waiting = waitForCompletionOrAbort(completion, controller.signal);
+    controller.abort();
+    assert.deepEqual(await waiting, { cancelled: true });
+
+    finish("finished");
+    assert.deepEqual(await waitForCompletionOrAbort(completion), { result: "finished" });
+  });
+
+  it("suppresses status steers while wait-all calls are pending", () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    assert.equal(testApi.shouldSteerStatusTransition({ interactive: false, orchestrationMode: "wait-all" }), false);
+    assert.equal(testApi.shouldSteerStatusTransition({ interactive: false, orchestrationMode: "async" }), true);
+    assert.equal(testApi.shouldSteerStatusTransition({ interactive: true, orchestrationMode: "async" }), false);
+  });
+
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
     const agents = new Map([["child", {
@@ -2850,6 +2935,25 @@ describe("subagent interruption", () => {
     } finally {
       runningMap.clear();
     }
+  });
+
+  it("returns caller_ping through its wait-all tool result", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveWaitAllResultPresentation(
+      {
+        exitCode: 0,
+        elapsed: 3,
+        summary: "ignored",
+        sessionFile: "/tmp/subagent.jsonl",
+        ping: { name: "Worker", message: "Need a decision" },
+      },
+      "Worker",
+    );
+
+    assert.match(presentation, /needs help/);
+    assert.match(presentation, /Need a decision/);
+    assert.match(presentation, /Resume: pi --session/);
+    assert.doesNotMatch(presentation, /completed/);
   });
 
   it("formats exit code 130 as an ordinary failure", () => {

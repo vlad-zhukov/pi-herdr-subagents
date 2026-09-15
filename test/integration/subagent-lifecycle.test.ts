@@ -17,7 +17,7 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import {
   getAvailableBackends,
   setBackend,
@@ -37,6 +37,17 @@ import {
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
+
+function configureWaitAll(env: TestEnv): void {
+  writeFileSync(
+    `${env.agentDir}/agents/config.json`,
+    JSON.stringify({
+      status: { enabled: true },
+      models: { default: process.env.PI_TEST_MODEL ?? "openrouter/free" },
+      orchestration: { mode: "wait-all" },
+    }),
+  );
+}
 
 if (backends.length === 0) {
   console.log("⚠️  herdr is unavailable — skipping subagent lifecycle integration tests");
@@ -106,6 +117,167 @@ for (const backend of backends) {
         assert.equal(header.type, "session", "First entry should be session header");
         assert.ok(header.id, "Session header should have an id");
       }
+    });
+
+    it("async returns before the subagent completes", async () => {
+      const id = uniqueId();
+      const childFile = `/tmp/pi-integ-async-child-${id}.txt`;
+      const parentFile = `/tmp/pi-integ-async-parent-${id}.txt`;
+      trackTempFile(env, childFile);
+      trackTempFile(env, parentFile);
+
+      const surface = createTrackedSurface(env, `async-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        "Call subagent exactly once with these parameters:",
+        `name: "Async-${id}"`,
+        'agent: "test-echo"',
+        `task: "Run: sleep 5; echo 'CHILD_${id}' > '${childFile}'"`,
+        `Immediately after subagent returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
+        "Then say ASYNC_COMPLETE.",
+      ].join("\n"));
+
+      const parent = await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
+      assert.match(parent, new RegExp(`PARENT_${id}`));
+      assert.equal(existsSync(childFile), false, "async parent work must start before child completion");
+      await waitForFile(childFile, PI_TIMEOUT, /CHILD_/);
+    });
+
+    it("wait-all returns the terminal subagent result before parent work continues", async () => {
+      const id = uniqueId();
+      const childFile = `/tmp/pi-integ-wait-all-child-${id}.txt`;
+      const parentFile = `/tmp/pi-integ-wait-all-parent-${id}.txt`;
+      trackTempFile(env, childFile);
+      trackTempFile(env, parentFile);
+      configureWaitAll(env);
+
+      const surface = createTrackedSurface(env, `wait-all-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        `Call subagent exactly once with name "WaitAll-${id}", agent "test-echo",`,
+        `and task "Run: sleep 5; echo 'CHILD_${id}' > '${childFile}'".`,
+        `Only after that tool call returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
+        "Then say WAIT_ALL_COMPLETE.",
+      ].join("\n"));
+
+      const parent = await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
+      assert.match(parent, new RegExp(`PARENT_${id}`));
+      assert.equal(existsSync(childFile), true, "child must finish before parent continues");
+      assert.match(readFileSync(childFile, "utf8"), new RegExp(`CHILD_${id}`));
+      const screen = await waitForScreen(surface, /WAIT_ALL_COMPLETE/, PI_TIMEOUT);
+      const completed = screen.match(new RegExp(`Sub-agent "WaitAll-${id}" completed`, "g")) ?? [];
+      assert.equal(completed.length, 1, "wait-all must return one terminal result without a completion steer");
+    });
+
+    it("wait-all holds an interactive subagent until explicit completion", async () => {
+      const id = uniqueId();
+      const parentFile = `/tmp/pi-integ-wait-all-interactive-parent-${id}.txt`;
+      trackTempFile(env, parentFile);
+      configureWaitAll(env);
+
+      const name = `InteractiveWaitAll-${id}`;
+      const surface = createTrackedSurface(env, `interactive-wait-all-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        `Call subagent exactly once with name "${name}", agent "test-interactive-done", and task "finish".`,
+        `Only after that tool call returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
+        "Then say INTERACTIVE_WAIT_ALL_COMPLETE.",
+      ].join("\n"));
+
+      await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
+      const screen = await waitForScreen(surface, /INTERACTIVE_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
+      assert.equal(
+        (screen.match(new RegExp(`Sub-agent "${name}" completed`, "g")) ?? []).length,
+        1,
+        "interactive completion needs one original-call result",
+      );
+    });
+
+    it("wait-all returns a resumed subagent result through its original tool call", async () => {
+      const id = uniqueId();
+      const firstFile = `/tmp/pi-integ-wait-all-resume-first-${id}.txt`;
+      const resumedFile = `/tmp/pi-integ-wait-all-resume-result-${id}.txt`;
+      const parentFile = `/tmp/pi-integ-wait-all-resume-parent-${id}.txt`;
+      trackTempFile(env, firstFile);
+      trackTempFile(env, resumedFile);
+      trackTempFile(env, parentFile);
+      configureWaitAll(env);
+
+      const firstName = `ResumeSource-${id}`;
+      const resumeName = `ResumeWaitAll-${id}`;
+      const surface = createTrackedSurface(env, `resume-wait-all-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        `Call subagent with name "${firstName}", agent "test-echo", and task "Run: echo 'FIRST_${id}' > '${firstFile}'".`,
+        `After its result returns, call subagent_resume using that result's Session path, name "${resumeName}",`,
+        `and message "Run bash: echo 'RESUMED_${id}' > '${resumedFile}'".`,
+        `Only after subagent_resume returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
+        "Then say RESUME_WAIT_ALL_COMPLETE.",
+      ].join("\n"));
+
+      await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
+      assert.match(await waitForFile(resumedFile, PI_TIMEOUT, /RESUMED_/), new RegExp(`RESUMED_${id}`));
+      const screen = await waitForScreen(surface, /RESUME_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
+      assert.equal(
+        (screen.match(new RegExp(`Sub-agent "${resumeName}" completed`, "g")) ?? []).length,
+        1,
+        "resumed subagent needs one original-call result",
+      );
+    });
+
+    it("wait-all settles a parallel batch with distinct success and failure results", async () => {
+      const id = uniqueId();
+      const successStart = `/tmp/pi-integ-parallel-success-start-${id}.txt`;
+      const failureStart = `/tmp/pi-integ-parallel-failure-start-${id}.txt`;
+      const successDone = `/tmp/pi-integ-parallel-success-done-${id}.txt`;
+      const failureDone = `/tmp/pi-integ-parallel-failure-done-${id}.txt`;
+      const parentFile = `/tmp/pi-integ-parallel-parent-${id}.txt`;
+      trackTempFile(env, successStart);
+      trackTempFile(env, failureStart);
+      trackTempFile(env, successDone);
+      trackTempFile(env, failureDone);
+      trackTempFile(env, parentFile);
+      configureWaitAll(env);
+      writeFileSync(
+        `${env.agentDir}/agents/parallel-success-${id}.md`,
+        `---\nname: parallel-success-${id}\ncli: test-shell\ncommand: "date +%s%3N > '${successStart}'; sleep 5; printf done > '${successDone}'; true"\n---\n`,
+      );
+      writeFileSync(
+        `${env.agentDir}/agents/parallel-failure-${id}.md`,
+        `---\nname: parallel-failure-${id}\ncli: test-shell\ncommand: "date +%s%3N > '${failureStart}'; sleep 1; printf done > '${failureDone}'; false"\n---\n`,
+      );
+
+      const successName = `ParallelSuccess-${id}`;
+      const failureName = `ParallelFailure-${id}`;
+      const surface = createTrackedSurface(env, `parallel-wait-all-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        "Make exactly two subagent tool calls in one assistant response. Do not make any other tool calls until both return.",
+        `First: name "${successName}", agent "parallel-success-${id}", task "success".`,
+        `Second: name "${failureName}", agent "parallel-failure-${id}", task "failure".`,
+        `After both results return, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
+        "Then say PARALLEL_WAIT_ALL_COMPLETE and nothing else.",
+      ].join("\n"));
+
+      await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
+      assert.equal(existsSync(successDone), true, "successful sibling must finish before parent continues");
+      assert.equal(existsSync(failureDone), true, "failed sibling must settle before parent continues");
+      assert.ok(
+        Math.abs(Number(readFileSync(successStart, "utf8")) - Number(readFileSync(failureStart, "utf8"))) < 3_000,
+        "siblings must launch concurrently, not after each other's terminal result",
+      );
+
+      const screen = await waitForScreen(surface, /PARALLEL_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
+      assert.equal(
+        (screen.match(new RegExp(`Sub-agent "${successName}" completed`, "g")) ?? []).length,
+        1,
+        "successful sibling needs one original-call result",
+      );
+      assert.equal(
+        (screen.match(new RegExp(`Sub-agent "${failureName}" failed`, "g")) ?? []).length,
+        1,
+        "failed sibling needs one original-call result",
+      );
     });
 
     // ── In-progress activity snapshots ──
@@ -275,6 +447,30 @@ for (const backend of backends) {
       assert.ok(
         /needs help|PING/i.test(screen),
         `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
+      );
+    });
+
+    it("wait-all returns caller_ping through its original tool result", async () => {
+      const id = uniqueId();
+      const parentFile = `/tmp/pi-integ-wait-all-ping-parent-${id}.txt`;
+      trackTempFile(env, parentFile);
+      configureWaitAll(env);
+
+      const name = `WaitAllPing-${id}`;
+      const surface = createTrackedSurface(env, `wait-all-ping-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        `Call subagent exactly once with name "${name}", agent "test-ping", and task "PING_${id}".`,
+        `Only after that tool call returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
+        "Then say WAIT_ALL_PING_COMPLETE.",
+      ].join("\n"));
+
+      await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
+      const screen = await waitForScreen(surface, /WAIT_ALL_PING_COMPLETE/, PI_TIMEOUT);
+      assert.equal(
+        (screen.match(new RegExp(`Sub-agent "${name}" needs help`, "g")) ?? []).length,
+        1,
+        "caller_ping needs one original-call result without a steer duplicate",
       );
     });
 

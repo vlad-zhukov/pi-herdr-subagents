@@ -44,6 +44,10 @@ import {
   resolveThinkingDefault,
   type ModelConfig,
 } from "./model-config.ts";
+import {
+  loadOrchestrationConfig,
+  type OrchestrationMode,
+} from "./orchestration-config.ts";
 
 import {
   findLastAssistantMessage,
@@ -462,6 +466,16 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 
 const statusConfig = loadStatusConfig();
 const modelConfig = loadModelConfig();
+const orchestrationConfig = loadOrchestrationConfig();
+
+function buildSubagentCompletionGuidance(mode: OrchestrationMode): string {
+  if (mode === "wait-all") {
+    return "This call waits for terminal Subagent result; do not poll for completion or invent results.";
+  }
+  return "This fire-and-forget call returns immediately. Completion is delivered automatically as a steer message; do not poll for completion or invent results.";
+}
+
+const subagentCompletionGuidance = buildSubagentCompletionGuidance(orchestrationConfig.mode);
 
 function resolveResultPresentation(
   result: Pick<
@@ -513,6 +527,16 @@ interface SubagentResult {
 /**
  * State for a launched (but not yet completed) subagent.
  */
+function resolveWaitAllResultPresentation(result: SubagentResult, name: string): string {
+  if (result.ping) {
+    const sessionRef = result.sessionFile
+      ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+      : "";
+    return `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`;
+  }
+  return resolveResultPresentation(result, name);
+}
+
 interface RunningSubagent {
   id: string;
   name: string;
@@ -549,6 +573,8 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** Mode captured when this Subagent launched. */
+  orchestrationMode: OrchestrationMode;
 }
 
 interface SubagentRuntime {
@@ -598,6 +624,29 @@ export function shouldDeliverSubagentCompletion(
 
 export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
   return current ?? previous;
+}
+
+export function waitForCompletionOrAbort<T>(
+  completion: Promise<T>,
+  signal?: AbortSignal,
+): Promise<{ result: T } | { cancelled: true }> {
+  if (!signal) return completion.then((result) => ({ result }));
+  if (signal.aborted) return Promise.resolve({ cancelled: true });
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve({ cancelled: true });
+    signal.addEventListener("abort", onAbort, { once: true });
+    completion.then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve({ result });
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 // ── Widget management ──
@@ -941,6 +990,12 @@ function handleSubagentInterrupt(
   };
 }
 
+function shouldSteerStatusTransition(
+  running: Pick<RunningSubagent, "interactive" | "orchestrationMode">,
+): boolean {
+  return !running.interactive && running.orchestrationMode !== "wait-all";
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -972,7 +1027,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       // wake the parent session on stalled/recovered transitions — the user is
       // working in the subagent's pane, and a steer message here would burn an
       // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
-      if (transition && !running.interactive) {
+      if (transition && shouldSteerStatusTransition(running)) {
         transitionLines.push(
           formatLifecycleTransitionLine(
             normalizeStatusName(running.name),
@@ -1030,9 +1085,12 @@ export const __test__ = {
   requestSubagentInterrupt,
   handleSubagentInterrupt,
   resolveResultPresentation,
+  resolveWaitAllResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
+  buildSubagentCompletionGuidance,
+  shouldSteerStatusTransition,
 };
 
 function startWidgetRefresh() {
@@ -1208,6 +1266,7 @@ async function launchSubagent(
     sentinelFile: built.sentinelFile,
     interactive: effectiveInteractive,
     runtimePlan,
+    orchestrationMode: orchestrationConfig.mode,
     activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
     lifecycle: !driver.hasActivitySnapshots
       ? markProcessRunning(createLifecycle(startTime), Date.now())
@@ -1431,22 +1490,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Spawn a sub-agent in a dedicated terminal herdr pane. " +
         "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); do not choose it yourself. " +
         "Bare child spawns without agent are rejected unless fork: true is set. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        subagentCompletionGuidance,
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal herdr pane. " +
         "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); do not choose it yourself. " +
         "Bare child spawns without agent are rejected unless fork: true is set. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        subagentCompletionGuidance,
       promptGuidelines: subagentRoutingGuidelines,
       parameters: SubagentParams,
+      executionMode: "parallel",
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const validationError = validateSubagentRequest(params);
@@ -1512,9 +1564,40 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
+        const completion = watchSubagent(running, watcherAbort.signal);
+
+        if (running.orchestrationMode === "wait-all") {
+          const waiting = await waitForCompletionOrAbort(completion, _signal);
+          if ("cancelled" in waiting) {
+            deliverCompletion();
+            return {
+              content: [{ type: "text" as const, text: "Wait cancelled. Subagent continues; terminal result will arrive through Completion delivery." }],
+              details: { id: running.id, name: running.name, status: "wait_cancelled" },
+            };
+          }
+          const result = waiting.result;
+          running.lifecycle = markDelivery(running.lifecycle, "delivered");
+          runningSubagents.delete(running.id);
+          updateWidget();
+
+          return {
+            content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(result, running.name) }],
+            details: {
+              id: running.id,
+              name: running.name,
+              task: running.task,
+              agent: running.agent,
+              exitCode: result.exitCode,
+              elapsed: result.elapsed,
+              sessionFile: result.sessionFile,
+              status: "completed",
+            },
+          };
+        }
+
+        function deliverCompletion(): void {
+          completion
+            .then((result) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -1590,7 +1673,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          });
+            });
+        }
+
+        deliverCompletion();
 
         // Return immediately
         return {
@@ -1791,18 +1877,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "Resume Subagent",
       description:
         "Resume a previous sub-agent session in a new herdr pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        subagentCompletionGuidance +
+        " Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
         "Resume a previous sub-agent session in a new herdr pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        subagentCompletionGuidance +
+        " Use when a sub-agent was cancelled or needs follow-up work.",
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
@@ -1820,6 +1900,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         ),
       }),
+      executionMode: "parallel",
 
       renderCall(args, theme) {
         const name = args.name ?? "Resume";
@@ -1956,19 +2037,61 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           activityFile,
           interactive,
           runtimePlan: undefined,
+          orchestrationMode: orchestrationConfig.mode,
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget watcher
+        // Watch completion
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
+        const completion = watchSubagent(running, watcherAbort.signal);
+        const resolveResumeResult = (result: SubagentResult): SubagentResult => {
+          const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
+          const summary = findLastAssistantMessage(allEntries) ??
+            (result.errorMessage
+              ? `Subagent error: ${result.errorMessage}`
+              : result.exitCode !== 0
+                ? `Resumed session exited with code ${result.exitCode}`
+                : "Resumed session exited without new output");
+          return { ...result, summary, sessionFile: params.sessionPath };
+        };
+
+        if (running.orchestrationMode === "wait-all") {
+          const waiting = await waitForCompletionOrAbort(completion, _signal);
+          if ("cancelled" in waiting) {
+            deliverCompletion();
+            return {
+              content: [{ type: "text" as const, text: "Wait cancelled. Resumed Subagent continues; terminal result will arrive through Completion delivery." }],
+              details: { id, name, sessionPath: params.sessionPath, status: "wait_cancelled" },
+            };
+          }
+          const result = resolveResumeResult(waiting.result);
+          running.lifecycle = markDelivery(running.lifecycle, "delivered");
+          runningSubagents.delete(running.id);
+          updateWidget();
+
+          return {
+            content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(result, name) }],
+            details: {
+              id,
+              name,
+              sessionPath: params.sessionPath,
+              launchScriptFile,
+              exitCode: result.exitCode,
+              elapsed: result.elapsed,
+              status: "completed",
+            },
+          };
+        }
+
+        function deliverCompletion(): void {
+          completion
+            .then((result) => {
+              if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
               updateWidget();
@@ -1997,17 +2120,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
-            const basePresentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
-              name,
-            );
+            const basePresentation = resolveResultPresentation(resolveResumeResult(result), name);
             const presentation = running.runtimePlan?.runtimeMismatch
               ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
               : basePresentation;
@@ -2049,7 +2162,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          });
+            });
+        }
+
+        deliverCompletion();
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],

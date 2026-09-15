@@ -4,5 +4,8 @@
   },
   "models": {
     "agents": {}
+  },
+  "orchestration": {
+    "mode": "async"
   }
 }
