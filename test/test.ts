@@ -15,13 +15,9 @@ import {
 } from "../pi-extension/subagents/index.ts";
 
 import {
-  getLeafId,
   getNewEntries,
   findLastAssistantMessage,
   findObservedSessionRuntime,
-  appendBranchSummary,
-  copySessionFile,
-  mergeNewEntries,
   seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
@@ -260,19 +256,6 @@ describe("session.ts", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  describe("getLeafId", () => {
-    it("returns last entry id", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
-      assert.equal(getLeafId(file), "asst-001");
-    });
-
-    it("returns null for empty file", () => {
-      const file = join(dir, "empty.jsonl");
-      writeFileSync(file, "");
-      assert.equal(getLeafId(file), null);
-    });
-  });
-
   describe("getNewEntries", () => {
     it("returns entries after a given line", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
@@ -405,50 +388,6 @@ describe("session.ts", () => {
     });
   });
 
-  describe("appendBranchSummary", () => {
-    it("appends valid branch_summary entry", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
-      const id = appendBranchSummary(file, "user-001", "asst-001", "The plan was created.");
-
-      assert.ok(id, "should return an id");
-      assert.equal(typeof id, "string");
-
-      // Read back and verify
-      const lines = readFileSync(file, "utf8").trim().split("\n");
-      assert.equal(lines.length, 4); // 3 original + 1 summary
-
-      const summary = JSON.parse(lines[3]);
-      assert.equal(summary.type, "branch_summary");
-      assert.equal(summary.id, id);
-      assert.equal(summary.parentId, "user-001");
-      assert.equal(summary.fromId, "asst-001");
-      assert.equal(summary.summary, "The plan was created.");
-      assert.ok(summary.timestamp);
-    });
-
-    it("uses branchPointId as fromId fallback", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER]);
-      appendBranchSummary(file, "branch-pt", null, "summary");
-
-      const lines = readFileSync(file, "utf8").trim().split("\n");
-      const summary = JSON.parse(lines[1]);
-      assert.equal(summary.fromId, "branch-pt");
-    });
-  });
-
-  describe("copySessionFile", () => {
-    it("creates a copy with different path", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG]);
-      const copyDir = join(dir, "copies");
-      mkdirSync(copyDir, { recursive: true });
-      const copy = copySessionFile(file, copyDir);
-
-      assert.notEqual(copy, file);
-      assert.ok(copy.endsWith(".jsonl"));
-      assert.equal(readFileSync(copy, "utf8"), readFileSync(file, "utf8"));
-    });
-  });
-
   describe("seedSubagentSessionFile", () => {
     it("creates a lineage-only child session with parent linkage and no copied turns", () => {
       const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
@@ -495,30 +434,7 @@ describe("session.ts", () => {
     });
   });
 
-  describe("mergeNewEntries", () => {
-    it("appends new entries from source to target", () => {
-      // Source starts with same base (2 entries), then has 1 new entry
-      const sourceFile = join(dir, "merge-source.jsonl");
-      const targetFile = join(dir, "merge-target.jsonl");
-      writeFileSync(
-        sourceFile,
-        [SESSION_HEADER, USER_MSG, ASSISTANT_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
-      );
-      writeFileSync(
-        targetFile,
-        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
-      );
 
-      // Merge entries after line 2 (the shared base)
-      const merged = mergeNewEntries(sourceFile, targetFile, 2);
-      assert.equal(merged.length, 1);
-      assert.equal(merged[0].id, "asst-001");
-
-      // Target should now have 3 entries
-      const targetLines = readFileSync(targetFile, "utf8").trim().split("\n");
-      assert.equal(targetLines.length, 3);
-    });
-  });
 });
 
 describe("status.ts", () => {
