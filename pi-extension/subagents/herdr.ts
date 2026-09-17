@@ -249,6 +249,15 @@ export function sendHerdrCommand(surface: string, command: string): void {
   herdrExec(["pane", "run", surface, command]);
 }
 
+function buildAgentPromptArgs(surface: string, message: string): string[] {
+  return ["agent", "prompt", surface, message];
+}
+
+/** Submit through Herdr agent API, preserving Pi editor input semantics. */
+export function sendHerdrAgentPrompt(surface: string, message: string): void {
+  herdrExec(buildAgentPromptArgs(surface, message));
+}
+
 export function sendHerdrEscape(surface: string): void {
   herdrExec(["pane", "send-keys", surface, "Escape"]);
 }
@@ -312,6 +321,7 @@ export function reportHerdrPaneTask(
 export const __herdrTest__ = {
   buildTabCreateArgs,
   buildPaneReportTaskArgs,
+  buildAgentPromptArgs,
   parseHerdrJson,
   extractHerdrPaneId,
   extractHerdrRootPaneId,

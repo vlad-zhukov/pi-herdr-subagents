@@ -15,6 +15,15 @@ import {
 } from "../pi-extension/subagents/index.ts";
 
 import {
+  handlePromptError,
+  restoreSubagentHandles,
+  saveSubagentHandle,
+  type SubagentHandle,
+} from "../pi-extension/subagents/assignment-handles.ts";
+
+import { buildPiContinuationCommand } from "../pi-extension/subagents/harness/drivers/pi.ts";
+
+import {
   getNewEntries,
   findLastAssistantMessage,
   findObservedSessionRuntime,
@@ -244,6 +253,70 @@ const TOOL_RESULT = {
 };
 
 // --- Tests ---
+
+describe("durable subagent handles", () => {
+  const handle: SubagentHandle = {
+    id: "child-001",
+    name: "Scout",
+    sessionFile: "/tmp/child-001.jsonl",
+    surface: "w1:p2",
+    state: "finalized",
+    autoExit: false,
+    interactive: false,
+    createdAt: 1_000,
+  };
+
+  it("persists immutable handles and restores latest lifecycle state", () => {
+    const saved: Array<{ customType: string; data: unknown }> = [];
+    saveSubagentHandle((customType, data) => saved.push({ customType, data }), {
+      ...handle,
+      state: "active",
+    });
+    saveSubagentHandle((customType, data) => saved.push({ customType, data }), handle);
+
+    const restored = restoreSubagentHandles(saved.map(({ customType, data }) => ({
+      type: "custom",
+      customType,
+      data,
+    })));
+    assert.deepEqual(restored.get(handle.id), handle);
+  });
+
+  it("reopens with original Pi launch settings without resolving config", () => {
+    const command = buildPiContinuationCommand({
+      handle: {
+        ...handle,
+        agent: "scout",
+        agentDir: "/agents/scout",
+        cwd: "/work/scout",
+        spawning: true,
+        autoExit: true,
+      },
+      surface: "w1:p9",
+      activityFile: "/artifacts/activity.json",
+      messageFile: "/artifacts/message.md",
+      doneExtension: "/extension/subagent-done.ts",
+    });
+
+    assert.match(command, /^cd '\/work\/scout' && /);
+    for (const setting of [
+      "PI_CODING_AGENT_DIR='/agents/scout'",
+      "PI_SUBAGENT_SPAWNING=1",
+      "PI_SUBAGENT_NAME='Scout'",
+      "PI_SUBAGENT_AGENT='scout'",
+      "PI_SUBAGENT_AUTO_EXIT=1",
+      "pi --session '/tmp/child-001.jsonl'",
+    ]) assert.match(command, new RegExp(setting.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  });
+
+  it("rejects unknown, detached, abandoned, and locked handles without mutation", () => {
+    assert.equal(handlePromptError(undefined, false), "Unknown subagent handle.");
+    assert.match(handlePromptError({ ...handle, state: "accepted" }, false)!, /accepted/);
+    assert.match(handlePromptError({ ...handle, state: "abandoned" }, false)!, /abandoned/);
+    assert.match(handlePromptError(handle, true)!, /busy/);
+    assert.equal(handlePromptError(handle, false), null);
+  });
+});
 
 describe("session.ts", () => {
   let dir: string;
@@ -1894,7 +1967,7 @@ describe("tool registration", () => {
       assert.equal(registeredTools.some((tool) => tool.name === "subagent"), true);
       assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
       assert.equal(registeredTools.some((tool) => tool.name === "subagents_list"), true);
-      assert.equal(registeredTools.some((tool) => tool.name === "subagent_resume"), true);
+      assert.equal(registeredTools.some((tool) => tool.name === "subagent_prompt"), true);
     } finally {
       delete process.env.PI_SUBAGENT_SPAWNING;
     }
@@ -1910,7 +1983,7 @@ describe("tool registration", () => {
         "subagent",
         "subagent_interrupt",
         "subagents_list",
-        "subagent_resume",
+        "subagent_prompt",
       ]) {
         assert.equal(registeredTools.some((tool) => tool.name === name), false);
       }
@@ -1930,7 +2003,7 @@ describe("tool registration", () => {
         "subagent",
         "subagent_interrupt",
         "subagents_list",
-        "subagent_resume",
+        "subagent_prompt",
       ]) {
         assert.equal(registeredTools.some((tool) => tool.name === name), true);
       }
@@ -1940,17 +2013,43 @@ describe("tool registration", () => {
     }
   });
 
-  it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
-    const testApi = (subagentsModule as any).__test__;
+  it("registers subagent_prompt for handle-based continuation", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
 
-    assert.deepEqual(testApi.resolveResumeLaunchBehavior({}), {
+    const promptTool = registeredTools.find((tool) => tool.name === "subagent_prompt");
+    assert.ok(promptTool, "expected subagent_prompt tool to be registered");
+    assert.equal(promptTool.executionMode, "parallel");
+    assert.equal(promptTool.parameters.properties.id.type, "string");
+    assert.equal(promptTool.parameters.properties.message.type, "string");
+    assert.equal(promptTool.parameters.properties.name, undefined);
+    assert.equal(promptTool.parameters.properties.sessionPath, undefined);
+  });
+
+  it("rejects continuation while initial Pi input lock is held", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const promptTool = registeredTools.find((tool) => tool.name === "subagent_prompt");
+    const testApi = (subagentsModule as any).__test__;
+    const id = "initial-turn-lock";
+    const handle = {
+      id,
+      name: "Worker",
+      sessionFile: "/tmp/worker.jsonl",
+      state: "active",
       autoExit: true,
       interactive: false,
-    });
-    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: false }), {
-      autoExit: false,
-      interactive: true,
-    });
+      createdAt: 1,
+    };
+    testApi.subagentHandles.set(id, handle);
+    testApi.runningSubagents.set(id, { inputLocked: true });
+    try {
+      const result = await promptTool.execute("test", { id, message: "Continue" }, new AbortController().signal, undefined, {});
+      assert.match(result.content[0].text, /busy/);
+    } finally {
+      testApi.subagentHandles.delete(id);
+      testApi.runningSubagents.delete(id);
+    }
   });
 
   it("defaults child spawning off and allows explicit opt-in", () => {
@@ -2012,29 +2111,21 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("lets resumed subagents join parallel wait-all batches", () => {
-    const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
 
-    const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
-    assert.ok(resumeTool, "expected subagent_resume tool to be registered");
-    assert.equal(resumeTool.executionMode, "parallel");
-  });
-
-  it("registers subagent_resume with an autoExit override", () => {
-    const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-
-    const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
-    assert.ok(resumeTool, "expected subagent_resume tool to be registered");
-
-    const autoExitSchema = resumeTool.parameters.properties.autoExit;
-    assert.equal(autoExitSchema.type, "boolean");
-    assert.match(autoExitSchema.description, /Defaults to true/);
-  });
 });
 
 describe("subagent parent lifecycle", () => {
+  it("upgrades reload-persisted runtime objects with durable handles", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningSubagents = new Map();
+    const legacyRuntime = { runningSubagents };
+
+    const runtime = testApi.ensureSubagentRuntime(legacyRuntime);
+    assert.equal(runtime, legacyRuntime);
+    assert.equal(runtime.runningSubagents, runningSubagents);
+    assert.ok(runtime.handles instanceof Map);
+  });
+
   it("releases parent wait without aborting subagent completion", async () => {
     const controller = new AbortController();
     let finish!: (value: string) => void;
@@ -2574,7 +2665,7 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /needs help/);
     assert.match(presentation, /Need a decision/);
-    assert.match(presentation, /Resume: pi --session/);
+    assert.match(presentation, /Session: \/tmp\/subagent.jsonl/);
     assert.doesNotMatch(presentation, /completed/);
   });
 
@@ -2592,7 +2683,7 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
-    assert.match(presentation, /Resume: pi --session/);
+    assert.match(presentation, /Session: \/tmp\/subagent.jsonl/);
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {
@@ -2616,9 +2707,27 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
-    assert.match(presentation, /subagent_resume/);
-    assert.match(presentation, /Resume: pi --session/);
+    assert.match(presentation, /retry by spawning a new subagent/);
+    assert.match(presentation, /Session: \/tmp\/subagent.jsonl/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+});
+
+describe("subagent result renderer", () => {
+  it("shows durable continuation instead of raw-session resume", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const renderer = registeredMessageRenderers.find((entry) => entry.name === "subagent_result");
+    assert.ok(renderer);
+    const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text, bold: (text: string) => text };
+    const output = renderer.renderer(
+      { customType: "subagent_result", content: "done", details: { id: "child-1", name: "Worker", sessionFile: "/tmp/worker.jsonl" } },
+      { expanded: true },
+      theme,
+    ).render(120).join("\n");
+
+    assert.match(output, /Continue: subagent_prompt/);
+    assert.doesNotMatch(output, /Resume:.*pi --session/);
   });
 });
 
@@ -2968,6 +3077,13 @@ describe("herdr.ts", () => {
         "/repo",
         "--no-focus",
       ]);
+    });
+
+    it("submits live prompts through the agent API", () => {
+      assert.deepEqual(
+        __herdrTest__.buildAgentPromptArgs("w1:p2", "Continue with v2"),
+        ["agent", "prompt", "w1:p2", "Continue with v2"],
+      );
     });
 
     it("constructs report-metadata arguments with normalized task token", () => {

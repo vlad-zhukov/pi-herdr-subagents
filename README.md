@@ -80,7 +80,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | `subagent`           | Spawn a sub-agent in a dedicated herdr pane (`async` returns immediately; `wait-all` returns terminal result) |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
-| `subagent_resume`    | Resume a previous sub-agent session (follows `async` or `wait-all` orchestration mode)      |
+| `subagent_prompt`    | Continue prior Pi subagent session by immutable handle                                      |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -188,7 +188,7 @@ If `PI_CODING_AGENT_DIR` is set, use `$PI_CODING_AGENT_DIR/agents/config.json` i
 }
 ```
 
-`orchestration.mode` defaults to `async`: calls return immediately and Completion delivery arrives as a steer message. Set it to `wait-all` to make each `subagent` and `subagent_resume` call return its terminal result; calls in one tool batch launch concurrently and Orchestrator reasoning resumes after every result. Interactive Subagents participate until explicit completion. Escape cancels only Orchestrator wait: Subagent continues and its incomplete or buffered terminal result reverts to Completion delivery exactly once. Mode is captured when Subagent launches; config changes apply after extension reload or new session.
+`orchestration.mode` defaults to `async`: calls return immediately and Completion delivery arrives as a steer message. Set it to `wait-all` to make each `subagent` and `subagent_prompt` call return its terminal result; calls in one tool batch launch concurrently and Orchestrator reasoning resumes after every result. Interactive Subagents participate until explicit completion. Escape cancels only Orchestrator wait: Subagent continues and its incomplete or buffered terminal result reverts to Completion delivery exactly once. Mode is captured when Subagent launches; config changes apply after extension reload or new session.
 
 `status.enabled` controls live status supervision. Status notifications cap at four lines (`lineLimit: 4`); extra lines collapse into an overflow summary. This limit is fixed.
 
@@ -247,37 +247,26 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 ---
 
-## caller_ping — Child-to-Parent Help Request
+## Continue a Subagent Session
 
-The `caller_ping` tool lets a Subagent request help from its Orchestrator. When called, the child session **exits**. In `async` mode, Completion delivery is a steer message; in `wait-all`, help request returns through originating `subagent` or `subagent_resume` tool result. Orchestrator can then **resume** child session with response using `subagent_resume`.
+Every Pi-backed `subagent` result includes immutable `id`. Use `subagent_prompt`
+when existing session needs another turn: follow-up work, recovery after an
+interruption or failure, or answer to a child help request. Start unrelated work
+with `subagent` instead.
 
-**`caller_ping` parameters:**
-- `message` (required): What you need help with
-
-**`subagent_resume` parameters:**
-- `sessionPath` (required): Path to the child session `.jsonl` file
-- `name` (optional): Display name for the resumed pane (defaults to `Resume`)
-- `message` (optional): Follow-up prompt to send after resuming
-- `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
-
-**Interaction flow:**
-1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
-2. Child session exits (like `subagent_done`)
-3. In `async`, Orchestrator receives a steer notification; in `wait-all`, originating tool call returns: *"Sub-agent Worker needs help: Not sure which schema to use"*
-4. Orchestrator resumes child session via `subagent_resume` with response
-5. Child picks up where it left off with Orchestrator guidance
-
-**Example:**
 ```typescript
-// Inside a worker subagent
-await caller_ping({
-  message: "Found two conflicting migration files — should I use v1 or v2?"
-});
-// Session exits here. Parent receives the ping, then resumes this session
-// with guidance like "Use v2, v1 is deprecated"
+subagent_prompt({ id: "child-handle", message: "Use v2 and continue." });
 ```
 
-> **Note:** `caller_ping` is only available inside subagent contexts. Calling it from a standalone pi session returns an error.
+Live child receives continuation in same pane. Closed Pi child reopens same session
+with its original working directory, agent directory, identity,
+spawning capability, and Auto-exit policy. Display name and raw session path are
+never targets. Unknown, accepted, abandoned, and busy handles fail without
+changing session state.
+
+`caller_ping` still returns help request under legacy lifecycle. Continue it with
+original handle ID using `subagent_prompt`.
+
 
 ---
 
@@ -429,7 +418,7 @@ Allows child sessions to use subagent lifecycle tools.
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_prompt`):
 
 ```yaml
 ---

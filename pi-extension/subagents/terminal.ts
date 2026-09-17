@@ -12,6 +12,7 @@ import {
   renameHerdrTab,
   renameHerdrWorkspace,
   reportHerdrPaneTask,
+  sendHerdrAgentPrompt,
   sendHerdrCommand,
   sendHerdrEscape,
 } from "./herdr.ts";
@@ -62,6 +63,12 @@ export function renameCurrentWorkspace(title: string): void {
 export function runInPane(paneId: PaneId, command: string): void {
   assertTerminalAvailable();
   sendHerdrCommand(paneId, command);
+}
+
+/** Submit a normal user prompt to recognized Pi agent in a live pane. */
+export function promptPane(paneId: PaneId, message: string): void {
+  assertTerminalAvailable();
+  sendHerdrAgentPrompt(paneId, message);
 }
 
 export function interruptPane(paneId: PaneId): void {

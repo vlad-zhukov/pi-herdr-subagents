@@ -6,6 +6,9 @@ import type {
   BuiltHarnessCommand,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import type { SubagentHandle } from "../../assignment-handles.ts";
+import { getSubagentActivityFile } from "../../activity.ts";
+import { createSubagentPane, runScriptInPane, setPaneTask, shellQuote } from "../../terminal.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -43,6 +46,57 @@ export function buildPiPromptArgs(params: {
     ...skillPrompts,
     params.taskArg,
   ];
+}
+
+/** Reopen a persisted Pi session with its original child settings. */
+export function buildPiContinuationCommand(params: {
+  handle: SubagentHandle;
+  surface: string;
+  activityFile: string;
+  messageFile: string;
+  doneExtension: string;
+}): string {
+  const { handle, surface, activityFile, messageFile, doneExtension } = params;
+  const env = [
+    handle.agentDir ? `PI_CODING_AGENT_DIR=${shellQuote(handle.agentDir)}` : "",
+    `PI_SUBAGENT_SPAWNING=${handle.spawning ? "1" : "0"}`,
+    `PI_SUBAGENT_NAME=${shellQuote(handle.name)}`,
+    ...(handle.agent ? [`PI_SUBAGENT_AGENT=${shellQuote(handle.agent)}`] : []),
+    `PI_SUBAGENT_SESSION=${shellQuote(handle.sessionFile)}`,
+    `PI_SUBAGENT_ID=${shellQuote(handle.id)}`,
+    `PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
+    `PI_SUBAGENT_SURFACE=${shellQuote(surface)}`,
+    ...(handle.autoExit ? ["PI_SUBAGENT_AUTO_EXIT=1"] : []),
+  ].filter(Boolean).join(" ");
+  const cwd = handle.cwd ? `cd ${shellQuote(handle.cwd)} && ` : "";
+  return `${cwd}${env} pi --session ${shellQuote(handle.sessionFile)} -e ${shellQuote(doneExtension)} ${shellQuote(`@${messageFile}`)}; echo '__SUBAGENT_DONE_'$?'__'`;
+}
+
+export async function launchPiContinuation(params: {
+  handle: SubagentHandle;
+  message: string;
+  artifactDir: string;
+  doneExtension: string;
+  shellReadyDelayMs: number;
+}): Promise<{ surface: string; activityFile: string; launchScriptFile: string }> {
+  const { handle, message, artifactDir, doneExtension, shellReadyDelayMs } = params;
+  const surface = createSubagentPane(handle.name);
+  setPaneTask(surface, message);
+  await new Promise<void>((resolve) => setTimeout(resolve, shellReadyDelayMs));
+
+  const activityFile = getSubagentActivityFile(artifactDir, handle.id);
+  const messageFile = join(artifactDir, "subagent-prompts", `${handle.id}-${Date.now()}.md`);
+  mkdirSync(dirname(activityFile), { recursive: true });
+  mkdirSync(dirname(messageFile), { recursive: true });
+  writeFileSync(messageFile, message, "utf8");
+
+  const launchScriptFile = join(artifactDir, "subagent-scripts", `${handle.id}-continue-${Date.now()}.sh`);
+  runScriptInPane(
+    surface,
+    buildPiContinuationCommand({ handle, surface, activityFile, messageFile, doneExtension }),
+    { scriptPath: launchScriptFile },
+  );
+  return { surface, activityFile, launchScriptFile };
 }
 
 export class PiHarnessDriver implements HarnessDriver {

@@ -204,14 +204,13 @@ for (const backend of backends) {
       configureWaitAll(env);
 
       const firstName = `ResumeSource-${id}`;
-      const resumeName = `ResumeWaitAll-${id}`;
       const surface = createTrackedSurface(env, `resume-wait-all-${id}`);
       await sleep(1000);
       startPi(surface, env.dir, [
         `Call subagent with name "${firstName}", agent "test-echo", and task "Run: echo 'FIRST_${id}' > '${firstFile}'".`,
-        `After its result returns, call subagent_resume using that result's Session path, name "${resumeName}",`,
+        `After its result returns, call subagent_prompt with immutable id from that result,`,
         `and message "Run bash: echo 'RESUMED_${id}' > '${resumedFile}'".`,
-        `Only after subagent_resume returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
+        `Only after subagent_prompt returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
         "Then say RESUME_WAIT_ALL_COMPLETE.",
       ].join("\n"));
 
@@ -219,9 +218,9 @@ for (const backend of backends) {
       assert.match(await waitForFile(resumedFile, PI_TIMEOUT, /RESUMED_/), new RegExp(`RESUMED_${id}`));
       const screen = await waitForScreen(surface, /RESUME_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
       assert.equal(
-        (screen.match(new RegExp(`Sub-agent "${resumeName}" completed`, "g")) ?? []).length,
-        1,
-        "resumed subagent needs one original-call result",
+        (screen.match(new RegExp(`Sub-agent "${firstName}" completed`, "g")) ?? []).length,
+        2,
+        "continued subagent needs one completion per turn",
       );
     });
 
