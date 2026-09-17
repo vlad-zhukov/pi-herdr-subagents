@@ -56,7 +56,6 @@ import {
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
-  type SubagentStatusState,
   capStatusLines,
   formatElapsedDuration,
   formatStatusAggregate,
@@ -556,11 +555,6 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
-  /**
-   * Optional legacy status snapshot retained only for hydrating pre-lifecycle
-   * runtime entries after /reload. Live observation uses `lifecycle` only.
-   */
-  statusState?: SubagentStatusState;
   lifecycle: SubagentLifecycle;
   /** Last projected kind used to detect stalled/recovered transitions. */
   lastProjectedKind?: LifecycleProjection["kind"];
@@ -834,53 +828,8 @@ function updateWidget() {
 
 function ensureLifecycle(running: RunningSubagent): SubagentLifecycle {
   if (running.lifecycle) return running.lifecycle;
-  let lifecycle = createLifecycle(running.startTime);
-  const driver = getHarnessDriver(running.cli);
-  if (!driver.hasActivitySnapshots) {
-    lifecycle = markProcessRunning(lifecycle, running.startTime);
-    running.lifecycle = lifecycle;
-    return lifecycle;
-  }
-  const state = running.statusState;
-  if (state?.activityLabel === "interrupted" && state.localOverrideAtMs != null) {
-    lifecycle = markInterruptRequested(lifecycle, state.localOverrideAtMs);
-  } else if (state?.phase === "done") {
-    // Legacy activity "done" means the turn ended, not that completion
-    // evidence was recorded. Hydrate as Herdr-style waiting and let the
-    // preserved watcher consume sidecar/sentinel evidence.
-    const observedAt = state.lastActivityAtMs ?? running.startTime;
-    lifecycle = observePaneInspection(
-      lifecycle,
-      { kind: "present", observedAt, agentStatus: "done" },
-      observedAt,
-    );
-  } else if (state?.phase === "active" || state?.phase === "waiting" || state?.phase === "starting") {
-    lifecycle = observeActivity(lifecycle, {
-      ok: true,
-      activity: {
-        version: 1,
-        runningChildId: running.id,
-        createdAt: running.startTime,
-        updatedAt: state.lastActivityAtMs ?? running.startTime,
-        sequence: state.lastActivitySequence ?? 0,
-        latestEvent: state.latestEvent === "agent_end" ? "agent_end" : "agent_start",
-        phase: state.phase,
-        agentActive: state.phase === "active",
-        turnActive: state.phase === "active",
-        providerActive: false,
-        toolActive: state.activeScope === "tool",
-        ...(state.activeScope ? { activeScope: state.activeScope as any } : {}),
-        ...(state.activeSinceMs != null ? { activeSince: state.activeSinceMs } : {}),
-        ...(state.waitingSinceMs != null ? { waitingSince: state.waitingSinceMs } : {}),
-        ...(state.activityLabel && state.activeScope === "tool" ? { toolName: state.activityLabel } : {}),
-      },
-    }, state.lastActivityAtMs ?? running.startTime);
-  } else if (state?.hasActivitySnapshots === false || running.startTime) {
-    // Pre-lifecycle Pi agents without a known phase still get a running process.
-    lifecycle = markProcessRunning(lifecycle, running.startTime);
-  }
-  running.lifecycle = lifecycle;
-  return lifecycle;
+  running.lifecycle = markProcessRunning(createLifecycle(running.startTime), running.startTime);
+  return running.lifecycle;
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
@@ -1014,7 +963,6 @@ function startStatusRefresh(pi: ExtensionAPI) {
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
-      // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
       observeRunningSubagent(running, now);
       const projection = projectLifecycle(ensureLifecycle(running), now);
       const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
