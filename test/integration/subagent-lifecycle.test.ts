@@ -169,29 +169,6 @@ for (const backend of backends) {
       assert.equal(completed.length, 1, "wait-all must return one terminal result without a completion steer");
     });
 
-    it("wait-all holds an interactive subagent until explicit completion", async () => {
-      const id = uniqueId();
-      const parentFile = `/tmp/pi-integ-wait-all-interactive-parent-${id}.txt`;
-      trackTempFile(env, parentFile);
-      configureWaitAll(env);
-
-      const name = `InteractiveWaitAll-${id}`;
-      const surface = createTrackedSurface(env, `interactive-wait-all-${id}`);
-      await sleep(1000);
-      startPi(surface, env.dir, [
-        `Call subagent exactly once with name "${name}", agent "test-interactive-done", and task "finish".`,
-        `Only after that tool call returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
-        "Then say INTERACTIVE_WAIT_ALL_COMPLETE.",
-      ].join("\n"));
-
-      await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
-      const screen = await waitForScreen(surface, /INTERACTIVE_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
-      assert.equal(
-        (screen.match(new RegExp(`Sub-agent "${name}" completed`, "g")) ?? []).length,
-        1,
-        "interactive completion needs one original-call result",
-      );
-    });
 
     it("wait-all returns a resumed subagent result through its original tool call", async () => {
       const id = uniqueId();

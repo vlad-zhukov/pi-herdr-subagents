@@ -67,13 +67,13 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. The `interactive` setting keeps a child session open after it finishes and controls parent status notifications, not terminal focus.
 
 ## What's Included
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 4 main-session tools + 3 commands, plus child-only finalization and help controls:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -87,6 +87,8 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | `/plan`                    | Start a full planning workflow       |
 | `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
+
+Child sessions additionally expose `/subagent_finalize`, which sends an interactive subagent result after Pi is idle.
 
 ### Named Agents
 
@@ -157,7 +159,7 @@ When `activeCount === 0` (every tracked row is open), the border uses an amber a
 
 A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+**Interactive subagents stay open.** Run child-only `/subagent_finalize` after Pi is idle to send their result. Interactive subagents also suppress parent `stalled`/`recovered` notifications. `interactive` defaults to `false` independently of `auto-exit`.
 
 #### Configuration
 
@@ -222,7 +224,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load role, tools, skills, and lifecycle defaults from agent definition                           |
 | `fork`                 | boolean | `false`        | Use only for an explicitly requested current-session fork; overrides agent `session-mode`; bare calls without `agent` require `fork: true` |
-| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
+| `interactive`          | boolean | `false`        | Keep child session open until `/subagent_finalize` runs in its pane; also suppress parent stall/recovery notifications. Agent frontmatter can set the default. |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
 
 Runtime and role prompts come from `config.json` and named agent definitions. `model`, `thinking`, `systemPrompt`, `skills`, and `tools` are not valid `subagent()` parameters; old calls fail schema validation.
@@ -260,7 +262,7 @@ subagent_prompt({ id: "child-handle", message: "Use v2 and continue." });
 
 Live child receives continuation in same pane. Closed Pi child reopens same session
 with its original working directory, agent directory, identity,
-spawning capability, and Auto-exit policy. Display name and raw session path are
+spawning capability, and auto-exit setting. Display name and raw session path are
 never targets. Unknown, accepted, abandoned, and busy handles fail without
 changing session state.
 
@@ -330,8 +332,8 @@ You are a specialized agent that does X...
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `lineage-only` when omitted; `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Defaults to `false` for child sessions; set `true` to allow nested subagent-spawning tools                                                                                                                                                                                        |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
-| `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
+| `auto-exit`   | boolean | `false` | Close Pi and its Herdr pane after the result is sent. Independent from `interactive`. |
+| `interactive` | boolean | `false` | Keep session open until `/subagent_finalize` runs in its pane; also suppress stall/recovery notifications. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
@@ -358,53 +360,22 @@ session-mode: lineage-only
 ---
 ```
 
-### `auto-exit`
+### Finishing sessions
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+`interactive` and `auto-exit` are independent, false-by-default settings.
 
-**Behavior:**
-
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
-- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
-
-**When to use:**
-
-- ✅ Autonomous agents (scout, worker, reviewer) that run to completion
-- ❌ Interactive agents (planner, iterate) where the user drives the session
-
-```yaml
----
-name: scout
-auto-exit: true
----
-```
-
-### `interactive`
-
-Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
-
-**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
-
-**Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
-
-**When to override:**
-
-- Set `interactive: false` on an agent that doesn't auto-exit but you still want stall pings for
-- Set `interactive: true` on an autonomous agent you'd rather check on yourself
+- Noninteractive subagents send their result when work finishes. Interactive subagents remain open until `/subagent_finalize` runs in their pane; that command waits for Pi to become idle and can send a result while Pi awaits an answer.
+- `auto-exit: true` shuts down Pi and closes its Herdr pane after sending a result. With `auto-exit: false`, both remain open for review and follow-up work.
 
 ```yaml
 ---
 name: planner
-# interactive defaults to true because auto-exit is not set
+interactive: true
+auto-exit: false
 ---
 ```
 
-Or per spawn:
-
-```typescript
-subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
-```
+`/subagent_finalize` is available only in child sessions. `caller_ping` remains available for questions to the main session.
 
 ---
 

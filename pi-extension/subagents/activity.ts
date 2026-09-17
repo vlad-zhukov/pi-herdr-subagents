@@ -21,7 +21,7 @@ export type SubagentActivityEvent =
   | "tool_result"
   | "tool_execution_end"
   | "caller_ping"
-  | "subagent_done"
+  | "assignment_finalized"
   | "session_shutdown";
 
 export interface SubagentActivityState {
@@ -59,7 +59,6 @@ export interface SubagentActivityRecorder {
   beforeAgentStart(): void;
   agentStart(): void;
   agentEndWaiting(): void;
-  agentEndDone(): void;
   turnStart(turnIndex?: number): void;
   turnEnd(turnIndex?: number): void;
   beforeProviderRequest(): void;
@@ -71,7 +70,7 @@ export interface SubagentActivityRecorder {
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
   callerPing(): void;
-  subagentDone(): void;
+  assignmentFinalized(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
 
@@ -96,7 +95,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "tool_result",
   "tool_execution_end",
   "caller_ping",
-  "subagent_done",
+  "assignment_finalized",
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
@@ -240,7 +239,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolResult() {},
     toolExecutionEnd() {},
     callerPing() {},
-    subagentDone() {},
+    assignmentFinalized() {},
     sessionShutdown() {},
   };
 }
@@ -416,9 +415,6 @@ export function createSubagentActivityRecorder(params: {
         current.waitingSince = observedAt;
       }, "immediate");
     },
-    agentEndDone() {
-      markDone("agent_end");
-    },
     turnStart(turnIndex) {
       record("turn_start", (current, observedAt) => {
         current.agentActive = true;
@@ -500,8 +496,8 @@ export function createSubagentActivityRecorder(params: {
     callerPing() {
       markDone("caller_ping");
     },
-    subagentDone() {
-      markDone("subagent_done");
+    assignmentFinalized() {
+      markDone("assignment_finalized");
     },
     sessionShutdown(reason) {
       if (reason === "quit") markDone("session_shutdown");

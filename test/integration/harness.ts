@@ -175,6 +175,12 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   // Point the harness at its dedicated workspace without changing the parent's pane.
   process.env.HERDR_WORKSPACE_ID = workspaceId;
   mkdirSync(agentsDir, { recursive: true });
+  // Parent uses -e for current-branch isolation; children autoload same package.
+  writeFileSync(
+    join(agentDir, "settings.json"),
+    JSON.stringify({ packages: [PROJECT_ROOT] }, null, 2) + "\n",
+    "utf8",
+  );
 
   // Keep child runtime selection in shared config, not agent frontmatter.
   writeFileSync(

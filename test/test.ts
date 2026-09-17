@@ -52,12 +52,11 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import subagentDoneExtension, {
-  shouldMarkUserTookOver,
-  shouldAutoExitOnAgentEnd,
+import { registerChildLifecycle,
+  shouldFinalizeOnAgentSettlement,
   findLatestAssistantError,
   buildCompletionSidecar,
-} from "../pi-extension/subagents/subagent-done.ts";
+} from "../pi-extension/subagents/child-lifecycle.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
   createLifecycle,
@@ -295,10 +294,10 @@ describe("durable subagent handles", () => {
       surface: "w1:p9",
       activityFile: "/artifacts/activity.json",
       messageFile: "/artifacts/message.md",
-      doneExtension: "/extension/subagent-done.ts",
     });
 
     assert.match(command, /^cd '\/work\/scout' && /);
+    assert.doesNotMatch(command, /\s-e\s/);
     for (const setting of [
       "PI_CODING_AGENT_DIR='/agents/scout'",
       "PI_SUBAGENT_SPAWNING=1",
@@ -883,66 +882,20 @@ describe("subagent discovery", () => {
       false,
     );
 
-    // Named agents without auto-exit preserve their interactive behavior.
-    assert.equal(
-      testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: false }),
-      false,
-    );
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
-      true,
-    );
+    // Missing settings are independently false for named and bare spawns.
+    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { }), false);
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { }), false);
+    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T", fork: true }, null), false);
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", fork: true }, null), false);
 
-    // Bare task spawns are autonomous by default. Otherwise a normal final
-    // answer leaves the child open and no completion is delivered to the parent.
-    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, null), true);
-    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null), false);
-
-    // A bare full-context fork invoked directly through the tool is still an
-    // autonomous task. Forking only controls inherited conversation context.
-    assert.equal(
-      testApi.resolveEffectiveAutoExit({ name: "A", task: "T", fork: true }, null),
-      true,
-    );
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T", fork: true }, null),
-      false,
-    );
-
-    // Interactive fork workflows such as /iterate opt out explicitly.
-    assert.equal(
-      testApi.resolveEffectiveAutoExit(
-        { name: "A", task: "T", fork: true, interactive: true },
-        null,
-      ),
-      false,
-    );
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T", fork: true, interactive: true },
-        null,
-      ),
-      true,
-    );
+    // Explicit interactive remains independent from auto-exit.
+    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T", interactive: true }, null), false);
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", interactive: true }, null), true);
   });
 
-  it("resolveEffectiveInteractive honors explicit frontmatter over the auto-exit default", () => {
-    // Autonomous agent that still wants to be treated as interactive.
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T" },
-        { autoExit: true, interactive: true },
-      ),
-      true,
-    );
-    // Non-auto-exit agent that opts back into stall pings.
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T" },
-        { interactive: false },
-      ),
-      false,
-    );
+  it("resolveEffectiveInteractive honors explicit frontmatter", () => {
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { interactive: true }), true);
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { interactive: false }), false);
   });
 
   it("resolveEffectiveInteractive honors the explicit tool parameter over all else", () => {
@@ -1061,7 +1014,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,caller_ping",
     );
   });
 
@@ -1292,154 +1245,100 @@ describe("subagent discovery", () => {
     assert.match(withOverride, /thinking low/);
   });
 });
-describe("subagent-done.ts", () => {
-  describe("shouldMarkUserTookOver", () => {
-    it("ignores the initial injected task before the first agent run", () => {
-      assert.equal(shouldMarkUserTookOver(false), false);
-    });
-
-    it("treats later input as manual takeover", () => {
-      assert.equal(shouldMarkUserTookOver(true), true);
-    });
-  });
-
-  describe("shouldAutoExitOnAgentEnd", () => {
-    it("auto-exits after normal completion when there was no takeover", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
-    });
-
-    it("auto-exits after normal completion even when the user sent the prompt", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), true);
-    });
-
-    it("stays open after Escape aborts the run", () => {
-      const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
-    });
-
-    it("still exits when the latest turn ended with stopReason=error", () => {
-      // Auto-exit subagents must shut down on retry-exhaustion errors so the
-      // parent is woken. The error sidecar (written separately) carries the
-      // failure detail; staying open would just strand the worker.
-      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
-    });
-  });
-
-  describe("auto-exit lifecycle", () => {
-    it("waits for agent_settled and uses the latest agent result", () => {
-      withTempDir((dir) => {
-        const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
-        const previousSession = process.env.PI_SUBAGENT_SESSION;
-        const sessionFile = join(dir, "child.jsonl");
-        process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-        process.env.PI_SUBAGENT_SESSION = sessionFile;
-
-        try {
-          const { api, eventHandlers } = createMockExtensionApi();
-          subagentDoneExtension(api);
-          const agentEnd = eventHandlers.get("agent_end")![0];
-          const agentSettled = eventHandlers.get("agent_settled")![0];
-          let shutdowns = 0;
-          const ctx = { shutdown: () => { shutdowns += 1; } };
-
-          agentEnd({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
-          assert.equal(shutdowns, 0, "agent_end must not shut down before Pi settles");
-          assert.equal(existsSync(`${sessionFile}.exit`), false);
-
-          agentEnd({ messages: [{ role: "assistant", stopReason: "error", errorMessage: "latest failure" }] }, ctx);
-          agentSettled({ type: "agent_settled" }, ctx);
-
-          assert.equal(shutdowns, 1);
-          assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
-            type: "error",
-            errorMessage: "latest failure",
-            stopReason: "error",
-          });
-        } finally {
-          restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
-          restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
-        }
-      });
-    });
-
-    it("preserves an aborted worker after agent_settled", () => {
-      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
-      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+describe("child assignment lifecycle", () => {
+  it("finalizes a noninteractive settled child while default auto-exit retains Pi", () => {
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      const previous = {
+        interactive: process.env.PI_SUBAGENT_INTERACTIVE,
+        autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+        session: process.env.PI_SUBAGENT_SESSION,
+      };
+      delete process.env.PI_SUBAGENT_INTERACTIVE;
+      delete process.env.PI_SUBAGENT_AUTO_EXIT;
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
       try {
         const { api, eventHandlers } = createMockExtensionApi();
-        subagentDoneExtension(api);
+        registerChildLifecycle(api);
+        const agentEnd = eventHandlers.get("agent_end")![0];
+        const agentSettled = eventHandlers.get("agent_settled")![0];
         let shutdowns = 0;
         const ctx = { shutdown: () => { shutdowns += 1; } };
-        eventHandlers.get("agent_end")![0]({
-          messages: [{ role: "assistant", stopReason: "aborted" }],
-        }, ctx);
-        eventHandlers.get("agent_settled")![0]({ type: "agent_settled" }, ctx);
+        agentEnd({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+        agentSettled({}, ctx);
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
         assert.equal(shutdowns, 0);
       } finally {
-        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+        restoreEnvVar("PI_SUBAGENT_INTERACTIVE", previous.interactive);
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previous.autoExit);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previous.session);
       }
     });
   });
 
-  describe("findLatestAssistantError", () => {
-    it("returns the error info from a stopReason=error message", () => {
-      const messages = [
-        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] },
-        { role: "toolResult", content: [] },
-        { role: "assistant", stopReason: "error", errorMessage: "Anthropic 529 Overloaded" },
-      ];
-      assert.deepEqual(findLatestAssistantError(messages), {
-        errorMessage: "Anthropic 529 Overloaded",
-        stopReason: "error",
-      });
-    });
+  it("keeps an interactive child live until /subagent_finalize waits for idle", async () => {
+    const dir = createTestDir();
+    try {
+      const sessionFile = join(dir, "child.jsonl");
+      const previousInteractive = process.env.PI_SUBAGENT_INTERACTIVE;
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      process.env.PI_SUBAGENT_INTERACTIVE = "1";
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+      try {
+        const { api, eventHandlers, registeredCommands } = createMockExtensionApi();
+        registerChildLifecycle(api);
+        let waited = 0;
+        let shutdowns = 0;
+        const ctx = { shutdown: () => { shutdowns += 1; }, waitForIdle: async () => { waited += 1; } };
+        eventHandlers.get("agent_end")![0]({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+        eventHandlers.get("agent_settled")![0]({}, ctx);
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+        assert.equal(shutdowns, 0);
+        const finalize = registeredCommands.find((command) => command.name === "subagent_finalize");
+        assert.ok(finalize);
+        await finalize.handler("", ctx);
+        assert.equal(waited, 1);
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
+        assert.equal(shutdowns, 1);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_INTERACTIVE", previousInteractive);
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
-    it("returns null when the latest assistant turn completed normally", () => {
-      const messages = [
-        { role: "assistant", stopReason: "error", errorMessage: "old failure" },
-        { role: "user", content: [] },
-        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
-      ];
-      assert.equal(findLatestAssistantError(messages), null);
-    });
-
-    it("returns null when the latest assistant turn was aborted by the user", () => {
-      const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(findLatestAssistantError(messages), null);
-    });
-
-    it("falls back to a placeholder when stopReason=error has no errorMessage field", () => {
-      const messages = [{ role: "assistant", stopReason: "error" }];
-      const info = findLatestAssistantError(messages);
-      assert.ok(info);
-      assert.equal(info!.stopReason, "error");
-      assert.match(info!.errorMessage, /stopReason=error/);
-    });
-
-    it("returns null when messages is undefined or empty", () => {
-      assert.equal(findLatestAssistantError(undefined), null);
-      assert.equal(findLatestAssistantError([]), null);
+  it("finalizes awaiting-answer state and reports errors", () => {
+    assert.equal(shouldFinalizeOnAgentSettlement([{ role: "assistant", stopReason: "aborted" }]), false);
+    assert.equal(shouldFinalizeOnAgentSettlement([{ role: "assistant", stopReason: "error" }]), true);
+    assert.deepEqual(buildCompletionSidecar(undefined), { type: "done" });
+    assert.deepEqual(buildCompletionSidecar([{ role: "assistant", stopReason: "error", errorMessage: "provider failed" }]), {
+      type: "error", errorMessage: "provider failed", stopReason: "error",
     });
   });
 
-  describe("buildCompletionSidecar", () => {
-    it("emits done immediately for a normal auto-exit completion", () => {
-      assert.deepEqual(buildCompletionSidecar([
-        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
-      ]), { type: "done" });
-    });
+  it("registers /subagent_finalize only when index loads in child mode", () => {
+    const previousId = process.env.PI_SUBAGENT_ID;
+    try {
+      process.env.PI_SUBAGENT_ID = "child-test";
+      const child = createMockExtensionApi();
+      (subagentsModule as any).default(child.api);
+      assert.ok(child.registeredCommands.some((command) => command.name === "subagent_finalize"));
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_ID", previousId);
+    }
+    const parent = createMockExtensionApi();
+    (subagentsModule as any).default(parent.api);
+    assert.equal(parent.registeredCommands.some((command) => command.name === "subagent_finalize"), false);
+  });
 
-    it("preserves provider errors in the immediate completion sidecar", () => {
-      assert.deepEqual(buildCompletionSidecar([
-        { role: "assistant", stopReason: "error", errorMessage: "provider failed" },
-      ]), {
-        type: "error",
-        errorMessage: "provider failed",
-        stopReason: "error",
-      });
+  it("finds the latest provider error", () => {
+    assert.deepEqual(findLatestAssistantError([{ role: "assistant", stopReason: "error", errorMessage: "overloaded" }]), {
+      errorMessage: "overloaded", stopReason: "error",
     });
   });
 });
@@ -2139,6 +2038,12 @@ describe("subagent parent lifecycle", () => {
     assert.deepEqual(await waitForCompletionOrAbort(completion), { result: "finished" });
   });
 
+  it("closes a pane only when auto-exit is enabled", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(testApi.shouldClosePaneAfterFinalization({ autoExit: true }), true);
+    assert.equal(testApi.shouldClosePaneAfterFinalization({ autoExit: false }), false);
+  });
+
   it("suppresses status steers while wait-all calls are pending", () => {
     const testApi = (subagentsModule as any).__test__;
 
@@ -2269,7 +2174,7 @@ describe("subagent activity snapshots", () => {
       assert.equal(read.activity.waitingSince, 3_000);
 
       currentNow = 4_000;
-      recorder.subagentDone();
+      recorder.assignmentFinalized();
       read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "done");

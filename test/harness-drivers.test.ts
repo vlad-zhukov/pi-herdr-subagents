@@ -136,6 +136,8 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
     assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=0"));
+    assert.ok(built.command.includes("PI_SUBAGENT_INTERACTIVE=0"));
+    assert.doesNotMatch(built.command, /\s-e\s/);
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
   });
 

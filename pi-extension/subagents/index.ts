@@ -25,6 +25,7 @@ import {
   setPaneTask,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
+import { registerChildLifecycle } from "./child-lifecycle.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -154,7 +155,7 @@ const SubagentParams = Type.Object({
   interactive: Type.Optional(
     Type.Boolean({
       description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
+        "Keep this subagent open after it finishes until /subagent_finalize is run in its pane. Also suppresses parent stalled/recovered notifications. Defaults to the agent's `interactive` frontmatter, otherwise false; independent from `auto-exit`.",
     }),
   ),
   resumeSessionId: Type.Optional(
@@ -383,41 +384,19 @@ function resolveLaunchBehavior(
   };
 }
 
-/**
- * Decide whether a subagent is interactive (user-driven, long-running).
- *
- * Resolution order:
- *   1. Explicit `interactive` tool parameter wins.
- *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
- *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
- * subagent is treated as interactive — matching the intent of iterate.
- */
+/** Resolve independent Assignment policies; both default to false. */
 function resolveEffectiveAutoExit(
-  params: Static<typeof SubagentParams>,
+  _params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  // Named agents preserve their declared behavior. Bare tool calls are
-  // autonomous by default, including full-context forks: `fork` controls
-  // context inheritance, not whether the child should remain open. Interactive
-  // flows such as /iterate opt out explicitly with `interactive: true`.
-  if (agentDefs) return agentDefs.autoExit ?? false;
-  return params.interactive !== true;
+  return agentDefs?.autoExit ?? false;
 }
 
 function resolveEffectiveInteractive(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  if (params.interactive != null) return params.interactive;
-  if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !resolveEffectiveAutoExit(params, agentDefs);
+  return params.interactive ?? agentDefs?.interactive ?? false;
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -1091,6 +1070,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveWaitAllResultPresentation,
+  shouldClosePaneAfterFinalization,
   runningSubagents,
   subagentHandles,
   restoreHandles,
@@ -1202,12 +1182,10 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = effectiveAutoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = effectiveAutoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+  const modeHint = effectiveInteractive
+    ? "Complete your task, then wait for further instructions."
+    : "Complete your task autonomously.";
+  const summaryInstruction = "Your FINAL assistant message should summarize what you accomplished.";
   const spawning = resolveSpawning(agentDefs);
   const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
@@ -1335,7 +1313,7 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        closePane(surface);
+        if (shouldClosePaneAfterFinalization(running)) closePane(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1397,7 +1375,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
+    if (shouldClosePaneAfterFinalization(running)) closePane(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1413,9 +1391,11 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
-    try {
-      closePane(surface);
-    } catch {}
+    if (shouldClosePaneAfterFinalization(running)) {
+      try {
+        closePane(surface);
+      } catch {}
+    }
     running.lifecycle = markFailed(
       running.lifecycle,
       signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
@@ -1444,6 +1424,12 @@ async function watchSubagent(
       error: err?.message ?? String(err),
     };
   }
+}
+
+export function shouldClosePaneAfterFinalization(
+  running: Pick<RunningSubagent, "autoExit">,
+): boolean {
+  return running.autoExit;
 }
 
 function finishPromptCompletion(
@@ -1528,7 +1514,6 @@ async function reopenPiSubagent(
     handle,
     message,
     artifactDir,
-    doneExtension: join(SUBAGENTS_DIR, "subagent-done.ts"),
     shellReadyDelayMs: getShellReadyDelayMs(),
   });
   const startTime = Date.now();
@@ -1559,6 +1544,7 @@ async function reopenPiSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  if (process.env.PI_SUBAGENT_ID) registerChildLifecycle(pi);
   runtime.pi = pi;
 
   // Capture the UI context for widget updates and restore presentation for

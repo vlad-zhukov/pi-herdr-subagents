@@ -10,7 +10,7 @@ import type { SubagentHandle } from "../../assignment-handles.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
 import { createSubagentPane, runScriptInPane, setPaneTask, shellQuote } from "../../terminal.ts";
 
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["caller_ping"] as const;
 
 export function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   const requested = (effectiveTools ?? "")
@@ -54,9 +54,8 @@ export function buildPiContinuationCommand(params: {
   surface: string;
   activityFile: string;
   messageFile: string;
-  doneExtension: string;
 }): string {
-  const { handle, surface, activityFile, messageFile, doneExtension } = params;
+  const { handle, surface, activityFile, messageFile } = params;
   const env = [
     handle.agentDir ? `PI_CODING_AGENT_DIR=${shellQuote(handle.agentDir)}` : "",
     `PI_SUBAGENT_SPAWNING=${handle.spawning ? "1" : "0"}`,
@@ -66,20 +65,20 @@ export function buildPiContinuationCommand(params: {
     `PI_SUBAGENT_ID=${shellQuote(handle.id)}`,
     `PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
     `PI_SUBAGENT_SURFACE=${shellQuote(surface)}`,
+    `PI_SUBAGENT_INTERACTIVE=${handle.interactive ? "1" : "0"}`,
     ...(handle.autoExit ? ["PI_SUBAGENT_AUTO_EXIT=1"] : []),
   ].filter(Boolean).join(" ");
   const cwd = handle.cwd ? `cd ${shellQuote(handle.cwd)} && ` : "";
-  return `${cwd}${env} pi --session ${shellQuote(handle.sessionFile)} -e ${shellQuote(doneExtension)} ${shellQuote(`@${messageFile}`)}; echo '__SUBAGENT_DONE_'$?'__'`;
+  return `${cwd}${env} pi --session ${shellQuote(handle.sessionFile)} ${shellQuote(`@${messageFile}`)}; echo '__SUBAGENT_DONE_'$?'__'`;
 }
 
 export async function launchPiContinuation(params: {
   handle: SubagentHandle;
   message: string;
   artifactDir: string;
-  doneExtension: string;
   shellReadyDelayMs: number;
 }): Promise<{ surface: string; activityFile: string; launchScriptFile: string }> {
-  const { handle, message, artifactDir, doneExtension, shellReadyDelayMs } = params;
+  const { handle, message, artifactDir, shellReadyDelayMs } = params;
   const surface = createSubagentPane(handle.name);
   setPaneTask(surface, message);
   await new Promise<void>((resolve) => setTimeout(resolve, shellReadyDelayMs));
@@ -93,7 +92,7 @@ export async function launchPiContinuation(params: {
   const launchScriptFile = join(artifactDir, "subagent-scripts", `${handle.id}-continue-${Date.now()}.sh`);
   runScriptInPane(
     surface,
-    buildPiContinuationCommand({ handle, surface, activityFile, messageFile, doneExtension }),
+    buildPiContinuationCommand({ handle, surface, activityFile, messageFile }),
     { scriptPath: launchScriptFile },
   );
   return { surface, activityFile, launchScriptFile };
@@ -122,6 +121,7 @@ export class PiHarnessDriver implements HarnessDriver {
       effectiveCwd,
       localAgentDir,
       effectiveAutoExit,
+      effectiveInteractive,
       taskDelivery,
       spawning,
       identity,
@@ -130,15 +130,11 @@ export class PiHarnessDriver implements HarnessDriver {
       roleBlock,
       modeHint,
       summaryInstruction,
-      subagentsDir,
       shellQuote,
     } = context;
 
     const parts: string[] = ["pi"];
     parts.push("--session", shellQuote(subagentSessionFile));
-
-    const subagentDonePath = join(subagentsDir, "subagent-done.ts");
-    parts.push("-e", shellQuote(subagentDonePath));
 
     if (effectiveModel) {
       parts.push("--model", shellQuote(effectiveModel));
@@ -180,9 +176,8 @@ export class PiHarnessDriver implements HarnessDriver {
     if (params.agent) {
       envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
     }
-    if (effectiveAutoExit) {
-      envParts.push("PI_SUBAGENT_AUTO_EXIT=1");
-    }
+    envParts.push(`PI_SUBAGENT_INTERACTIVE=${effectiveInteractive ? "1" : "0"}`);
+    if (effectiveAutoExit) envParts.push("PI_SUBAGENT_AUTO_EXIT=1");
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
     const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
