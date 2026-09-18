@@ -394,59 +394,59 @@ for (const backend of backends) {
       }
     });
 
-    // ── caller_ping ──
+    // ── subagent_ask ──
 
-    it("subagent caller_ping sends notification back to the parent", async () => {
+    it("subagent_ask sends question back to the parent", async () => {
       const id = uniqueId();
 
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const surface = createTrackedSurface(env, `ask-${id}`);
       await sleep(1000);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
-        `  task: "PING_TEST_${id}"`,
+        `  agent: "test-ask"`,
+        `  task: "ASK_TEST_${id}"`,
         `Just call the subagent tool once. Do not do anything else before calling it.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      // The test-ping agent calls caller_ping, which steers a "needs help" message
+      // The test-ask agent calls subagent_ask, which steers its question
       // back to the outer pi. Look for it on screen.
       const screen = await waitForScreen(
         surface,
-        /needs help|PING|caller_ping|ping/i,
+        /asks|PING|subagent_ask/i,
         PI_TIMEOUT,
       );
 
       assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
+        /asks|PING/i.test(screen),
+        `Screen should show question notification. Got:\n${screen.slice(-800)}`,
       );
     });
 
-    it("wait-all returns caller_ping through its original tool result", async () => {
+    it("wait-all returns subagent_ask through its original tool result", async () => {
       const id = uniqueId();
-      const parentFile = `/tmp/pi-integ-wait-all-ping-parent-${id}.txt`;
+      const parentFile = `/tmp/pi-integ-wait-all-ask-parent-${id}.txt`;
       trackTempFile(env, parentFile);
       configureWaitAll(env);
 
       const name = `WaitAllPing-${id}`;
-      const surface = createTrackedSurface(env, `wait-all-ping-${id}`);
+      const surface = createTrackedSurface(env, `wait-all-ask-${id}`);
       await sleep(1000);
       startPi(surface, env.dir, [
-        `Call subagent exactly once with name "${name}", agent "test-ping", and task "PING_${id}".`,
+        `Call subagent exactly once with name "${name}", agent "test-ask", and task "ASK_${id}".`,
         `Only after that tool call returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
-        "Then say WAIT_ALL_PING_COMPLETE.",
+        "Then say WAIT_ALL_ASK_COMPLETE.",
       ].join("\n"));
 
       await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
-      const screen = await waitForScreen(surface, /WAIT_ALL_PING_COMPLETE/, PI_TIMEOUT);
+      const screen = await waitForScreen(surface, /WAIT_ALL_ASK_COMPLETE/, PI_TIMEOUT);
       assert.equal(
-        (screen.match(new RegExp(`Sub-agent "${name}" needs help`, "g")) ?? []).length,
+        (screen.match(new RegExp(`Sub-agent "${name}" asks`, "g")) ?? []).length,
         1,
-        "caller_ping needs one original-call result without a steer duplicate",
+        "subagent_ask needs one original-call result without a steer duplicate",
       );
     });
 

@@ -241,7 +241,7 @@ subagent_interrupt({ id: "abcd1234" });
 subagent_interrupt({ name: "Scout" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `subagent_ask` still flow through normally.
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
@@ -266,8 +266,8 @@ spawning capability, and auto-exit setting. Display name and raw session path ar
 never targets. Unknown, accepted, abandoned, and busy handles fail without
 changing session state.
 
-`caller_ping` still returns help request under legacy lifecycle. Continue it with
-original handle ID using `subagent_prompt`.
+`subagent_ask({ question })` reports a structured question without closing child Pi
+or pane. Answer it with original handle ID using `subagent_prompt`.
 
 
 ---
@@ -375,7 +375,7 @@ auto-exit: false
 ---
 ```
 
-`/subagent_finalize` is available only in child sessions. `caller_ping` remains available for questions to the main session.
+`/subagent_finalize` is available only in child sessions. `subagent_ask` sends a question to parent session without closing child session.
 
 ---
 

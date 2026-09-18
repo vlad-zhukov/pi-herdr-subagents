@@ -1014,7 +1014,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping",
+      "read,bash,web_search,subagent_ask",
     );
   });
 
@@ -1312,6 +1312,31 @@ describe("child assignment lifecycle", () => {
     }
   });
 
+  it("subagent_ask keeps child live and suppresses automatic finalization", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    const previousSession = process.env.PI_SUBAGENT_SESSION;
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    try {
+      const { api, eventHandlers, registeredTools } = createMockExtensionApi();
+      registerChildLifecycle(api);
+      const ask = registeredTools.find((tool) => tool.name === "subagent_ask");
+      assert.ok(ask);
+      assert.match(ask.promptGuidelines.join("\n"), /Do not end a task with an unresolved question/);
+      const result = await ask.execute("ask-1", { question: "Use v1 or v2?" });
+      assert.equal(result.terminate, true);
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.ask`, "utf8")), {
+        type: "ask", question: "Use v1 or v2?",
+      });
+      eventHandlers.get("agent_end")![0]({ messages: [{ role: "assistant", stopReason: "stop" }] }, {});
+      eventHandlers.get("agent_settled")![0]({}, { shutdown() {} });
+      assert.equal(existsSync(`${sessionFile}.exit`), false);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("finalizes awaiting-answer state and reports errors", () => {
     assert.equal(shouldFinalizeOnAgentSettlement([{ role: "assistant", stopReason: "aborted" }]), false);
     assert.equal(shouldFinalizeOnAgentSettlement([{ role: "assistant", stopReason: "error" }]), true);
@@ -1521,14 +1546,10 @@ describe("lifecycle.ts", () => {
 
 describe("completion.ts", () => {
 
-  it("decodes ping payloads", () => {
+  it("decodes structured ask payloads", () => {
     assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      {
-        reason: "ping",
-        exitCode: 0,
-        ping: { name: "Worker", message: "need help" },
-      },
+      interpretExitSidecar({ type: "ask", question: "need help" }),
+      { reason: "ask", exitCode: 0, ask: { question: "need help" } },
     );
   });
 
@@ -1573,8 +1594,7 @@ describe("completion.ts", () => {
   it("consumes a sidecar and removes it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-sidecar-"));
     const sessionFile = join(dir, "session.jsonl");
-    const exitFile = `${sessionFile}.exit`;
-    writeFileSync(exitFile, JSON.stringify({ type: "ping", name: "Scout", message: "ready" }));
+    writeFileSync(`${sessionFile}.ask`, JSON.stringify({ type: "ask", question: "ready" }));
     try {
       const result = await waitForCompletion(new AbortController().signal, {
         intervalMs: 1,
@@ -1582,11 +1602,32 @@ describe("completion.ts", () => {
         readTerminalTail: async () => "",
       });
       assert.deepEqual(result, {
-        reason: "ping",
+        reason: "ask",
         exitCode: 0,
-        ping: { name: "Scout", message: "ready" },
+        ask: { question: "ready" },
       });
-      assert.equal(existsSync(exitFile), false);
+      assert.equal(existsSync(`${sessionFile}.ask`), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("atomically claims an ask sidecar for one watcher", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-ask-race-"));
+    const sessionFile = join(dir, "session.jsonl");
+    writeFileSync(`${sessionFile}.ask`, JSON.stringify({ type: "ask", question: "Choose one" }));
+    const first = new AbortController();
+    const second = new AbortController();
+    try {
+      const waits = [first, second].map((controller) =>
+        waitForCompletion(controller.signal, { intervalMs: 10_000, sessionFile, readTerminalTail: async () => "" }),
+      );
+      const winner = await Promise.race(waits.map((wait) => wait.then((result) => ({ result }))));
+      first.abort();
+      second.abort();
+      const settled = await Promise.allSettled(waits);
+      assert.deepEqual(winner.result, { reason: "ask", exitCode: 0, ask: { question: "Choose one" } });
+      assert.equal(settled.filter((result) => result.status === "fulfilled").length, 1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2555,22 +2596,17 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("returns caller_ping through its wait-all tool result", () => {
+  it("returns subagent_ask through its wait-all tool result", () => {
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveWaitAllResultPresentation(
-      {
-        exitCode: 0,
-        elapsed: 3,
-        summary: "ignored",
-        sessionFile: "/tmp/subagent.jsonl",
-        ping: { name: "Worker", message: "Need a decision" },
-      },
+      { exitCode: 0, elapsed: 3, summary: "ignored", ask: { question: "Need a decision" } },
       "Worker",
+      "worker-id",
     );
 
-    assert.match(presentation, /needs help/);
+    assert.match(presentation, /asks/);
     assert.match(presentation, /Need a decision/);
-    assert.match(presentation, /Session: \/tmp\/subagent.jsonl/);
+    assert.match(presentation, /subagent_prompt/);
     assert.doesNotMatch(presentation, /completed/);
   });
 

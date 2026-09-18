@@ -1,12 +1,12 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
 const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 
 export interface CompletionResult {
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "ask" | "sentinel" | "error";
   exitCode: number;
-  ping?: { name: string; message: string };
+  ask?: { question: string };
   errorMessage?: string;
 }
 
@@ -30,17 +30,15 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     type?: unknown;
     name?: unknown;
     message?: unknown;
+    question?: unknown;
     errorMessage?: unknown;
   };
 
-  if (payload?.type === "ping") {
+  if (payload?.type === "ask") {
     return {
-      reason: "ping",
+      reason: "ask",
       exitCode: 0,
-      ping: {
-        name: typeof payload.name === "string" ? payload.name : "subagent",
-        message: typeof payload.message === "string" ? payload.message : "",
-      },
+      ask: { question: typeof payload.question === "string" ? payload.question : "" },
     };
   }
 
@@ -77,12 +75,30 @@ function consumeExitSidecar(sessionFile: string | undefined): CompletionResult |
   }
 }
 
+function consumeAskSidecar(sessionFile: string | undefined): CompletionResult | null {
+  if (!sessionFile) return null;
+  const askFile = `${sessionFile}.ask`;
+  if (!existsSync(askFile)) return null;
+  const claimedFile = `${askFile}.${process.pid}.consumed`;
+  try {
+    renameSync(askFile, claimedFile);
+    const result = interpretExitSidecar(JSON.parse(readFileSync(claimedFile, "utf8")));
+    return result.reason === "ask" ? result : null;
+  } catch {
+    return null;
+  } finally {
+    rmSync(claimedFile, { force: true });
+  }
+}
+
 function terminalExitCode(screen: string): number | null {
   const match = screen.match(TERMINAL_SENTINEL);
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
 function completionArtifact(options: CompletionOptions): CompletionResult | null {
+  const ask = consumeAskSidecar(options.sessionFile);
+  if (ask) return ask;
   const sidecar = consumeExitSidecar(options.sessionFile);
   if (sidecar) return sidecar;
   if (options.sentinelFile && existsSync(options.sentinelFile)) {
@@ -134,7 +150,7 @@ export async function waitForCompletion(
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = consumeExitSidecar(options.sessionFile);
+    const sidecarResult = completionArtifact(options);
     if (sidecarResult) return sidecarResult;
 
     if (options.sentinelFile && existsSync(options.sentinelFile)) {

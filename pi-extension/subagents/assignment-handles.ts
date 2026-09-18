@@ -1,6 +1,6 @@
 export const SUBAGENT_HANDLE_ENTRY = "subagent_handle";
 
-export type AssignmentState = "active" | "finalized" | "accepted" | "abandoned";
+export type AssignmentState = "active" | "awaiting_answer" | "finalized" | "accepted" | "abandoned";
 
 export interface SubagentHandle {
   id: string;
@@ -29,7 +29,7 @@ function isHandle(value: unknown): value is SubagentHandle {
     typeof handle.name === "string" &&
     typeof handle.sessionFile === "string" &&
     (handle.surface == null || typeof handle.surface === "string") &&
-    (handle.state === "active" || handle.state === "finalized" || handle.state === "accepted" || handle.state === "abandoned") &&
+    (handle.state === "active" || handle.state === "awaiting_answer" || handle.state === "finalized" || handle.state === "accepted" || handle.state === "abandoned") &&
     typeof handle.autoExit === "boolean" &&
     typeof handle.interactive === "boolean" &&
     (handle.agent == null || typeof handle.agent === "string") &&

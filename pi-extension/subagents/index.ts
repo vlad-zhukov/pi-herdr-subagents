@@ -508,19 +508,18 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
-  ping?: { name: string; message: string };
+  ask?: { question: string };
 }
 
 /**
  * State for a launched (but not yet completed) subagent.
  */
 function resolveWaitAllResultPresentation(result: SubagentResult, name: string, handleId?: string): string {
-  if (result.ping) {
-    const sessionRef = result.sessionFile ? `\n\nSession: ${result.sessionFile}` : "";
+  if (result.ask) {
     const continuation = handleId
       ? `\nContinue: subagent_prompt({ id: "${handleId}", message: "..." })`
       : "";
-    return `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${continuation}${sessionRef}`;
+    return `Sub-agent "${name}" asks (${formatElapsed(result.elapsed)}):\n\n${result.ask.question}${continuation}`;
   }
   return resolveResultPresentation(result, name, handleId);
 }
@@ -1297,9 +1296,12 @@ async function watchSubagent(
     });
 
     const detectedAt = Date.now();
+    const elapsed = Math.floor((detectedAt - startTime) / 1000);
+    if (result.ask) {
+      return { name, task, summary: "", sessionFile, exitCode: 0, elapsed, ask: result.ask };
+    }
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
-    const elapsed = Math.floor((detectedAt - startTime) / 1000);
 
     const driver = getHarnessDriver(running.cli);
     if (driver.extractResult) {
@@ -1387,7 +1389,7 @@ async function watchSubagent(
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
-      ping: result.ping,
+      ask: result.ask,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
@@ -1432,6 +1434,26 @@ export function shouldClosePaneAfterFinalization(
   return running.autoExit;
 }
 
+function finishAskDelivery(running: RunningSubagent): void {
+  running.lifecycle = markDelivery(running.lifecycle, "delivered");
+  running.inputLocked = false;
+  updateHandle(running, "awaiting_answer");
+  updateWidget();
+}
+
+function sendSubagentAsk(pi: ExtensionAPI, running: RunningSubagent, result: SubagentResult): void {
+  const question = result.ask?.question ?? "";
+  selectCompletionApi(pi, runtime.pi).sendMessage(
+    {
+      customType: "subagent_ask",
+      content: `Sub-agent "${running.name}" asks (${formatElapsed(result.elapsed)}):\n\n${question}\nContinue: subagent_prompt({ id: "${running.id}", message: "..." })`,
+      display: true,
+      details: { id: running.id, name: running.name, question, agent: running.agent, sessionFile: result.sessionFile },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 function finishPromptCompletion(
   running: RunningSubagent,
   delivery: "delivered" | "suppressed",
@@ -1453,20 +1475,13 @@ function deliverPromptCompletion(
         finishPromptCompletion(running, "suppressed");
         return;
       }
-      finishPromptCompletion(running, "delivered");
-      const completionApi = selectCompletionApi(pi, runtime.pi);
-      if (result.ping) {
-        completionApi.sendMessage(
-          {
-            customType: "subagent_ping",
-            content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}`,
-            display: true,
-            details: { id: running.id, name: result.ping.name, message: result.ping.message, sessionFile: result.sessionFile },
-          },
-          { triggerTurn: true, deliverAs: "steer" },
-        );
+      if (result.ask) {
+        finishAskDelivery(running);
+        sendSubagentAsk(pi, running, result);
         return;
       }
+      finishPromptCompletion(running, "delivered");
+      const completionApi = selectCompletionApi(pi, runtime.pi);
       completionApi.sendMessage(
         {
           customType: "subagent_result",
@@ -1689,10 +1704,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             };
           }
           const result = waiting.result;
-          running.lifecycle = markDelivery(running.lifecycle, "delivered");
-          updateHandle(running, "finalized");
-          runningSubagents.delete(running.id);
-          updateWidget();
+          if (result.ask) finishAskDelivery(running);
+          else {
+            running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            updateHandle(running, "finalized");
+            runningSubagents.delete(running.id);
+            updateWidget();
+          }
 
           return {
             content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(result, running.name, running.id) }],
@@ -1718,32 +1736,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               updateWidget();
               return;
             }
+            if (result.ask) {
+              finishAskDelivery(running);
+              sendSubagentAsk(pi, running, result);
+              return;
+            }
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             updateHandle(running, "finalized");
             runningSubagents.delete(running.id);
             updateWidget();
-            const completionApi = selectCompletionApi(pi, runtime.pi);
-
-            if (result.ping) {
-              // Subagent is requesting help — steer its stable continuation handle.
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nContinue: subagent_prompt({ id: "${running.id}", message: "..." })`;
-              completionApi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    id: running.id,
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    agent: running.agent,
-                    sessionFile: result.sessionFile,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
 
             const basePresentation = resolveResultPresentation(result, running.name, running.id);
             const presentation = running.runtimePlan?.runtimeMismatch
@@ -2018,6 +2019,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         if (running) {
           running.inputLocked = true;
+          running.task = params.message;
+          running.lifecycle = createLifecycle(running.startTime);
           try {
             promptPane(running.surface, params.message);
           } catch (cause: any) {
@@ -2025,6 +2028,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const text = `Could not prompt subagent ${params.id}: ${cause?.message ?? String(cause)}`;
             return { content: [{ type: "text" as const, text }], details: { error: text, id: params.id } };
           }
+          const controller = new AbortController();
+          running.abortController = controller;
+          const completion = watchSubagent(running, controller.signal);
+          if (running.orchestrationMode === "wait-all") {
+            const waited = await waitForCompletionOrAbort(completion, signal);
+            if ("cancelled" in waited) {
+              deliverPromptCompletion(running, completion, pi);
+              return {
+                content: [{ type: "text" as const, text: "Wait cancelled. Continued subagent session remains live." }],
+                details: { id: running.id, name: running.name, status: "wait_cancelled" },
+              };
+            }
+            if (waited.result.ask) finishAskDelivery(running);
+            else finishPromptCompletion(running, "delivered");
+            return {
+              content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, running.name, running.id) }],
+              details: { id: running.id, name: running.name, sessionFile: running.sessionFile, status: waited.result.ask ? "awaiting_answer" : "completed" },
+            };
+          }
+          deliverPromptCompletion(running, completion, pi);
           return {
             content: [{ type: "text" as const, text: `Continuation sent to subagent ${params.id}.` }],
             details: { id: params.id, name: handle.name, status: "continued" },
@@ -2048,10 +2071,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               details: { id: resumed.id, name: resumed.name, status: "wait_cancelled" },
             };
           }
-          finishPromptCompletion(resumed, "delivered");
+          if (waited.result.ask) finishAskDelivery(resumed);
+          else finishPromptCompletion(resumed, "delivered");
           return {
             content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, resumed.name, resumed.id) }],
-            details: { id: resumed.id, name: resumed.name, sessionFile: resumed.sessionFile, status: "completed" },
+            details: { id: resumed.id, name: resumed.name, sessionFile: resumed.sessionFile, status: waited.result.ask ? "awaiting_answer" : "completed" },
           };
         }
 
@@ -2214,8 +2238,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     };
   });
 
-  // ── subagent_ping message renderer ──
-  pi.registerMessageRenderer("subagent_ping", (message, options, theme) => {
+  // ── subagent_ask message renderer ──
+  pi.registerMessageRenderer("subagent_ask", (message, options, theme) => {
     const details = message.details as any;
     if (!details) return undefined;
 
@@ -2226,19 +2250,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const bgFn = (text: string) => theme.bg("toolSuccessBg", text);
 
         const icon = theme.fg("accent", "?");
-        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— needs help")}`;
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— asks")}`;
 
         const contentLines = [header];
 
         if (options.expanded) {
           contentLines.push("");
-          contentLines.push(details.message ?? "");
+          contentLines.push(details.question ?? "");
           if (details.sessionFile) {
             contentLines.push("");
             contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
           }
         } else {
-          const preview = (details.message ?? "").split("\n")[0].slice(0, width - 10);
+          const preview = (details.question ?? "").split("\n")[0].slice(0, width - 10);
           contentLines.push(theme.fg("dim", preview));
           contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
         }

@@ -10,7 +10,7 @@ import type { SubagentHandle } from "../../assignment-handles.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
 import { createSubagentPane, runScriptInPane, setPaneTask, shellQuote } from "../../terminal.ts";
 
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["subagent_ask"] as const;
 
 export function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   const requested = (effectiveTools ?? "")

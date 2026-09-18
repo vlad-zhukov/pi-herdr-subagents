@@ -20,7 +20,7 @@ export type SubagentActivityEvent =
   | "tool_execution_update"
   | "tool_result"
   | "tool_execution_end"
-  | "caller_ping"
+  | "assignment_awaiting"
   | "assignment_finalized"
   | "session_shutdown";
 
@@ -69,7 +69,7 @@ export interface SubagentActivityRecorder {
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
-  callerPing(): void;
+  assignmentAwaiting(): void;
   assignmentFinalized(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
@@ -94,7 +94,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "tool_execution_update",
   "tool_result",
   "tool_execution_end",
-  "caller_ping",
+  "assignment_awaiting",
   "assignment_finalized",
   "session_shutdown",
 ]);
@@ -238,7 +238,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolExecutionUpdate() {},
     toolResult() {},
     toolExecutionEnd() {},
-    callerPing() {},
+    assignmentAwaiting() {},
     assignmentFinalized() {},
     sessionShutdown() {},
   };
@@ -493,8 +493,12 @@ export function createSubagentActivityRecorder(params: {
         refreshActiveScope(current);
       }, "immediate");
     },
-    callerPing() {
-      markDone("caller_ping");
+    assignmentAwaiting() {
+      record("assignment_awaiting", (current, observedAt) => {
+        clearActiveState(current);
+        current.phase = "waiting";
+        current.waitingSince = observedAt;
+      }, "immediate");
     },
     assignmentFinalized() {
       markDone("assignment_finalized");

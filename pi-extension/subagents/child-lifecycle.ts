@@ -47,6 +47,7 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
   let expanded = false;
   let latestAgentMessages: any[] | undefined;
   let finalized = false;
+  let awaitingAnswer = false;
 
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
@@ -96,7 +97,10 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
     toolNames = pi.getAllTools().map((tool) => tool.name).sort();
     renderWidget(ctx, null);
   });
-  pi.on("input", () => recorder.input());
+  pi.on("input", () => {
+    awaitingAnswer = false;
+    recorder.input();
+  });
   pi.on("before_agent_start", () => recorder.beforeAgentStart());
   pi.on("agent_start", () => recorder.agentStart());
   pi.on("agent_end", (event) => {
@@ -104,7 +108,7 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
     recorder.agentEndWaiting();
   });
   pi.on("agent_settled", (_event, ctx) => {
-    if (!interactive && shouldFinalizeOnAgentSettlement(latestAgentMessages)) finalize(ctx);
+    if (!interactive && !awaitingAnswer && shouldFinalizeOnAgentSettlement(latestAgentMessages)) finalize(ctx);
   });
   pi.on("turn_start", (event) => recorder.turnStart((event as any).turnIndex));
   pi.on("turn_end", (event) => recorder.turnEnd((event as any).turnIndex));
@@ -135,30 +139,29 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "caller_ping",
-    label: "Caller Ping",
+    name: "subagent_ask",
+    label: "Ask Question",
     description:
-      "Send a help request to the parent agent and exit this session. " +
-      "The parent will be notified with your message and can resume this session with a response. " +
-      "Use when you're stuck, need clarification, or need the parent to take action.",
+      "Ask a question without closing this session. " +
+      "This ends the current turn and waits for a reply.",
+    promptGuidelines: [
+      "When you need a decision or clarification to continue, call subagent_ask. Do not end a task with an unresolved question.",
+    ],
     parameters: Type.Object({
-      message: Type.String({ description: "What you need help with" }),
+      question: Type.String({ description: "Question needing a decision or clarification" }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (!sessionFile) {
-        throw new Error("caller_ping is only available in subagent contexts. PI_SUBAGENT_SESSION environment variable is not set.");
+        throw new Error("subagent_ask is only available in subagent contexts. PI_SUBAGENT_SESSION environment variable is not set.");
       }
-      recorder.callerPing();
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify({
-        type: "ping" as const,
-        name: process.env.PI_SUBAGENT_NAME ?? "subagent",
-        message: params.message,
-      }));
-      ctx.shutdown();
+      awaitingAnswer = true;
+      recorder.assignmentAwaiting();
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ type: "ask" as const, question: params.question }));
       return {
-        content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
+        content: [{ type: "text", text: "Question sent. Waiting for a reply." }],
         details: {},
+        terminate: true,
       };
     },
   });
