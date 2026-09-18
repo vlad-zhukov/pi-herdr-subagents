@@ -566,6 +566,7 @@ interface RunningSubagent {
   agentDir?: string;
   spawning?: boolean;
   inputLocked?: boolean;
+  abandoned?: boolean;
 }
 
 interface SubagentRuntime {
@@ -575,6 +576,7 @@ interface SubagentRuntime {
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
   agentCatalog?: string;
+  halted?: boolean;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -586,6 +588,7 @@ function ensureSubagentRuntime(value: Partial<SubagentRuntime> | undefined): Sub
   const runtime = value ?? createSubagentRuntime();
   runtime.runningSubagents ??= new Map<string, RunningSubagent>();
   runtime.handles ??= new Map<string, SubagentHandle>();
+  runtime.halted ??= false;
   return runtime as SubagentRuntime;
 }
 
@@ -661,6 +664,54 @@ export function shouldDeliverSubagentCompletion(
   // Authoritative gate: only pending deliveries may be sent.
   // Missing lifecycle (pre-migration fixtures) defaults to pending/true.
   return (running.lifecycle?.delivery ?? "pending") === "pending";
+}
+
+/** Pi failures abandon an Assignment; other harnesses retain legacy semantics. */
+export function isFatalPiFailure(
+  running: Pick<RunningSubagent, "cli">,
+  result: Pick<SubagentResult, "exitCode" | "ask" | "error">,
+): boolean {
+  return running.cli === "pi" && !result.ask && result.exitCode !== 0 && result.error !== "cancelled";
+}
+
+/** Persist one terminal failed Assignment and tear down its pane regardless of Auto-exit. */
+export function abandonSubagent(
+  running: RunningSubagent,
+  reason: string,
+  close: (surface: string) => void = closePane,
+): boolean {
+  if (running.abandoned) return false;
+  running.abandoned = true;
+  running.inputLocked = false;
+  running.lifecycle = markFailed(ensureLifecycle(running), reason, Date.now(), 1);
+  cancelCompletionChannel(running.sessionFile);
+
+  const handle = subagentHandles.get(running.id);
+  if (handle) saveHandle({ ...handle, surface: running.surface, state: "abandoned", subscribed: false });
+  try {
+    close(running.surface);
+  } catch {
+    // Pane may already be gone; abandonment target state still holds.
+  }
+  updateWidget();
+  return true;
+}
+
+export function haltOrchestrator(ctx: Pick<ExtensionContext, "abort"> | undefined = runtime.latestCtx): boolean {
+  if (runtime.halted) return false;
+  runtime.halted = true;
+  ctx?.abort();
+  return true;
+}
+
+export function clearOrchestratorHalt(source: "interactive" | "rpc" | "extension" | undefined): boolean {
+  if (source !== "interactive" || !runtime.halted) return false;
+  runtime.halted = false;
+  return true;
+}
+
+function completionDeliveryOptions() {
+  return { triggerTurn: !runtime.halted, deliverAs: "steer" as const };
 }
 
 export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
@@ -1053,7 +1104,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
           display: true,
           details: { lines: capped.visibleLines, overflow: capped.overflow },
         },
-        { triggerTurn: true, deliverAs: "steer" },
+        completionDeliveryOptions(),
       );
     }
   }, 1000);
@@ -1090,6 +1141,12 @@ export const __test__ = {
   formatElapsed,
   buildSubagentCompletionGuidance,
   shouldSteerStatusTransition,
+  isFatalPiFailure,
+  abandonSubagent,
+  haltOrchestrator,
+  clearOrchestratorHalt,
+  completionDeliveryOptions,
+  runtime,
 };
 
 function startWidgetRefresh() {
@@ -1314,6 +1371,13 @@ async function watchSubagent(
     if (result.ask) {
       return { name, task, summary: "", sessionFile, exitCode: 0, elapsed, ask: result.ask };
     }
+    // A Pi child normally publishes its sidecar before leaving. Its bare shell
+    // sentinel means Pi disappeared without settlement evidence, even at exit 0.
+    const unexpectedPiExit = running.cli === "pi" && result.reason === "sentinel";
+    const exitCode = unexpectedPiExit ? 1 : result.exitCode;
+    const errorMessage = unexpectedPiExit
+      ? "Subagent Pi process exited before completion evidence was recorded."
+      : result.errorMessage;
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
 
@@ -1329,16 +1393,20 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        if (shouldClosePaneAfterFinalization(running)) closePane(surface);
-        running.lifecycle = result.exitCode === 0
-          ? markCompleted(running.lifecycle, Date.now())
-          : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
+        if (exitCode === 0) {
+          if (shouldClosePaneAfterFinalization(running)) closePane(surface);
+          running.lifecycle = markCompleted(running.lifecycle, Date.now());
+        } else if (running.cli === "pi") {
+          abandonSubagent(running, errorMessage ?? extracted.summary);
+        } else {
+          running.lifecycle = markFailed(running.lifecycle, errorMessage ?? extracted.summary, Date.now(), exitCode);
+        }
 
         return {
           name,
           task,
           summary: extracted.summary,
-          exitCode: result.exitCode,
+          exitCode: exitCode,
           elapsed,
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
           ...extracted.details,
@@ -1378,46 +1446,57 @@ async function watchSubagent(
       }
       summary =
         findLastAssistantMessage(allEntries) ??
-        (result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
+        (errorMessage
+          ? `Subagent error: ${errorMessage}`
+          : exitCode !== 0
+            ? `Sub-agent exited with code ${exitCode}`
             : "Sub-agent exited without output");
     } else {
-      summary = result.errorMessage
-        ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
+      summary = errorMessage
+        ? `Subagent error: ${errorMessage}`
+        : exitCode !== 0
+          ? `Sub-agent exited with code ${exitCode}`
           : "Sub-agent exited without output";
     }
 
-    if (shouldClosePaneAfterFinalization(running)) closePane(surface);
-    running.lifecycle = result.exitCode === 0
-      ? markCompleted(running.lifecycle, Date.now())
-      : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
+    if (exitCode === 0) {
+      if (shouldClosePaneAfterFinalization(running)) closePane(surface);
+      running.lifecycle = markCompleted(running.lifecycle, Date.now());
+    } else if (running.cli === "pi") {
+      abandonSubagent(running, errorMessage ?? summary);
+    } else {
+      running.lifecycle = markFailed(running.lifecycle, errorMessage ?? summary, Date.now(), exitCode);
+    }
 
     return {
       name,
       task,
       summary,
       sessionFile,
-      exitCode: result.exitCode,
+      exitCode: exitCode,
       elapsed,
       ask: result.ask,
-      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(errorMessage ? { errorMessage: errorMessage } : {}),
     };
   } catch (err: any) {
-    if (shouldClosePaneAfterFinalization(running)) {
-      try {
-        closePane(surface);
-      } catch {}
+    const error = signal.aborted ? "Subagent cancelled." : err?.message ?? String(err);
+    if (signal.aborted) {
+      if (shouldClosePaneAfterFinalization(running)) {
+        try {
+          closePane(surface);
+        } catch {}
+      }
+      running.lifecycle = markFailed(running.lifecycle, error, Date.now(), 1);
+    } else if (running.cli === "pi") {
+      abandonSubagent(running, error);
+    } else {
+      if (shouldClosePaneAfterFinalization(running)) {
+        try {
+          closePane(surface);
+        } catch {}
+      }
+      running.lifecycle = markFailed(running.lifecycle, error, Date.now(), 1);
     }
-    running.lifecycle = markFailed(
-      running.lifecycle,
-      signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
-      Date.now(),
-      1,
-    );
     updateWidget();
 
     if (signal.aborted) {
@@ -1464,7 +1543,7 @@ function sendSubagentAsk(pi: ExtensionAPI, running: RunningSubagent, result: Sub
       display: true,
       details: { id: running.id, name: running.name, question, agent: running.agent, sessionFile: result.sessionFile },
     },
-    { triggerTurn: true, deliverAs: "steer" },
+    completionDeliveryOptions(),
   );
 }
 
@@ -1494,6 +1573,7 @@ function deliverPromptCompletion(
         sendSubagentAsk(pi, running, result);
         return;
       }
+      if (isFatalPiFailure(running, result)) haltOrchestrator();
       finishPromptCompletion(running, "delivered");
       const completionApi = selectCompletionApi(pi, runtime.pi);
       completionApi.sendMessage(
@@ -1511,13 +1591,17 @@ function deliverPromptCompletion(
             ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
           },
         },
-        { triggerTurn: true, deliverAs: "steer" },
+        completionDeliveryOptions(),
       );
     },
     (cause: any) => {
       if (!shouldDeliverSubagentCompletion(running)) {
         finishPromptCompletion(running, "suppressed");
         return;
+      }
+      if (running.cli === "pi") {
+        abandonSubagent(running, cause?.message ?? String(cause));
+        haltOrchestrator();
       }
       finishPromptCompletion(running, "delivered");
       selectCompletionApi(pi, runtime.pi).sendMessage(
@@ -1527,7 +1611,7 @@ function deliverPromptCompletion(
           display: true,
           details: { id: running.id, name: running.name, task: running.task, error: cause?.message },
         },
-        { triggerTurn: true, deliverAs: "steer" },
+        completionDeliveryOptions(),
       );
     },
   );
@@ -1642,6 +1726,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       updateWidget();
     }
   });
+
+  if (!process.env.PI_SUBAGENT_ID) {
+    pi.on("input", (event) => {
+      clearOrchestratorHalt((event as any).source);
+    });
+  }
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
@@ -1760,6 +1850,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             };
           }
           const result = waiting.result;
+          if (isFatalPiFailure(running, result)) haltOrchestrator(ctx);
           if (result.ask) finishAskDelivery(running);
           else {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
@@ -1797,6 +1888,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               sendSubagentAsk(pi, running, result);
               return;
             }
+            if (isFatalPiFailure(running, result)) haltOrchestrator();
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             updateHandle(running, "finalized");
             runningSubagents.delete(running.id);
@@ -1825,7 +1917,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
               },
-              { triggerTurn: true, deliverAs: "steer" },
+              completionDeliveryOptions(),
             );
           })
           .catch((err) => {
@@ -1834,6 +1926,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               runningSubagents.delete(running.id);
               updateWidget();
               return;
+            }
+            if (running.cli === "pi") {
+              abandonSubagent(running, err?.message ?? String(err));
+              haltOrchestrator();
             }
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             updateHandle(running, "finalized");
@@ -1846,7 +1942,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 display: true,
                 details: { name: running.name, task: running.task, error: err?.message },
               },
-              { triggerTurn: true, deliverAs: "steer" },
+              completionDeliveryOptions(),
             );
             });
         }
@@ -2110,6 +2206,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: { id: running.id, name: running.name, status: "wait_cancelled" },
               };
             }
+            if (isFatalPiFailure(running, waited.result)) haltOrchestrator(ctx);
             if (waited.result.ask) finishAskDelivery(running);
             else finishPromptCompletion(running, "delivered");
             return {
@@ -2141,6 +2238,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               details: { id: resumed.id, name: resumed.name, status: "wait_cancelled" },
             };
           }
+          if (isFatalPiFailure(resumed, waited.result)) haltOrchestrator(ctx);
           if (waited.result.ask) finishAskDelivery(resumed);
           else finishPromptCompletion(resumed, "delivered");
           return {

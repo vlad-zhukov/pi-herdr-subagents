@@ -2240,6 +2240,73 @@ describe("subagent parent lifecycle", () => {
     assert.equal(selectCompletionApi(previous, current), current);
     assert.equal(selectCompletionApi(previous, undefined), previous);
   });
+
+  it("abandons Pi failures once, closes regardless of auto-exit, and persists handle state", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const id = "failed-child";
+    const running = {
+      id,
+      name: "Worker",
+      task: "",
+      surface: "pane-failed",
+      startTime: 1,
+      sessionFile: "/tmp/failed-child.jsonl",
+      cli: "pi",
+      autoExit: false,
+      interactive: false,
+      lifecycle: createLifecycle(1),
+    };
+    testApi.subagentHandles.set(id, {
+      id,
+      name: "Worker",
+      sessionFile: running.sessionFile,
+      surface: running.surface,
+      state: "active",
+      subscribed: true,
+      autoExit: false,
+      interactive: false,
+      createdAt: 1,
+    });
+    const closed: string[] = [];
+    try {
+      assert.equal(testApi.abandonSubagent(running, "provider exhausted", (surface: string) => closed.push(surface)), true);
+      assert.equal(testApi.abandonSubagent(running, "duplicate", (surface: string) => closed.push(surface)), false);
+      assert.deepEqual(closed, ["pane-failed"]);
+      assert.equal(running.lifecycle.process.kind, "failed");
+      assert.deepEqual(testApi.subagentHandles.get(id), {
+        id,
+        name: "Worker",
+        sessionFile: running.sessionFile,
+        surface: running.surface,
+        state: "abandoned",
+        subscribed: false,
+        autoExit: false,
+        interactive: false,
+        createdAt: 1,
+      });
+      assert.match(handlePromptError(testApi.subagentHandles.get(id), false) ?? "", /cannot be continued/);
+    } finally {
+      testApi.subagentHandles.delete(id);
+    }
+  });
+
+  it("halts only fatal Pi failures and resumes only on human input", () => {
+    const testApi = (subagentsModule as any).__test__;
+    testApi.runtime.halted = false;
+    assert.equal(testApi.isFatalPiFailure({ cli: "pi" }, { exitCode: 1 }), true);
+    assert.equal(testApi.isFatalPiFailure({ cli: "pi" }, { exitCode: 1, error: "cancelled" }), false);
+    assert.equal(testApi.isFatalPiFailure({ cli: "test-shell" }, { exitCode: 1 }), false);
+
+    let aborts = 0;
+    assert.equal(testApi.haltOrchestrator({ abort: () => { aborts += 1; } }), true);
+    assert.equal(testApi.haltOrchestrator({ abort: () => { aborts += 1; } }), false);
+    assert.equal(aborts, 1);
+    assert.deepEqual(testApi.completionDeliveryOptions(), { triggerTurn: false, deliverAs: "steer" });
+    assert.equal(testApi.clearOrchestratorHalt("extension"), false);
+    assert.equal(testApi.clearOrchestratorHalt("rpc"), false);
+    assert.equal(testApi.clearOrchestratorHalt("interactive"), true);
+    assert.deepEqual(testApi.completionDeliveryOptions(), { triggerTurn: true, deliverAs: "steer" });
+  });
 });
 
 describe("subagent activity snapshots", () => {
