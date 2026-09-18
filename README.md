@@ -260,14 +260,18 @@ with `subagent` instead.
 subagent_prompt({ id: "child-handle", message: "Use v2 and continue." });
 ```
 
+Each spawn or `subagent_prompt` observes one child turn. Its next result or
+question ends that observation; retained child sessions can then continue locally
+without waking this session. Another `subagent_prompt` observes one new turn.
+
 Live child receives continuation in same pane. Closed Pi child reopens same session
-with its original working directory, agent directory, identity,
-spawning capability, and auto-exit setting. Display name and raw session path are
-never targets. Unknown, accepted, abandoned, and busy handles fail without
-changing session state.
+with its original working directory, agent directory, identity, spawning
+capability, and auto-exit setting. Display name and raw session path are never
+targets. Unknown, abandoned, and busy handles fail without changing session state.
 
 `subagent_ask({ question })` reports a structured question without closing child Pi
-or pane. Answer it with original handle ID using `subagent_prompt`.
+or pane while parent is observing that turn. Local questions remain in child pane.
+Answer a reported question with original handle ID using `subagent_prompt`.
 
 
 ---

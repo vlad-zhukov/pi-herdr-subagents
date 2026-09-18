@@ -1,5 +1,5 @@
 import type { ActivityReadResult, SubagentActivityScope } from "./activity.ts";
-import type { CompletionResult } from "./completion.ts";
+import type { CompletionPayload } from "./completion.ts";
 
 export type HerdrAgentStatus =
   | "idle"
@@ -21,8 +21,8 @@ export type PaneInspection =
 export type ProcessState =
   | { kind: "starting"; startedAt: number }
   | { kind: "running"; startedAt: number; confirmedAt: number }
-  | { kind: "finalizing"; startedAt: number; detectedAt: number; completion: CompletionResult }
-  | { kind: "completed"; startedAt: number; detectedAt: number; completedAt: number; completion: CompletionResult }
+  | { kind: "finalizing"; startedAt: number; detectedAt: number; completion: CompletionPayload }
+  | { kind: "completed"; startedAt: number; detectedAt: number; completedAt: number; completion: CompletionPayload }
   | { kind: "failed"; startedAt: number; detectedAt: number; completedAt: number; error: string; exitCode?: number };
 
 export type ActivityDetail =
@@ -328,7 +328,7 @@ export function markInterruptRequested(
 
 export function markCompletionDetected(
   lifecycle: SubagentLifecycle,
-  completion: CompletionResult,
+  completion: CompletionPayload,
   detectedAt: number,
 ): SubagentLifecycle {
   if (lifecycle.process.kind === "finalizing" || isTerminal(lifecycle.process)) return lifecycle;

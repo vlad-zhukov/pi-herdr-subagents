@@ -1,5 +1,5 @@
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../runtime-routing.ts";
-import type { CompletionResult } from "../completion.ts";
+import type { CompletionPayload } from "../completion.ts";
 
 export interface SubagentLaunchParams {
   id: string;
@@ -77,7 +77,7 @@ export interface SubagentResultContext {
     interactive: boolean;
     runtimePlan?: ResolvedRuntimePlan;
   };
-  completionResult: CompletionResult;
+  completionResult: CompletionPayload;
   surface: string;
   readPane: (surface: string, lines?: number) => string;
   closePane: (surface: string) => void;

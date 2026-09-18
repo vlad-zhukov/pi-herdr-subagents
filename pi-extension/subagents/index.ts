@@ -24,7 +24,11 @@ import {
   inspectPane,
   setPaneTask,
 } from "./terminal.ts";
-import { waitForCompletion } from "./completion.ts";
+import {
+  beginCompletionChannel,
+  cancelCompletionChannel,
+  waitForCompletion,
+} from "./completion.ts";
 import { registerChildLifecycle } from "./child-lifecycle.ts";
 import {
   buildAuthenticatedModelCatalog,
@@ -604,6 +608,7 @@ function rememberPiHandle(running: RunningSubagent): void {
     sessionFile: running.sessionFile,
     surface: running.surface,
     state: "active",
+    subscribed: true,
     autoExit: running.autoExit,
     interactive: running.interactive,
     ...(running.agent ? { agent: running.agent } : {}),
@@ -614,9 +619,16 @@ function rememberPiHandle(running: RunningSubagent): void {
   });
 }
 
-function updateHandle(running: RunningSubagent, state: SubagentHandle["state"]): void {
+function updateHandle(
+  running: RunningSubagent,
+  state: SubagentHandle["state"],
+  subscribed = false,
+): void {
   const handle = subagentHandles.get(running.id);
-  if (handle) saveHandle({ ...handle, surface: running.surface, state });
+  if (handle && handle.state !== "abandoned") {
+    if (!subscribed) cancelCompletionChannel(running.sessionFile);
+    saveHandle({ ...handle, surface: running.surface, state, subscribed });
+  }
 }
 
 function restoreHandles(entries: unknown[]): void {
@@ -980,9 +992,10 @@ function handleSubagentInterrupt(
 }
 
 function shouldSteerStatusTransition(
-  running: Pick<RunningSubagent, "interactive" | "orchestrationMode">,
+  running: Pick<RunningSubagent, "id" | "interactive" | "orchestrationMode">,
 ): boolean {
-  return !running.interactive && running.orchestrationMode !== "wait-all";
+  return (subagentHandles.get(running.id)?.subscribed ?? true) &&
+    !running.interactive && running.orchestrationMode !== "wait-all";
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
@@ -1228,6 +1241,7 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
+  if (driver.id === "pi") beginCompletionChannel(built.sessionFile ?? subagentSessionFile);
   runScriptInPane(surface, built.command, {
     scriptPath: launchScriptFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
@@ -1525,6 +1539,7 @@ async function reopenPiSubagent(
   ctx: Pick<ExtensionContext, "sessionManager">,
 ): Promise<RunningSubagent> {
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  beginCompletionChannel(handle.sessionFile);
   const launched = await launchPiContinuation({
     handle,
     message,
@@ -1554,8 +1569,49 @@ async function reopenPiSubagent(
     inputLocked: true,
   };
   runningSubagents.set(handle.id, running);
-  saveHandle({ ...handle, surface: launched.surface, state: "active" });
+  saveHandle({ ...handle, surface: launched.surface, state: "active", subscribed: true });
   return running;
+}
+
+function attachLivePiSubagent(
+  handle: SubagentHandle,
+  message: string,
+  ctx: Pick<ExtensionContext, "sessionManager">,
+): RunningSubagent {
+  const startTime = Date.now();
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  const running: RunningSubagent = {
+    id: handle.id,
+    name: handle.name,
+    task: message,
+    ...(handle.agent ? { agent: handle.agent } : {}),
+    surface: handle.surface!,
+    startTime,
+    sessionFile: handle.sessionFile,
+    activityFile: getSubagentActivityFile(artifactDir, handle.id),
+    cli: "pi",
+    interactive: handle.interactive,
+    autoExit: handle.autoExit,
+    ...(handle.cwd ? { cwd: handle.cwd } : {}),
+    ...(handle.agentDir ? { agentDir: handle.agentDir } : {}),
+    ...(handle.spawning != null ? { spawning: handle.spawning } : {}),
+    runtimePlan: undefined,
+    orchestrationMode: orchestrationConfig.mode,
+    lifecycle: createLifecycle(startTime),
+    inputLocked: true,
+  };
+  runningSubagents.set(handle.id, running);
+  return running;
+}
+
+function startParentSubscription(running: RunningSubagent): void {
+  beginCompletionChannel(running.sessionFile);
+  updateHandle(running, "active", true);
+}
+
+function cancelParentSubscription(running: RunningSubagent, previous: SubagentHandle): void {
+  cancelCompletionChannel(running.sessionFile);
+  saveHandle({ ...previous, surface: running.surface, subscribed: false });
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -2007,7 +2063,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const handle = subagentHandles.get(params.id);
-        const running = runningSubagents.get(params.id);
+        let running = runningSubagents.get(params.id);
         const error = handlePromptError(handle, running?.inputLocked === true);
         if (error) {
           return { content: [{ type: "text" as const, text: error }], details: { error, id: params.id } };
@@ -2017,19 +2073,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text }], details: { error: text, id: params.id } };
         }
 
+        if (!running && handle.surface) {
+          if (!isTerminalAvailable()) return muxUnavailableResult();
+          try {
+            const inspection = await inspectPane(handle.surface);
+            if (inspection.kind === "present") running = attachLivePiSubagent(handle, params.message, ctx);
+          } catch {
+            // Closed and unavailable panes both fall through to session reopen.
+          }
+        }
+
         if (running) {
           running.inputLocked = true;
           running.task = params.message;
           running.lifecycle = createLifecycle(running.startTime);
           try {
+            startParentSubscription(running);
             promptPane(running.surface, params.message);
           } catch (cause: any) {
+            cancelParentSubscription(running, handle);
             running.inputLocked = false;
             const text = `Could not prompt subagent ${params.id}: ${cause?.message ?? String(cause)}`;
             return { content: [{ type: "text" as const, text }], details: { error: text, id: params.id } };
           }
           const controller = new AbortController();
           running.abortController = controller;
+          startWidgetRefresh();
+          startStatusRefresh(pi);
           const completion = watchSubagent(running, controller.signal);
           if (running.orchestrationMode === "wait-all") {
             const waited = await waitForCompletionOrAbort(completion, signal);

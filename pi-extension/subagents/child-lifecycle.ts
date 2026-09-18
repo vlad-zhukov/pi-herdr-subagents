@@ -2,13 +2,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
-
-export interface SubagentErrorInfo {
-  errorMessage: string;
-  stopReason: "error";
-}
+import {
+  buildCompletionPayload,
+  hasCompletionChannel,
+  publishCompletion,
+} from "./completion.ts";
 
 export function shouldFinalizeOnAgentSettlement(messages: any[] | undefined): boolean {
   for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
@@ -16,30 +15,6 @@ export function shouldFinalizeOnAgentSettlement(messages: any[] | undefined): bo
     if (message?.role === "assistant") return message.stopReason !== "aborted";
   }
   return false;
-}
-
-export function findLatestAssistantError(
-  messages: any[] | undefined,
-): SubagentErrorInfo | null {
-  if (!messages) return null;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg?.role !== "assistant") continue;
-    if (msg.stopReason !== "error") return null;
-    const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
-    return {
-      errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
-      stopReason: "error",
-    };
-  }
-  return null;
-}
-
-export function buildCompletionSidecar(messages: any[] | undefined):
-  | { type: "done" }
-  | { type: "error"; errorMessage: string; stopReason: "error" } {
-  const errorInfo = findLatestAssistantError(messages);
-  return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
 }
 
 export function registerChildLifecycle(pi: ExtensionAPI): void {
@@ -61,14 +36,7 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
   function finalize(ctx: { shutdown(): void }): void {
     if (finalized) return;
     finalized = true;
-    const sessionFile = process.env.PI_SUBAGENT_SESSION;
-    if (sessionFile) {
-      try {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify(buildCompletionSidecar(latestAgentMessages)));
-      } catch {
-        // The parent still detects a terminal pane if publishing fails.
-      }
-    }
+    publishCompletion(process.env.PI_SUBAGENT_SESSION, buildCompletionPayload(latestAgentMessages));
     recorder.assignmentFinalized();
     if (autoExit) ctx.shutdown();
   }
@@ -98,6 +66,7 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
     renderWidget(ctx, null);
   });
   pi.on("input", () => {
+    if (hasCompletionChannel(process.env.PI_SUBAGENT_SESSION)) finalized = false;
     awaitingAnswer = false;
     recorder.input();
   });
@@ -108,7 +77,7 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
     recorder.agentEndWaiting();
   });
   pi.on("agent_settled", (_event, ctx) => {
-    if (!interactive && !awaitingAnswer && shouldFinalizeOnAgentSettlement(latestAgentMessages)) finalize(ctx);
+    if (!interactive && hasCompletionChannel(process.env.PI_SUBAGENT_SESSION) && !awaitingAnswer && shouldFinalizeOnAgentSettlement(latestAgentMessages)) finalize(ctx);
   });
   pi.on("turn_start", (event) => recorder.turnStart((event as any).turnIndex));
   pi.on("turn_end", (event) => recorder.turnEnd((event as any).turnIndex));
@@ -157,9 +126,9 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
       }
       awaitingAnswer = true;
       recorder.assignmentAwaiting();
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ type: "ask" as const, question: params.question }));
+      const report = publishCompletion(sessionFile, { reason: "ask", exitCode: 0, ask: { question: params.question } });
       return {
-        content: [{ type: "text", text: "Question sent. Waiting for a reply." }],
+        content: [{ type: "text", text: report ? "Question sent. Waiting for a reply." : "Waiting for a local reply." }],
         details: {},
         terminate: true,
       };

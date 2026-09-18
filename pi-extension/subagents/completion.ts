@@ -1,14 +1,14 @@
-import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
 const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 
-export interface CompletionResult {
-  reason: "done" | "ask" | "sentinel" | "error";
-  exitCode: number;
-  ask?: { question: string };
-  errorMessage?: string;
-}
+export type CompletionPayload =
+  | { reason: "done"; exitCode: 0 }
+  | { reason: "ask"; exitCode: 0; ask: { question: string } }
+  | { reason: "sentinel"; exitCode: number }
+  | { reason: "error"; exitCode: 1; errorMessage: string };
 
 export interface CompletionOptions {
   intervalMs: number;
@@ -25,69 +25,104 @@ export interface CompletionOptions {
   onTick?: (elapsedSeconds: number) => void;
 }
 
-export function interpretExitSidecar(data: unknown): CompletionResult {
-  const payload = data as {
-    type?: unknown;
-    name?: unknown;
-    message?: unknown;
-    question?: unknown;
-    errorMessage?: unknown;
-  };
+function exitFile(sessionFile: string): string {
+  return `${sessionFile}.exit`;
+}
 
-  if (payload?.type === "ask") {
-    return {
-      reason: "ask",
-      exitCode: 0,
-      ask: { question: typeof payload.question === "string" ? payload.question : "" },
-    };
+/** Open one parent-delivery channel for this child turn. */
+export function beginCompletionChannel(sessionFile: string): void {
+  writeFileSync(exitFile(sessionFile), "", "utf8");
+}
+
+/** Remove an unused parent-delivery channel. */
+export function cancelCompletionChannel(sessionFile: string): void {
+  rmSync(exitFile(sessionFile), { force: true });
+}
+
+/** True only while parent has opened a channel and child has not replied. */
+export function hasCompletionChannel(sessionFile: string | undefined): boolean {
+  if (!sessionFile) return false;
+  try {
+    return existsSync(exitFile(sessionFile)) && readFileSync(exitFile(sessionFile), "utf8").trim() === "";
+  } catch {
+    return false;
   }
+}
 
-  if (payload?.type === "error") {
-    const errorMessage =
-      typeof payload.errorMessage === "string" && payload.errorMessage.trim()
-        ? payload.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
+/** Publish one child reply through an open channel. Local turns have no channel. */
+export function publishCompletion(
+  sessionFile: string | undefined,
+  payload: CompletionPayload,
+): boolean {
+  if (!sessionFile || !hasCompletionChannel(sessionFile)) return false;
+
+  const file = exitFile(sessionFile);
+  const temp = join(dirname(file), `${file.split("/").pop()}.${process.pid}.tmp`);
+  try {
+    writeFileSync(temp, JSON.stringify(payload), "utf8");
+    renameSync(temp, file);
+    return true;
+  } catch {
+    rmSync(temp, { force: true });
+    return false;
+  }
+}
+
+export function buildCompletionPayload(messages: any[] | undefined): CompletionPayload {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    const message = messages![i];
+    if (message?.role !== "assistant" || message.stopReason !== "error") continue;
+    const errorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
+      ? message.errorMessage.trim()
+      : "Subagent agent loop ended with stopReason=error (no errorMessage field).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
+  return { reason: "done", exitCode: 0 };
+}
 
-  if (payload?.type === "done") return { reason: "done", exitCode: 0 };
-
+export function interpretExitSidecar(data: unknown): CompletionPayload {
+  const payload = data as Partial<CompletionPayload>;
+  if (payload?.reason === "done" && payload.exitCode === 0) return { reason: "done", exitCode: 0 };
+  if (payload?.reason === "ask" && payload.exitCode === 0 && typeof payload.ask?.question === "string") {
+    return { reason: "ask", exitCode: 0, ask: { question: payload.ask.question } };
+  }
+  if (payload?.reason === "sentinel" && Number.isInteger(payload.exitCode)) {
+    return { reason: "sentinel", exitCode: payload.exitCode };
+  }
+  if (payload?.reason === "error") {
+    const errorMessage = typeof payload.errorMessage === "string" && payload.errorMessage.trim()
+      ? payload.errorMessage
+      : "Subagent exited with reason=error (no errorMessage in completion payload).";
+    return { reason: "error", exitCode: 1, errorMessage };
+  }
   return {
     reason: "error",
     exitCode: 1,
-    errorMessage: "Invalid subagent completion sidecar: unsupported payload type.",
+    errorMessage: "Invalid completion payload.",
   };
 }
 
-function consumeExitSidecar(sessionFile: string | undefined): CompletionResult | null {
+function consumeExitSidecar(sessionFile: string | undefined): CompletionPayload | null {
   if (!sessionFile) return null;
+  const file = exitFile(sessionFile);
+  if (!hasCompletionChannel(sessionFile) && !existsSync(file)) return null;
 
-  const exitFile = `${sessionFile}.exit`;
-  if (!existsSync(exitFile)) return null;
-
+  let raw: string;
   try {
-    const result = interpretExitSidecar(JSON.parse(readFileSync(exitFile, "utf8")));
-    rmSync(exitFile, { force: true });
-    return result;
+    raw = readFileSync(file, "utf8");
   } catch {
-    // The child may still be writing the file. Retry on the next polling cycle.
     return null;
   }
-}
+  if (!raw.trim()) return null;
 
-function consumeAskSidecar(sessionFile: string | undefined): CompletionResult | null {
-  if (!sessionFile) return null;
-  const askFile = `${sessionFile}.ask`;
-  if (!existsSync(askFile)) return null;
-  const claimedFile = `${askFile}.${process.pid}.consumed`;
+  const claimed = `${file}.${process.pid}.consumed`;
   try {
-    renameSync(askFile, claimedFile);
-    const result = interpretExitSidecar(JSON.parse(readFileSync(claimedFile, "utf8")));
-    return result.reason === "ask" ? result : null;
+    renameSync(file, claimed);
+    return interpretExitSidecar(JSON.parse(readFileSync(claimed, "utf8")));
   } catch {
     return null;
   } finally {
-    rmSync(claimedFile, { force: true });
+    rmSync(claimed, { force: true });
   }
 }
 
@@ -96,9 +131,7 @@ function terminalExitCode(screen: string): number | null {
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
-function completionArtifact(options: CompletionOptions): CompletionResult | null {
-  const ask = consumeAskSidecar(options.sessionFile);
-  if (ask) return ask;
+function completionArtifact(options: CompletionOptions): CompletionPayload | null {
   const sidecar = consumeExitSidecar(options.sessionFile);
   if (sidecar) return sidecar;
   if (options.sentinelFile && existsSync(options.sentinelFile)) {
@@ -110,7 +143,7 @@ function completionArtifact(options: CompletionOptions): CompletionResult | null
 async function waitForDisappearanceArtifacts(
   signal: AbortSignal,
   options: CompletionOptions,
-): Promise<CompletionResult | null> {
+): Promise<CompletionPayload | null> {
   const immediate = completionArtifact(options);
   if (immediate) return immediate;
 
@@ -128,7 +161,7 @@ async function waitForDisappearanceArtifacts(
 function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.reject(new Error(ABORT_MESSAGE));
 
-  return new Promise<void>((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const onAbort = () => {
       clearTimeout(timer);
       reject(new Error(ABORT_MESSAGE));
@@ -144,7 +177,7 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
 export async function waitForCompletion(
   signal: AbortSignal,
   options: CompletionOptions,
-): Promise<CompletionResult> {
+): Promise<CompletionPayload> {
   const startedAt = Date.now();
 
   for (;;) {
@@ -175,8 +208,6 @@ export async function waitForCompletion(
       const observedAt = Date.now();
       options.onPaneInspection?.(inspection, observedAt);
       if (inspection.kind === "missing") {
-        // Pane closure and atomic artifact publication are separate operations.
-        // Allow a short bounded grace window before declaring evidence lost.
         const racedCompletion = await waitForDisappearanceArtifacts(signal, options);
         if (racedCompletion) return racedCompletion;
         return {

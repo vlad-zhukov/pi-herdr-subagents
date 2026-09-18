@@ -29,16 +29,17 @@ compaction retries, and queued continuations. Pi is idle and awaits another prom
 _Avoid_: end
 
 **Assignment finalization**:
-Subagent has completed assigned work and submitted a candidate result to its
-Orchestrator. It does not imply Orchestrator acceptance. Noninteractive Subagents
-finalize automatically on Agent settlement; Interactive Subagents require their
-Operator to run `/subagent_finalize`. Operator may finalize while Subagent is
-awaiting an answer; resulting candidate records that state.
+Subagent has completed assigned work and submitted its result to Orchestrator.
+Finalization ends current Parent subscription; it does not close retained Pi or
+Herdr pane unless Auto-exit is enabled.
 _Avoid_: end, session finalization
 
-**Orchestrator acceptance**:
-Orchestrator accepts finalized assignment. Accepted Subagent is permanently
-detached from Orchestrator and emits no further messages or results to it.
+**Parent subscription**:
+Temporary parent observation of one Subagent turn. Parent creates empty
+`<session>.exit`; child atomically replaces it with one structured payload; parent
+claims and removes payload, ending subscription. Local work without pending
+`.exit` is private. A later `subagent_prompt` creates a new subscription.
+_Avoid_: observer, listener
 
 **Automatic abandonment**:
 System terminal handling for provider failure after retries, unexpected Pi exit,
@@ -61,16 +62,16 @@ When false, Pi and pane remain open for Operator review and steering. Defaults t
 false independently of Interactive Subagent mode.
 
 **Subagent ask**:
-Nonterminal structured question from any Subagent to Orchestrator. It leaves Pi
-and Herdr pane live; Orchestrator may answer or reroute question to Operator.
+Nonterminal structured question written to current Parent subscription's `.exit`
+channel. Without that channel, question remains local.
 
 **Input lock**:
-One-input-at-a-time rule for a Subagent. First accepted prompt owns its next
+One-input-at-a-time rule for a Subagent. First prompt owns its next
 turn; concurrent prompt fails and caller retries.
 
 **Reportable event**:
-One-time handoff from Subagent to Orchestrator: a result, Subagent ask, Assignment
-finalization, or failure.
+One-time handoff from a subscribed Subagent turn to Orchestrator: a result,
+Subagent ask, Assignment finalization, or failure.
 
 **Fan-in**:
 Orchestrator resumes only after every Subagent launched in one tool batch reaches

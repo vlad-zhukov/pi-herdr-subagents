@@ -54,10 +54,15 @@ import {
 } from "../pi-extension/subagents/activity.ts";
 import { registerChildLifecycle,
   shouldFinalizeOnAgentSettlement,
-  findLatestAssistantError,
-  buildCompletionSidecar,
 } from "../pi-extension/subagents/child-lifecycle.ts";
-import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import {
+  beginCompletionChannel,
+  buildCompletionPayload,
+  hasCompletionChannel,
+  interpretExitSidecar,
+  publishCompletion,
+  waitForCompletion,
+} from "../pi-extension/subagents/completion.ts";
 import {
   createLifecycle,
   lifecycleTransition,
@@ -260,6 +265,7 @@ describe("durable subagent handles", () => {
     sessionFile: "/tmp/child-001.jsonl",
     surface: "w1:p2",
     state: "finalized",
+    subscribed: false,
     autoExit: false,
     interactive: false,
     createdAt: 1_000,
@@ -270,6 +276,7 @@ describe("durable subagent handles", () => {
     saveSubagentHandle((customType, data) => saved.push({ customType, data }), {
       ...handle,
       state: "active",
+      subscribed: true,
     });
     saveSubagentHandle((customType, data) => saved.push({ customType, data }), handle);
 
@@ -308,9 +315,18 @@ describe("durable subagent handles", () => {
     ]) assert.match(command, new RegExp(setting.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 
-  it("rejects unknown, detached, abandoned, and locked handles without mutation", () => {
+  it("persists detached subscriptions without blocking continuation", () => {
+    const saved: Array<{ customType: string; data: unknown }> = [];
+    saveSubagentHandle((customType, data) => saved.push({ customType, data }), handle);
+    const restored = restoreSubagentHandles(saved.map(({ customType, data }) => ({
+      type: "custom", customType, data,
+    })));
+    assert.equal(restored.get(handle.id)?.subscribed, false);
+    assert.equal(handlePromptError(restored.get(handle.id), false), null);
+  });
+
+  it("rejects unknown, abandoned, and locked handles without mutation", () => {
     assert.equal(handlePromptError(undefined, false), "Unknown subagent handle.");
-    assert.match(handlePromptError({ ...handle, state: "accepted" }, false)!, /accepted/);
     assert.match(handlePromptError({ ...handle, state: "abandoned" }, false)!, /abandoned/);
     assert.match(handlePromptError(handle, true)!, /busy/);
     assert.equal(handlePromptError(handle, false), null);
@@ -1258,6 +1274,7 @@ describe("child assignment lifecycle", () => {
       delete process.env.PI_SUBAGENT_AUTO_EXIT;
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       try {
+        beginCompletionChannel(sessionFile);
         const { api, eventHandlers } = createMockExtensionApi();
         registerChildLifecycle(api);
         const agentEnd = eventHandlers.get("agent_end")![0];
@@ -1266,7 +1283,7 @@ describe("child assignment lifecycle", () => {
         const ctx = { shutdown: () => { shutdowns += 1; } };
         agentEnd({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
         agentSettled({}, ctx);
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { reason: "done", exitCode: 0 });
         assert.equal(shutdowns, 0);
       } finally {
         restoreEnvVar("PI_SUBAGENT_INTERACTIVE", previous.interactive);
@@ -1287,6 +1304,7 @@ describe("child assignment lifecycle", () => {
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       try {
+        beginCompletionChannel(sessionFile);
         const { api, eventHandlers, registeredCommands } = createMockExtensionApi();
         registerChildLifecycle(api);
         let waited = 0;
@@ -1294,13 +1312,13 @@ describe("child assignment lifecycle", () => {
         const ctx = { shutdown: () => { shutdowns += 1; }, waitForIdle: async () => { waited += 1; } };
         eventHandlers.get("agent_end")![0]({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
         eventHandlers.get("agent_settled")![0]({}, ctx);
-        assert.equal(existsSync(`${sessionFile}.exit`), false);
+        assert.equal(hasCompletionChannel(sessionFile), true);
         assert.equal(shutdowns, 0);
         const finalize = registeredCommands.find((command) => command.name === "subagent_finalize");
         assert.ok(finalize);
         await finalize.handler("", ctx);
         assert.equal(waited, 1);
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { reason: "done", exitCode: 0 });
         assert.equal(shutdowns, 1);
       } finally {
         restoreEnvVar("PI_SUBAGENT_INTERACTIVE", previousInteractive);
@@ -1318,6 +1336,7 @@ describe("child assignment lifecycle", () => {
     const previousSession = process.env.PI_SUBAGENT_SESSION;
     process.env.PI_SUBAGENT_SESSION = sessionFile;
     try {
+      beginCompletionChannel(sessionFile);
       const { api, eventHandlers, registeredTools } = createMockExtensionApi();
       registerChildLifecycle(api);
       const ask = registeredTools.find((tool) => tool.name === "subagent_ask");
@@ -1325,12 +1344,53 @@ describe("child assignment lifecycle", () => {
       assert.match(ask.promptGuidelines.join("\n"), /Do not end a task with an unresolved question/);
       const result = await ask.execute("ask-1", { question: "Use v1 or v2?" });
       assert.equal(result.terminate, true);
-      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.ask`, "utf8")), {
-        type: "ask", question: "Use v1 or v2?",
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+        reason: "ask", exitCode: 0, ask: { question: "Use v1 or v2?" },
       });
       eventHandlers.get("agent_end")![0]({ messages: [{ role: "assistant", stopReason: "stop" }] }, {});
       eventHandlers.get("agent_settled")![0]({}, { shutdown() {} });
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+        reason: "ask", exitCode: 0, ask: { question: "Use v1 or v2?" },
+      });
+      eventHandlers.get("input")![0]({}, {});
+      eventHandlers.get("agent_end")![0]({ messages: [{ role: "assistant", stopReason: "stop" }] }, {});
+      eventHandlers.get("agent_settled")![0]({}, { shutdown() {} });
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+        reason: "ask", exitCode: 0, ask: { question: "Use v1 or v2?" },
+      });
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps local asks private after finalization and resubscribes on parent prompt", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    const previousSession = process.env.PI_SUBAGENT_SESSION;
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    try {
+      beginCompletionChannel(sessionFile);
+      const { api, eventHandlers, registeredTools } = createMockExtensionApi();
+      registerChildLifecycle(api);
+      const ask = registeredTools.find((tool) => tool.name === "subagent_ask");
+      const agentEnd = eventHandlers.get("agent_end")![0];
+      const agentSettled = eventHandlers.get("agent_settled")![0];
+      agentEnd({ messages: [{ role: "assistant", stopReason: "stop" }] }, {});
+      agentSettled({}, { shutdown() {} });
+      rmSync(`${sessionFile}.exit`);
+
+      const local = await ask.execute("local", { question: "Try another path?" });
+      assert.equal(local.content[0].text, "Waiting for a local reply.");
       assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+      beginCompletionChannel(sessionFile);
+      eventHandlers.get("input")![0]({}, {});
+      const parent = await ask.execute("parent", { question: "Need a decision?" });
+      assert.equal(parent.content[0].text, "Question sent. Waiting for a reply.");
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+        reason: "ask", exitCode: 0, ask: { question: "Need a decision?" },
+      });
     } finally {
       restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
       rmSync(dir, { recursive: true, force: true });
@@ -1340,9 +1400,9 @@ describe("child assignment lifecycle", () => {
   it("finalizes awaiting-answer state and reports errors", () => {
     assert.equal(shouldFinalizeOnAgentSettlement([{ role: "assistant", stopReason: "aborted" }]), false);
     assert.equal(shouldFinalizeOnAgentSettlement([{ role: "assistant", stopReason: "error" }]), true);
-    assert.deepEqual(buildCompletionSidecar(undefined), { type: "done" });
-    assert.deepEqual(buildCompletionSidecar([{ role: "assistant", stopReason: "error", errorMessage: "provider failed" }]), {
-      type: "error", errorMessage: "provider failed", stopReason: "error",
+    assert.deepEqual(buildCompletionPayload(undefined), { reason: "done", exitCode: 0 });
+    assert.deepEqual(buildCompletionPayload([{ role: "assistant", stopReason: "error", errorMessage: "provider failed" }]), {
+      reason: "error", exitCode: 1, errorMessage: "provider failed",
     });
   });
 
@@ -1361,11 +1421,7 @@ describe("child assignment lifecycle", () => {
     assert.equal(parent.registeredCommands.some((command) => command.name === "subagent_finalize"), false);
   });
 
-  it("finds the latest provider error", () => {
-    assert.deepEqual(findLatestAssistantError([{ role: "assistant", stopReason: "error", errorMessage: "overloaded" }]), {
-      errorMessage: "overloaded", stopReason: "error",
-    });
-  });
+
 });
 
 describe("lifecycle.ts", () => {
@@ -1546,15 +1602,29 @@ describe("lifecycle.ts", () => {
 
 describe("completion.ts", () => {
 
+  it("opens one channel and publishes one payload", () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-channel-"));
+    const sessionFile = join(dir, "session.jsonl");
+    try {
+      beginCompletionChannel(sessionFile);
+      assert.equal(hasCompletionChannel(sessionFile), true);
+      assert.equal(publishCompletion(sessionFile, { reason: "done", exitCode: 0 }), true);
+      assert.equal(hasCompletionChannel(sessionFile), false);
+      assert.equal(publishCompletion(sessionFile, { reason: "done", exitCode: 0 }), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("decodes structured ask payloads", () => {
     assert.deepEqual(
-      interpretExitSidecar({ type: "ask", question: "need help" }),
+      interpretExitSidecar({ reason: "ask", exitCode: 0, ask: { question: "need help" } }),
       { reason: "ask", exitCode: 0, ask: { question: "need help" } },
     );
   });
 
   it("decodes done payloads", () => {
-    assert.deepEqual(interpretExitSidecar({ type: "done" }), {
+    assert.deepEqual(interpretExitSidecar({ reason: "done", exitCode: 0 }), {
       reason: "done",
       exitCode: 0,
     });
@@ -1563,9 +1633,9 @@ describe("completion.ts", () => {
   it("decodes error payloads and propagates the message with a non-zero exit code", () => {
     assert.deepEqual(
       interpretExitSidecar({
-        type: "error",
+        reason: "error",
+        exitCode: 1,
         errorMessage: "Anthropic 529 Overloaded after 3 retries",
-        stopReason: "error",
       }),
       {
         reason: "error",
@@ -1576,7 +1646,7 @@ describe("completion.ts", () => {
   });
 
   it("falls back to a placeholder when error payload has no errorMessage", () => {
-    const result = interpretExitSidecar({ type: "error" });
+    const result = interpretExitSidecar({ reason: "error" });
     assert.equal(result.reason, "error");
     assert.equal(result.exitCode, 1);
     assert.match(result.errorMessage ?? "", /no errorMessage/);
@@ -1587,14 +1657,15 @@ describe("completion.ts", () => {
       const result = interpretExitSidecar(payload);
       assert.equal(result.reason, "error");
       assert.equal(result.exitCode, 1);
-      assert.match(result.errorMessage ?? "", /Invalid subagent completion sidecar/);
+      assert.match(result.errorMessage ?? "", /Invalid completion payload/);
     }
   });
 
   it("consumes a sidecar and removes it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-sidecar-"));
     const sessionFile = join(dir, "session.jsonl");
-    writeFileSync(`${sessionFile}.ask`, JSON.stringify({ type: "ask", question: "ready" }));
+    beginCompletionChannel(sessionFile);
+    publishCompletion(sessionFile, { reason: "ask", exitCode: 0, ask: { question: "ready" } });
     try {
       const result = await waitForCompletion(new AbortController().signal, {
         intervalMs: 1,
@@ -1606,7 +1677,7 @@ describe("completion.ts", () => {
         exitCode: 0,
         ask: { question: "ready" },
       });
-      assert.equal(existsSync(`${sessionFile}.ask`), false);
+      assert.equal(existsSync(`${sessionFile}.exit`), false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1615,7 +1686,8 @@ describe("completion.ts", () => {
   it("atomically claims an ask sidecar for one watcher", async () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-ask-race-"));
     const sessionFile = join(dir, "session.jsonl");
-    writeFileSync(`${sessionFile}.ask`, JSON.stringify({ type: "ask", question: "Choose one" }));
+    beginCompletionChannel(sessionFile);
+    publishCompletion(sessionFile, { reason: "ask", exitCode: 0, ask: { question: "Choose one" } });
     const first = new AbortController();
     const second = new AbortController();
     try {
@@ -1694,12 +1766,13 @@ describe("completion.ts", () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-race-"));
     const sessionFile = join(dir, "child.jsonl");
     try {
+      beginCompletionChannel(sessionFile);
       const result = await waitForCompletion(new AbortController().signal, {
         intervalMs: 1,
         sessionFile,
         readTerminalTail: async () => "",
         inspectPane: async () => {
-          writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+          publishCompletion(sessionFile, { reason: "done", exitCode: 0 });
           return { kind: "missing", error: "pane_not_found" };
         },
       });
@@ -1713,9 +1786,10 @@ describe("completion.ts", () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-delayed-race-"));
     const sessionFile = join(dir, "child.jsonl");
     const timer = setTimeout(() => {
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      publishCompletion(sessionFile, { reason: "done", exitCode: 0 });
     }, 30);
     try {
+      beginCompletionChannel(sessionFile);
       const result = await waitForCompletion(new AbortController().signal, {
         intervalMs: 1,
         sessionFile,
@@ -1953,6 +2027,12 @@ describe("tool registration", () => {
     }
   });
 
+  it("does not register obsolete parent detachment controls", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    assert.equal(registeredTools.some((tool) => tool.label === "Accept Subagent"), false);
+  });
+
   it("registers subagent_prompt for handle-based continuation", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -2085,12 +2165,21 @@ describe("subagent parent lifecycle", () => {
     assert.equal(testApi.shouldClosePaneAfterFinalization({ autoExit: false }), false);
   });
 
-  it("suppresses status steers while wait-all calls are pending", () => {
+  it("suppresses status steers without a parent subscription", () => {
     const testApi = (subagentsModule as any).__test__;
-
-    assert.equal(testApi.shouldSteerStatusTransition({ interactive: false, orchestrationMode: "wait-all" }), false);
-    assert.equal(testApi.shouldSteerStatusTransition({ interactive: false, orchestrationMode: "async" }), true);
-    assert.equal(testApi.shouldSteerStatusTransition({ interactive: true, orchestrationMode: "async" }), false);
+    const id = "local-only";
+    testApi.subagentHandles.set(id, {
+      id, name: "Worker", sessionFile: "/tmp/worker.jsonl", state: "finalized",
+      subscribed: false, autoExit: false, interactive: false, createdAt: 1,
+    });
+    try {
+      assert.equal(testApi.shouldSteerStatusTransition({ id, interactive: false, orchestrationMode: "async" }), false);
+      assert.equal(testApi.shouldSteerStatusTransition({ interactive: false, orchestrationMode: "wait-all" }), false);
+      assert.equal(testApi.shouldSteerStatusTransition({ interactive: false, orchestrationMode: "async" }), true);
+      assert.equal(testApi.shouldSteerStatusTransition({ interactive: true, orchestrationMode: "async" }), false);
+    } finally {
+      testApi.subagentHandles.delete(id);
+    }
   });
 
   it("preserves active subagents during extension reload", () => {
