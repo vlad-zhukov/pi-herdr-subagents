@@ -16,6 +16,7 @@
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import {
@@ -26,6 +27,8 @@ import {
   cleanupTestEnv,
   createTrackedSurface,
   startPi,
+  promptPane,
+  interruptPane,
   waitForScreen,
   waitForFile,
   sleep,
@@ -49,6 +52,63 @@ function configureWaitAll(env: TestEnv): void {
   );
 }
 
+function workspacePaneIds(env: TestEnv): string[] {
+  const output = execFileSync("herdr", ["pane", "list", "--workspace", env.workspaceId], { encoding: "utf8" });
+  const parsed = JSON.parse(output) as { result?: { panes?: Array<{ pane_id?: unknown }> } };
+  return (parsed.result?.panes ?? [])
+    .map((pane) => pane.pane_id)
+    .filter((paneId): paneId is string => typeof paneId === "string");
+}
+
+async function waitForChildPane(env: TestEnv, existingPanes: Set<string>, timeout: number): Promise<string> {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const children = workspacePaneIds(env).filter((paneId) => !existingPanes.has(paneId));
+    if (children.length === 1) return children[0];
+    await sleep(500);
+  }
+  throw new Error("Timed out waiting for the spawned Pi Assignment pane.");
+}
+
+async function waitForHandleId(surface: string, timeout: number): Promise<string> {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const output = execFileSync("herdr", ["pane", "get", surface], { encoding: "utf8" });
+    const parsed = JSON.parse(output) as { result?: { pane?: { agent_session?: { value?: unknown } } } };
+    const sessionFile = parsed.result?.pane?.agent_session?.value;
+    if (typeof sessionFile === "string" && existsSync(sessionFile)) {
+      const entries = readFileSync(sessionFile, "utf8").trim().split("\n").reverse();
+      for (const line of entries) {
+        try {
+          const entry = JSON.parse(line) as { customType?: unknown; data?: { handle?: { id?: unknown } } };
+          const id = entry.data?.handle?.id;
+          if (entry.customType === "subagent_handle" && typeof id === "string") return id;
+        } catch {}
+      }
+    }
+    await sleep(500);
+  }
+  throw new Error("Timed out waiting for the durable Subagent handle.");
+}
+
+async function waitForChildPaneGone(env: TestEnv, pane: string, timeout: number): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    if (!workspacePaneIds(env).includes(pane)) return;
+    await sleep(500);
+  }
+  throw new Error(`Timed out waiting for Assignment pane ${pane} to close.`);
+}
+
+async function waitForWidgetClear(surface: string, timeout: number): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    if (!/Subagents/.test(readPane(surface, 100))) return;
+    await sleep(500);
+  }
+  throw new Error("Timed out waiting for the Subagents widget to clear.");
+}
+
 if (backends.length === 0) {
   console.log("⚠️  herdr is unavailable — skipping subagent lifecycle integration tests");
   console.log("   Run inside herdr to enable these tests.");
@@ -67,6 +127,50 @@ for (const backend of backends) {
     after(() => {
       cleanupTestEnv(env);
       restoreBackend(prevMux);
+    });
+
+    // ── Parent Escape hard stop ──
+
+    it("Escape abandons an interactive Pi assignment and permits recovery", async () => {
+      const id = uniqueId();
+      const parentStart = `/tmp/pi-integ-escape-parent-start-${id}.txt`;
+      const parentMarker = `/tmp/pi-integ-escape-parent-${id}.txt`;
+      const childMarker = `/tmp/pi-integ-escape-child-${id}.txt`;
+      const freshMarker = `/tmp/pi-integ-escape-fresh-${id}.txt`;
+      trackTempFile(env, parentStart);
+      trackTempFile(env, parentMarker);
+      trackTempFile(env, childMarker);
+      trackTempFile(env, freshMarker);
+
+      const name = `HardStop-${id}`;
+      const surface = createTrackedSurface(env, `hard-stop-${id}`);
+      const existingPanes = new Set(workspacePaneIds(env));
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        `Call subagent exactly once with name "${name}", agent "test-echo", interactive: true,`,
+        `and task "Run: sleep 90; echo CHILD_${id} > '${childMarker}'".`,
+        `After the tool returns, run bash: echo START_${id} > '${parentStart}'; sleep 30; echo PARENT_${id} > '${parentMarker}'.`,
+      ].join("\n"));
+
+      const childPane = await waitForChildPane(env, existingPanes, PI_TIMEOUT);
+      await waitForScreen(surface, /Subagents/, PI_TIMEOUT);
+      const handleId = await waitForHandleId(surface, PI_TIMEOUT);
+      await waitForFile(parentStart, PI_TIMEOUT, new RegExp(`START_${id}`));
+
+      interruptPane(surface);
+      await waitForChildPaneGone(env, childPane, PI_TIMEOUT);
+      await waitForWidgetClear(surface, PI_TIMEOUT);
+      assert.equal(existsSync(parentMarker), false, "Escape must abort the parent turn before its follow-up work");
+
+      promptPane(surface, [
+        `First call subagent_prompt with id "${handleId}" and message "should fail";`,
+        `then call subagent exactly once with name "Fresh-${id}", agent "test-echo",`,
+        `and task "Run: echo FRESH_${id} > '${freshMarker}'". Do nothing else.`,
+      ].join("\n"));
+
+      await waitForFile(freshMarker, PI_TIMEOUT, new RegExp(`FRESH_${id}`));
+      const recovered = await waitForScreen(surface, /cannot be continued|abandoned/i, PI_TIMEOUT);
+      assert.match(recovered, /cannot be continued|abandoned/i, "the abandoned durable handle must reject subagent_prompt");
     });
 
     // ── Basic spawn + completion ──

@@ -31,6 +31,7 @@ import {
   readPaneAsync,
   closePane,
   interruptPane,
+  promptPane,
   shellQuote,
 } from "../../pi-extension/subagents/terminal.ts";
 
@@ -45,6 +46,7 @@ export {
   readPaneAsync,
   closePane,
   interruptPane,
+  promptPane,
   shellQuote,
 };
 export type { MuxBackend };

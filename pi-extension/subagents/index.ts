@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -30,6 +30,11 @@ import {
   waitForCompletion,
 } from "./completion.ts";
 import { registerChildLifecycle } from "./child-lifecycle.ts";
+import {
+  finalizeAssignment,
+  type AssignmentFinalizationEvent,
+  type AssignmentFinalizationOutcome,
+} from "./assignment-finalization.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -577,6 +582,7 @@ interface SubagentRuntime {
   modelCatalog?: string;
   agentCatalog?: string;
   halted?: boolean;
+  stopTerminalInput?: () => void;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -629,7 +635,6 @@ function updateHandle(
 ): void {
   const handle = subagentHandles.get(running.id);
   if (handle && handle.state !== "abandoned") {
-    if (!subscribed) cancelCompletionChannel(running.sessionFile);
     saveHandle({ ...handle, surface: running.surface, state, subscribed });
   }
 }
@@ -658,43 +663,37 @@ export function cleanupSubagentsForShutdown(
   agents.clear();
 }
 
-export function shouldDeliverSubagentCompletion(
-  running: Pick<RunningSubagent, "lifecycle">,
-): boolean {
-  // Authoritative gate: only pending deliveries may be sent.
-  // Missing lifecycle (pre-migration fixtures) defaults to pending/true.
-  return (running.lifecycle?.delivery ?? "pending") === "pending";
-}
-
-/** Pi failures abandon an Assignment; other harnesses retain legacy semantics. */
-export function isFatalPiFailure(
-  running: Pick<RunningSubagent, "cli">,
-  result: Pick<SubagentResult, "exitCode" | "ask" | "error">,
-): boolean {
-  return running.cli === "pi" && !result.ask && result.exitCode !== 0 && result.error !== "cancelled";
-}
-
-/** Persist one terminal failed Assignment and tear down its pane regardless of Auto-exit. */
-export function abandonSubagent(
-  running: RunningSubagent,
-  reason: string,
+/** User Escape abandons every running Assignment; pane closure remains best effort. */
+export function abandonAllSubagents(
+  ctx: Pick<ExtensionContext, "abort"> | undefined = runtime.latestCtx,
+  agents: Map<string, RunningSubagent> = runningSubagents,
   close: (surface: string) => void = closePane,
-): boolean {
-  if (running.abandoned) return false;
-  running.abandoned = true;
-  running.inputLocked = false;
-  running.lifecycle = markFailed(ensureLifecycle(running), reason, Date.now(), 1);
-  cancelCompletionChannel(running.sessionFile);
-
-  const handle = subagentHandles.get(running.id);
-  if (handle) saveHandle({ ...handle, surface: running.surface, state: "abandoned", subscribed: false });
-  try {
-    close(running.surface);
-  } catch {
-    // Pane may already be gone; abandonment target state still holds.
+): number {
+  let abandoned = 0;
+  for (const running of Array.from(agents.values())) {
+    const outcome = finalizeAssignment(
+      {
+        cli: running.cli,
+        autoExit: running.autoExit,
+        abandoned: running.abandoned,
+        delivery: running.lifecycle.delivery,
+      },
+      { kind: "abandonment", reason: "user" },
+    );
+    applyAssignmentOutcome(running, outcome, "Abandoned by user.", ctx, close, agents);
+    abandoned += 1;
   }
   updateWidget();
-  return true;
+  return abandoned;
+}
+
+/** Observe Escape without consuming it so Pi also aborts current parent turn. */
+export function handleParentTerminalInput(
+  data: string,
+  ctx: Pick<ExtensionContext, "abort"> | undefined = runtime.latestCtx,
+): boolean {
+  if (!matchesKey(data, "escape")) return false;
+  return abandonAllSubagents(ctx) > 0;
 }
 
 export function haltOrchestrator(ctx: Pick<ExtensionContext, "abort"> | undefined = runtime.latestCtx): boolean {
@@ -1134,6 +1133,7 @@ export const __test__ = {
   resolveResultPresentation,
   resolveWaitAllResultPresentation,
   shouldClosePaneAfterFinalization,
+  applyAssignmentFinalization,
   runningSubagents,
   subagentHandles,
   restoreHandles,
@@ -1141,8 +1141,8 @@ export const __test__ = {
   formatElapsed,
   buildSubagentCompletionGuidance,
   shouldSteerStatusTransition,
-  isFatalPiFailure,
-  abandonSubagent,
+  abandonAllSubagents,
+  handleParentTerminalInput,
   haltOrchestrator,
   clearOrchestratorHalt,
   completionDeliveryOptions,
@@ -1393,15 +1393,6 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        if (exitCode === 0) {
-          if (shouldClosePaneAfterFinalization(running)) closePane(surface);
-          running.lifecycle = markCompleted(running.lifecycle, Date.now());
-        } else if (running.cli === "pi") {
-          abandonSubagent(running, errorMessage ?? extracted.summary);
-        } else {
-          running.lifecycle = markFailed(running.lifecycle, errorMessage ?? extracted.summary, Date.now(), exitCode);
-        }
-
         return {
           name,
           task,
@@ -1459,15 +1450,6 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    if (exitCode === 0) {
-      if (shouldClosePaneAfterFinalization(running)) closePane(surface);
-      running.lifecycle = markCompleted(running.lifecycle, Date.now());
-    } else if (running.cli === "pi") {
-      abandonSubagent(running, errorMessage ?? summary);
-    } else {
-      running.lifecycle = markFailed(running.lifecycle, errorMessage ?? summary, Date.now(), exitCode);
-    }
-
     return {
       name,
       task,
@@ -1479,26 +1461,6 @@ async function watchSubagent(
       ...(errorMessage ? { errorMessage: errorMessage } : {}),
     };
   } catch (err: any) {
-    const error = signal.aborted ? "Subagent cancelled." : err?.message ?? String(err);
-    if (signal.aborted) {
-      if (shouldClosePaneAfterFinalization(running)) {
-        try {
-          closePane(surface);
-        } catch {}
-      }
-      running.lifecycle = markFailed(running.lifecycle, error, Date.now(), 1);
-    } else if (running.cli === "pi") {
-      abandonSubagent(running, error);
-    } else {
-      if (shouldClosePaneAfterFinalization(running)) {
-        try {
-          closePane(surface);
-        } catch {}
-      }
-      running.lifecycle = markFailed(running.lifecycle, error, Date.now(), 1);
-    }
-    updateWidget();
-
     if (signal.aborted) {
       return {
         name,
@@ -1524,14 +1486,80 @@ async function watchSubagent(
 export function shouldClosePaneAfterFinalization(
   running: Pick<RunningSubagent, "autoExit">,
 ): boolean {
-  return running.autoExit;
+  return finalizeAssignment(
+    { autoExit: running.autoExit, delivery: "pending" },
+    { kind: "result", exitCode: 0 },
+  ).pane === "close";
 }
 
-function finishAskDelivery(running: RunningSubagent): void {
-  running.lifecycle = markDelivery(running.lifecycle, "delivered");
-  running.inputLocked = false;
-  updateHandle(running, "awaiting_answer");
+function applyAssignmentOutcome(
+  running: RunningSubagent,
+  outcome: AssignmentFinalizationOutcome,
+  reason: string,
+  ctx?: Pick<ExtensionContext, "abort">,
+  close: (surface: string) => void = closePane,
+  agents: Map<string, RunningSubagent> = runningSubagents,
+  exitCode = 1,
+): AssignmentFinalizationOutcome {
+  if (outcome.lifecycle === "completed") running.lifecycle = markCompleted(running.lifecycle, Date.now());
+  if (outcome.lifecycle === "failed") running.lifecycle = markFailed(running.lifecycle, reason, Date.now(), exitCode);
+  if (outcome.delivery === "suppress") running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+  else if (outcome.delivery === "deliver") running.lifecycle = markDelivery(running.lifecycle, "delivered");
+
+  if (outcome.handle !== "unchanged") {
+    if (outcome.handle === "abandoned") {
+      running.abandoned = true;
+      running.inputLocked = false;
+      running.abortController?.abort();
+    }
+    updateHandle(running, outcome.handle);
+  }
+  if (outcome.parentSubscription === "cancel") cancelCompletionChannel(running.sessionFile);
+  if (outcome.pane === "close") {
+    try {
+      close(running.surface);
+    } catch {
+      // Pane closure is best effort after terminal Assignment state persists.
+    }
+  }
+  if (outcome.haltOrchestrator) haltOrchestrator(ctx);
+  if (outcome.removeFromRunning) agents.delete(running.id);
+  if (outcome.disposition === "awaiting_answer") running.inputLocked = false;
   updateWidget();
+  return outcome;
+}
+
+function applyAssignmentFinalization(
+  running: RunningSubagent,
+  result: SubagentResult,
+  ctx?: Pick<ExtensionContext, "abort">,
+): AssignmentFinalizationOutcome {
+  const event: AssignmentFinalizationEvent = result.ask
+    ? { kind: "ask" }
+    : { kind: "result", exitCode: result.exitCode, ...(result.error ? { error: result.error } : {}) };
+  const outcome = finalizeAssignment(
+    {
+      cli: running.cli,
+      autoExit: running.autoExit,
+      abandoned: running.abandoned,
+      delivery: running.lifecycle.delivery,
+    },
+    event,
+  );
+  return applyAssignmentOutcome(running, outcome, result.errorMessage ?? result.error ?? result.summary, ctx, closePane, runningSubagents, result.exitCode);
+}
+
+function subagentErrorResult(running: RunningSubagent, cause: unknown): SubagentResult {
+  const error = (cause as any)?.message ?? String(cause);
+  return {
+    name: running.name,
+    task: running.task,
+    summary: `Subagent error: ${error}`,
+    sessionFile: running.sessionFile,
+    exitCode: 1,
+    elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+    error,
+  };
 }
 
 function sendSubagentAsk(pi: ExtensionAPI, running: RunningSubagent, result: SubagentResult): void {
@@ -1547,16 +1575,6 @@ function sendSubagentAsk(pi: ExtensionAPI, running: RunningSubagent, result: Sub
   );
 }
 
-function finishPromptCompletion(
-  running: RunningSubagent,
-  delivery: "delivered" | "suppressed",
-): void {
-  running.lifecycle = markDelivery(running.lifecycle, delivery);
-  if (delivery === "delivered") updateHandle(running, "finalized");
-  runningSubagents.delete(running.id);
-  updateWidget();
-}
-
 function deliverPromptCompletion(
   running: RunningSubagent,
   completion: Promise<SubagentResult>,
@@ -1564,19 +1582,12 @@ function deliverPromptCompletion(
 ): void {
   completion.then(
     (result) => {
-      if (!shouldDeliverSubagentCompletion(running)) {
-        finishPromptCompletion(running, "suppressed");
-        return;
-      }
+      if (applyAssignmentFinalization(running, result).delivery === "suppress") return;
       if (result.ask) {
-        finishAskDelivery(running);
         sendSubagentAsk(pi, running, result);
         return;
       }
-      if (isFatalPiFailure(running, result)) haltOrchestrator();
-      finishPromptCompletion(running, "delivered");
-      const completionApi = selectCompletionApi(pi, runtime.pi);
-      completionApi.sendMessage(
+      selectCompletionApi(pi, runtime.pi).sendMessage(
         {
           customType: "subagent_result",
           content: resolveResultPresentation(result, running.name, running.id),
@@ -1595,21 +1606,14 @@ function deliverPromptCompletion(
       );
     },
     (cause: any) => {
-      if (!shouldDeliverSubagentCompletion(running)) {
-        finishPromptCompletion(running, "suppressed");
-        return;
-      }
-      if (running.cli === "pi") {
-        abandonSubagent(running, cause?.message ?? String(cause));
-        haltOrchestrator();
-      }
-      finishPromptCompletion(running, "delivered");
+      const result = subagentErrorResult(running, cause);
+      if (applyAssignmentFinalization(running, result).delivery === "suppress") return;
       selectCompletionApi(pi, runtime.pi).sendMessage(
         {
           customType: "subagent_result",
-          content: `Sub-agent "${running.name}" error: ${cause?.message ?? String(cause)}`,
+          content: `Sub-agent "${running.name}" error: ${result.error}`,
           display: true,
-          details: { id: running.id, name: running.name, task: running.task, error: cause?.message },
+          details: { id: running.id, name: running.name, task: running.task, error: result.error },
         },
         completionDeliveryOptions(),
       );
@@ -1725,6 +1729,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       startStatusRefresh(pi);
       updateWidget();
     }
+    if (!process.env.PI_SUBAGENT_ID && ctx.ui?.onTerminalInput) {
+      runtime.stopTerminalInput?.();
+      runtime.stopTerminalInput = ctx.ui.onTerminalInput((data) => {
+        handleParentTerminalInput(data, ctx);
+        return undefined;
+      });
+    }
   });
 
   if (!process.env.PI_SUBAGENT_ID) {
@@ -1735,6 +1746,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    runtime.stopTerminalInput?.();
+    runtime.stopTerminalInput = undefined;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1850,17 +1863,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             };
           }
           const result = waiting.result;
-          if (isFatalPiFailure(running, result)) haltOrchestrator(ctx);
-          if (result.ask) finishAskDelivery(running);
-          else {
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            updateHandle(running, "finalized");
-            runningSubagents.delete(running.id);
-            updateWidget();
-          }
-
+          const outcome = applyAssignmentFinalization(running, result, ctx);
           return {
-            content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(result, running.name, running.id) }],
+            content: [{
+              type: "text" as const,
+              text: outcome.delivery === "deliver"
+                ? resolveWaitAllResultPresentation(result, running.name, running.id)
+                : "Subagent completion suppressed.",
+            }],
             details: {
               id: running.id,
               name: running.name,
@@ -1869,7 +1879,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               exitCode: result.exitCode,
               elapsed: result.elapsed,
               sessionFile: result.sessionFile,
-              status: "completed",
+              status: outcome.disposition,
             },
           };
         }
@@ -1877,22 +1887,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         function deliverCompletion(): void {
           completion
             .then((result) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
-              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-              runningSubagents.delete(running.id);
-              updateWidget();
-              return;
-            }
+            const outcome = applyAssignmentFinalization(running, result);
+            if (outcome.delivery === "suppress") return;
             if (result.ask) {
-              finishAskDelivery(running);
               sendSubagentAsk(pi, running, result);
               return;
             }
-            if (isFatalPiFailure(running, result)) haltOrchestrator();
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            updateHandle(running, "finalized");
-            runningSubagents.delete(running.id);
-            updateWidget();
 
             const basePresentation = resolveResultPresentation(result, running.name, running.id);
             const presentation = running.runtimePlan?.runtimeMismatch
@@ -1921,30 +1921,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
-              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-              runningSubagents.delete(running.id);
-              updateWidget();
-              return;
-            }
-            if (running.cli === "pi") {
-              abandonSubagent(running, err?.message ?? String(err));
-              haltOrchestrator();
-            }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            updateHandle(running, "finalized");
-            runningSubagents.delete(running.id);
-            updateWidget();
+            const result = subagentErrorResult(running, err);
+            if (applyAssignmentFinalization(running, result).delivery === "suppress") return;
             selectCompletionApi(pi, runtime.pi).sendMessage(
               {
                 customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+                content: `Sub-agent "${running.name}" error: ${result.error}`,
                 display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
+                details: { name: running.name, task: running.task, error: result.error },
               },
               completionDeliveryOptions(),
             );
-            });
+          });
         }
 
         deliverCompletion();
@@ -2206,12 +2194,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: { id: running.id, name: running.name, status: "wait_cancelled" },
               };
             }
-            if (isFatalPiFailure(running, waited.result)) haltOrchestrator(ctx);
-            if (waited.result.ask) finishAskDelivery(running);
-            else finishPromptCompletion(running, "delivered");
+            const outcome = applyAssignmentFinalization(running, waited.result, ctx);
             return {
               content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, running.name, running.id) }],
-              details: { id: running.id, name: running.name, sessionFile: running.sessionFile, status: waited.result.ask ? "awaiting_answer" : "completed" },
+              details: { id: running.id, name: running.name, sessionFile: running.sessionFile, status: outcome.disposition },
             };
           }
           deliverPromptCompletion(running, completion, pi);
@@ -2238,12 +2224,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               details: { id: resumed.id, name: resumed.name, status: "wait_cancelled" },
             };
           }
-          if (isFatalPiFailure(resumed, waited.result)) haltOrchestrator(ctx);
-          if (waited.result.ask) finishAskDelivery(resumed);
-          else finishPromptCompletion(resumed, "delivered");
+          const outcome = applyAssignmentFinalization(resumed, waited.result, ctx);
           return {
             content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, resumed.name, resumed.id) }],
-            details: { id: resumed.id, name: resumed.name, sessionFile: resumed.sessionFile, status: waited.result.ask ? "awaiting_answer" : "completed" },
+            details: { id: resumed.id, name: resumed.name, sessionFile: resumed.sessionFile, status: outcome.disposition },
           };
         }
 

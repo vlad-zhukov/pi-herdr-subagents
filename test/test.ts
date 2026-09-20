@@ -9,7 +9,6 @@ import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
   cleanupSubagentsForShutdown,
   selectCompletionApi,
-  shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
   waitForCompletionOrAbort,
 } from "../pi-extension/subagents/index.ts";
@@ -63,6 +62,9 @@ import {
   publishCompletion,
   waitForCompletion,
 } from "../pi-extension/subagents/completion.ts";
+import {
+  finalizeAssignment,
+} from "../pi-extension/subagents/assignment-finalization.ts";
 import {
   createLifecycle,
   lifecycleTransition,
@@ -2134,6 +2136,53 @@ describe("tool registration", () => {
 
 });
 
+describe("Assignment finalization policy", () => {
+  it("returns one disposition for async and wait-all adapters", () => {
+    const cases = [
+      {
+        name: "normal completion retains pane",
+        state: { cli: "pi", autoExit: false, delivery: "pending" as const },
+        event: { kind: "result" as const, exitCode: 0 },
+        expected: { disposition: "finalized", lifecycle: "completed", handle: "finalized", parentSubscription: "consume", pane: "retain", delivery: "deliver", haltOrchestrator: false, removeFromRunning: true },
+      },
+      {
+        name: "ask stays live despite auto-exit",
+        state: { cli: "pi", autoExit: true, delivery: "pending" as const },
+        event: { kind: "ask" as const },
+        expected: { disposition: "awaiting_answer", lifecycle: "unchanged", handle: "awaiting_answer", parentSubscription: "consume", pane: "retain", delivery: "deliver", haltOrchestrator: false, removeFromRunning: false },
+      },
+      {
+        name: "fatal Pi failure abandons only this assignment",
+        state: { cli: "pi", autoExit: false, delivery: "pending" as const },
+        event: { kind: "result" as const, exitCode: 1 },
+        expected: { disposition: "abandoned", lifecycle: "failed", handle: "abandoned", parentSubscription: "cancel", pane: "close", delivery: "deliver", haltOrchestrator: true, removeFromRunning: true },
+      },
+      {
+        name: "non-Pi failure remains ordinary result",
+        state: { cli: "test-shell", autoExit: true, delivery: "pending" as const },
+        event: { kind: "result" as const, exitCode: 1 },
+        expected: { disposition: "finalized", lifecycle: "failed", handle: "finalized", parentSubscription: "consume", pane: "close", delivery: "deliver", haltOrchestrator: false, removeFromRunning: true },
+      },
+      {
+        name: "user abandonment suppresses later delivery",
+        state: { cli: "pi", autoExit: false, delivery: "pending" as const },
+        event: { kind: "abandonment" as const, reason: "user" as const },
+        expected: { disposition: "abandoned", lifecycle: "failed", handle: "abandoned", parentSubscription: "cancel", pane: "close", delivery: "suppress", haltOrchestrator: true, removeFromRunning: true },
+      },
+      {
+        name: "duplicate completion is idempotent",
+        state: { cli: "pi", autoExit: false, abandoned: true, delivery: "delivered" as const },
+        event: { kind: "result" as const, exitCode: 1 },
+        expected: { disposition: "suppressed", lifecycle: "unchanged", handle: "unchanged", parentSubscription: "retain", pane: "retain", delivery: "suppress", haltOrchestrator: false, removeFromRunning: true },
+      },
+    ];
+
+    for (const test of cases) {
+      assert.deepEqual(finalizeAssignment(test.state, test.event), test.expected, test.name);
+    }
+  });
+});
+
 describe("subagent parent lifecycle", () => {
   it("upgrades reload-persisted runtime objects with durable handles", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -2182,6 +2231,35 @@ describe("subagent parent lifecycle", () => {
     }
   });
 
+  it("observes parent Escape without consuming Pi input", () => {
+    const { api, eventHandlers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const testApi = (subagentsModule as any).__test__;
+    let rawInput: ((data: string) => unknown) | undefined;
+    let unsubscribed = 0;
+    const ctx = {
+      sessionManager: { getEntries: () => [], getSessionFile: () => null },
+      modelRegistry: { find: () => undefined, getAvailable: () => [], hasConfiguredAuth: () => true },
+      scopedModels: [],
+      ui: {
+        onTerminalInput(handler: (data: string) => unknown) {
+          rawInput = handler;
+          return () => { unsubscribed += 1; };
+        },
+      },
+    };
+
+    try {
+      eventHandlers.get("session_start")![0]({}, ctx);
+      assert.equal(rawInput?.("\x1b"), undefined);
+      eventHandlers.get("session_start")![0]({}, ctx);
+      assert.equal(unsubscribed, 1);
+    } finally {
+      testApi.runtime.stopTerminalInput?.();
+      testApi.runtime.stopTerminalInput = undefined;
+    }
+  });
+
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
     const agents = new Map([["child", {
@@ -2193,7 +2271,7 @@ describe("subagent parent lifecycle", () => {
 
     assert.equal(shouldPreserveSubagentsOnShutdown("reload"), true);
     assert.equal(abortController.signal.aborted, false);
-    assert.equal(shouldDeliverSubagentCompletion(agents.get("child")!), true);
+    assert.equal(agents.get("child")!.lifecycle.delivery, "pending");
     assert.equal(agents.size, 1);
   });
 
@@ -2207,30 +2285,9 @@ describe("subagent parent lifecycle", () => {
 
       assert.equal(shouldPreserveSubagentsOnShutdown(reason), false);
       assert.equal(abortController.signal.aborted, true);
-      // Delivery is suppressed before the map is cleared so a racing watcher
-      // that still holds a reference cannot deliver after shutdown.
       assert.equal(running.lifecycle.delivery, "suppressed");
-      assert.equal(shouldDeliverSubagentCompletion(running), false);
       assert.equal(agents.size, 0);
     }
-  });
-
-  it("treats lifecycle.delivery as the authoritative completion gate", () => {
-    const pending = { lifecycle: createLifecycle(1_000) };
-    assert.equal(shouldDeliverSubagentCompletion(pending), true);
-
-    const delivered = {
-      lifecycle: { ...createLifecycle(1_000), delivery: "delivered" as const },
-    };
-    assert.equal(shouldDeliverSubagentCompletion(delivered), false);
-
-    const suppressed = {
-      lifecycle: { ...createLifecycle(1_000), delivery: "suppressed" as const },
-    };
-    assert.equal(shouldDeliverSubagentCompletion(suppressed), false);
-
-    // Pre-lifecycle fixtures without a lifecycle field still default to pending.
-    assert.equal(shouldDeliverSubagentCompletion({} as any), true);
   });
 
   it("delivers completion through the reloaded extension API", () => {
@@ -2241,62 +2298,132 @@ describe("subagent parent lifecycle", () => {
     assert.equal(selectCompletionApi(previous, undefined), previous);
   });
 
-  it("abandons Pi failures once, closes regardless of auto-exit, and persists handle state", () => {
+  it("abandons every Assignment on parent Escape without consuming it", () => {
     const testApi = (subagentsModule as any).__test__;
-    const id = "failed-child";
-    const running = {
+    const agents = new Map();
+    const closed: string[] = [];
+    let parentAborts = 0;
+    const makeRunning = (id: string) => ({
       id,
       name: "Worker",
-      task: "",
-      surface: "pane-failed",
+      task: "work",
+      surface: `pane-${id}`,
       startTime: 1,
-      sessionFile: "/tmp/failed-child.jsonl",
+      sessionFile: `/tmp/${id}.jsonl`,
       cli: "pi",
       autoExit: false,
       interactive: false,
+      abortController: new AbortController(),
       lifecycle: createLifecycle(1),
-    };
-    testApi.subagentHandles.set(id, {
-      id,
-      name: "Worker",
+    });
+    const makeHandle = (running: ReturnType<typeof makeRunning>) => ({
+      id: running.id,
+      name: running.name,
       sessionFile: running.sessionFile,
       surface: running.surface,
-      state: "active",
+      state: "active" as const,
       subscribed: true,
+      autoExit: running.autoExit,
+      interactive: running.interactive,
+      createdAt: running.startTime,
+    });
+    const first = makeRunning("escaped-first");
+    const second = { ...makeRunning("escaped-second"), interactive: true };
+
+    testApi.runtime.halted = false;
+    for (const running of [first, second]) {
+      beginCompletionChannel(running.sessionFile);
+      agents.set(running.id, running);
+      testApi.subagentHandles.set(running.id, makeHandle(running));
+    }
+    try {
+      assert.equal(testApi.handleParentTerminalInput("x", { abort() {} }), false);
+      assert.equal(
+        testApi.abandonAllSubagents(
+          { abort() { parentAborts += 1; } },
+          agents,
+          (surface: string) => {
+            closed.push(surface);
+            if (surface === second.surface) throw new Error("pane already gone");
+          },
+        ),
+        2,
+      );
+
+      assert.equal(parentAborts, 1);
+      assert.equal(agents.size, 0);
+      assert.deepEqual(closed, [first.surface, second.surface]);
+      for (const running of [first, second]) {
+        assert.equal(running.abortController.signal.aborted, true);
+        assert.equal(running.lifecycle.process.kind, "failed");
+        assert.equal(running.lifecycle.delivery, "suppressed");
+        assert.equal(existsSync(`${running.sessionFile}.exit`), false);
+        const handle = testApi.subagentHandles.get(running.id);
+        assert.equal(handle.state, "abandoned");
+        assert.equal(handle.subscribed, false);
+        assert.match(handlePromptError(handle, false) ?? "", /cannot be continued/);
+      }
+    } finally {
+      testApi.runtime.halted = false;
+      for (const running of [first, second]) {
+        testApi.subagentHandles.delete(running.id);
+        rmSync(`${running.sessionFile}.exit`, { force: true });
+      }
+    }
+  });
+
+  it("applies identical finalization to live and reopened continuations", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = (id: string) => ({
+      id,
+      name: "Worker",
+      task: "continue",
+      surface: `pane-${id}`,
+      startTime: 1,
+      sessionFile: `/tmp/${id}.jsonl`,
+      cli: "pi",
       autoExit: false,
       interactive: false,
-      createdAt: 1,
+      lifecycle: markCompletionDetected(createLifecycle(1), { reason: "done", exitCode: 0 }, 2),
     });
-    const closed: string[] = [];
+    const handle = (agent: ReturnType<typeof running>) => ({
+      id: agent.id,
+      name: agent.name,
+      sessionFile: agent.sessionFile,
+      surface: agent.surface,
+      state: "active" as const,
+      subscribed: true,
+      autoExit: agent.autoExit,
+      interactive: agent.interactive,
+      createdAt: agent.startTime,
+    });
+
     try {
-      assert.equal(testApi.abandonSubagent(running, "provider exhausted", (surface: string) => closed.push(surface)), true);
-      assert.equal(testApi.abandonSubagent(running, "duplicate", (surface: string) => closed.push(surface)), false);
-      assert.deepEqual(closed, ["pane-failed"]);
-      assert.equal(running.lifecycle.process.kind, "failed");
-      assert.deepEqual(testApi.subagentHandles.get(id), {
-        id,
-        name: "Worker",
-        sessionFile: running.sessionFile,
-        surface: running.surface,
-        state: "abandoned",
-        subscribed: false,
-        autoExit: false,
-        interactive: false,
-        createdAt: 1,
-      });
-      assert.match(handlePromptError(testApi.subagentHandles.get(id), false) ?? "", /cannot be continued/);
+      for (const source of ["live", "reopened"]) {
+        const agent = running(`${source}-continuation`);
+        testApi.runningSubagents.set(agent.id, agent);
+        testApi.subagentHandles.set(agent.id, handle(agent));
+
+        const outcome = testApi.applyAssignmentFinalization(agent, {
+          name: agent.name, task: agent.task, summary: "done", sessionFile: agent.sessionFile, exitCode: 0, elapsed: 1,
+        });
+
+        assert.equal(outcome.disposition, "finalized", source);
+        assert.equal(agent.lifecycle.process.kind, "completed", source);
+        assert.equal(testApi.runningSubagents.has(agent.id), false, source);
+        assert.deepEqual(testApi.subagentHandles.get(agent.id), { ...handle(agent), state: "finalized", subscribed: false }, source);
+      }
     } finally {
-      testApi.subagentHandles.delete(id);
+      for (const id of ["live-continuation", "reopened-continuation"]) {
+        testApi.runningSubagents.delete(id);
+        testApi.subagentHandles.delete(id);
+      }
     }
   });
 
   it("halts only fatal Pi failures and resumes only on human input", () => {
     const testApi = (subagentsModule as any).__test__;
     testApi.runtime.halted = false;
-    assert.equal(testApi.isFatalPiFailure({ cli: "pi" }, { exitCode: 1 }), true);
-    assert.equal(testApi.isFatalPiFailure({ cli: "pi" }, { exitCode: 1, error: "cancelled" }), false);
-    assert.equal(testApi.isFatalPiFailure({ cli: "test-shell" }, { exitCode: 1 }), false);
-
     let aborts = 0;
     assert.equal(testApi.haltOrchestrator({ abort: () => { aborts += 1; } }), true);
     assert.equal(testApi.haltOrchestrator({ abort: () => { aborts += 1; } }), false);
