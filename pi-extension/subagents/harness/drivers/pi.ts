@@ -185,7 +185,7 @@ export class PiHarnessDriver implements HarnessDriver {
     envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
 
     const fullTask = taskDelivery === "direct"
-      ? params.task
+      ? roleBlock ? `${roleBlock}\n\n${params.task}` : params.task
       : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
 
     let taskArg: string;

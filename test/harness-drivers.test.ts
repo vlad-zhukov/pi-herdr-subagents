@@ -145,6 +145,24 @@ describe("Pi Harness Driver", () => {
     const built = driver.buildCommand(createMockLaunchContext({ spawning: true }));
     assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=1"));
   });
+
+  void it("keeps role body in direct Pi fork prompts when not system-routed", () => {
+    const built = driver.buildCommand(createMockLaunchContext({
+      taskDelivery: "direct",
+      inheritsConversationContext: true,
+      identity: "You are a forked specialist.",
+      identityInSystemPrompt: false,
+      roleBlock: "\n\nYou are a forked specialist.",
+      systemPromptMode: undefined,
+    }));
+
+    const bodyIndex = built.command.indexOf("You are a forked specialist.");
+    const taskIndex = built.command.indexOf("Analyze the repository structure");
+    assert.ok(bodyIndex >= 0);
+    assert.ok(taskIndex > bodyIndex);
+    assert.ok(!built.command.includes("--append-system-prompt"));
+    assert.ok(!built.command.includes("--system-prompt"));
+  });
 });
 
 describe("OpenCode Harness Driver", () => {
