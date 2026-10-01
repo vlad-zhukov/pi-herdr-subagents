@@ -2298,6 +2298,115 @@ describe("subagent parent lifecycle", () => {
     assert.equal(selectCompletionApi(previous, undefined), previous);
   });
 
+  void it("delivers async initial completion through the selected extension API", async () => {
+    type SentMessage = {
+      message: {
+        customType?: string;
+        content: string;
+        details: { exitCode?: number; sessionFile?: string };
+      };
+      options: { deliverAs?: string };
+    };
+    type MockApi = {
+      sendMessage(message: SentMessage["message"], options: SentMessage["options"]): void;
+    };
+    type CompletionResult = {
+      name: string;
+      task: string;
+      summary: string;
+      sessionFile: string;
+      exitCode: number;
+      elapsed: number;
+    };
+    type TestApi = {
+      runtime: { pi?: MockApi; halted: boolean };
+      deliverInitialCompletion(
+        running: Record<string, unknown>,
+        completion: Promise<CompletionResult>,
+        pi: MockApi,
+      ): void;
+      runningSubagents: Map<string, unknown>;
+      subagentHandles: Map<string, unknown>;
+    };
+    const testApi: TestApi = Reflect.get(subagentsModule, "__test__");
+    const previousMessages: SentMessage[] = [];
+    const currentMessages: SentMessage[] = [];
+    const previousApi = {
+      sendMessage(message: SentMessage["message"], options: SentMessage["options"]) {
+        previousMessages.push({ message, options });
+      },
+    };
+    const currentApi = {
+      sendMessage(message: SentMessage["message"], options: SentMessage["options"]) {
+        currentMessages.push({ message, options });
+      },
+    };
+    const originalPi = testApi.runtime.pi;
+    const originalHalted = testApi.runtime.halted;
+    const running = {
+      id: "async-initial",
+      name: "Worker",
+      task: "do work",
+      agent: "worker",
+      surface: "pane-async-initial",
+      startTime: 1,
+      sessionFile: "/tmp/async-initial.jsonl",
+      cli: "pi",
+      autoExit: false,
+      interactive: false,
+      lifecycle: createLifecycle(1),
+    };
+
+    try {
+      testApi.runtime.pi = currentApi;
+      testApi.runtime.halted = false;
+      testApi.deliverInitialCompletion(running, Promise.resolve({
+        name: "Worker",
+        task: "do work",
+        summary: "real result",
+        sessionFile: running.sessionFile,
+        exitCode: 0,
+        elapsed: 2,
+      }), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      assert.equal(previousMessages.length, 0);
+      assert.equal(currentMessages.length, 1);
+      assert.equal(currentMessages[0].message.customType, "subagent_result");
+      assert.match(currentMessages[0].message.content, /real result/);
+      assert.match(currentMessages[0].message.content, /Continue: subagent_prompt/);
+      assert.equal(currentMessages[0].message.details.exitCode, 0);
+      assert.equal(currentMessages[0].message.details.sessionFile, running.sessionFile);
+      assert.equal(currentMessages[0].options.deliverAs, "steer");
+      assert.equal(running.lifecycle.delivery, "delivered");
+
+      const failed = {
+        ...running,
+        id: "async-initial-failed",
+        sessionFile: "/tmp/async-initial-failed.jsonl",
+        cli: "claude",
+        lifecycle: createLifecycle(1),
+      };
+      testApi.deliverInitialCompletion(
+        failed,
+        Promise.reject<CompletionResult>(new Error("real failure")),
+        previousApi,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      assert.equal(previousMessages.length, 0);
+      assert.equal(currentMessages.length, 2);
+      assert.match(currentMessages[1].message.content, /real failure/);
+      assert.doesNotMatch(currentMessages[1].message.content, /completionApi/);
+      assert.equal(currentMessages[1].options.deliverAs, "steer");
+    } finally {
+      testApi.runtime.pi = originalPi;
+      testApi.runtime.halted = originalHalted;
+      testApi.runningSubagents.delete(running.id);
+      testApi.subagentHandles.delete(running.id);
+    }
+  });
+
   it("abandons every Assignment on parent Escape without consuming it", () => {
     const testApi = (subagentsModule as any).__test__;
     const agents = new Map();

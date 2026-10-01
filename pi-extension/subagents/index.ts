@@ -1146,6 +1146,7 @@ export const __test__ = {
   haltOrchestrator,
   clearOrchestratorHalt,
   completionDeliveryOptions,
+  deliverInitialCompletion,
   runtime,
 };
 
@@ -1575,6 +1576,62 @@ function sendSubagentAsk(pi: ExtensionAPI, running: RunningSubagent, result: Sub
   );
 }
 
+function deliverInitialCompletion(
+  running: RunningSubagent,
+  completion: Promise<SubagentResult>,
+  pi: ExtensionAPI,
+): void {
+  void (async () => {
+    try {
+      const result = await completion;
+      const outcome = applyAssignmentFinalization(running, result);
+      if (outcome.delivery === "suppress") return;
+      if (result.ask) {
+        sendSubagentAsk(pi, running, result);
+        return;
+      }
+
+      const basePresentation = resolveResultPresentation(result, running.name, running.id);
+      const presentation = running.runtimePlan?.runtimeMismatch
+        ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
+        : basePresentation;
+
+      selectCompletionApi(pi, runtime.pi).sendMessage(
+        {
+          customType: "subagent_result",
+          content: presentation,
+          display: true,
+          details: {
+            id: running.id,
+            name: running.name,
+            task: running.task,
+            agent: running.agent,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
+            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+            ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+            ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
+          },
+        },
+        completionDeliveryOptions(),
+      );
+    } catch (err: unknown) {
+      const result = subagentErrorResult(running, err);
+      if (applyAssignmentFinalization(running, result).delivery === "suppress") return;
+      selectCompletionApi(pi, runtime.pi).sendMessage(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "${running.name}" error: ${result.error}`,
+          display: true,
+          details: { name: running.name, task: running.task, error: result.error },
+        },
+        completionDeliveryOptions(),
+      );
+    }
+  })();
+}
+
 function deliverPromptCompletion(
   running: RunningSubagent,
   completion: Promise<SubagentResult>,
@@ -1884,58 +1941,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        function deliverCompletion(): void {
-          completion
-            .then((result) => {
-            const outcome = applyAssignmentFinalization(running, result);
-            if (outcome.delivery === "suppress") return;
-            if (result.ask) {
-              sendSubagentAsk(pi, running, result);
-              return;
-            }
-
-            const basePresentation = resolveResultPresentation(result, running.name, running.id);
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
-              : basePresentation;
-
-            completionApi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  id: running.id,
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                  ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
-                },
-              },
-              completionDeliveryOptions(),
-            );
-          })
-          .catch((err) => {
-            const result = subagentErrorResult(running, err);
-            if (applyAssignmentFinalization(running, result).delivery === "suppress") return;
-            selectCompletionApi(pi, runtime.pi).sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${result.error}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: result.error },
-              },
-              completionDeliveryOptions(),
-            );
-          });
-        }
-
-        deliverCompletion();
+        deliverInitialCompletion(running, completion, pi);
 
         // Return immediately
         return {
