@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -14,6 +14,7 @@ import {
   GenericHarnessDriver,
   type SubagentLaunchContext,
 } from "../pi-extension/subagents/harness/index.ts";
+import { buildTaskHints } from "../pi-extension/subagents/child-prompt.ts";
 import type { ResolvedRuntimePlan } from "../pi-extension/subagents/runtime-routing.ts";
 import type { SubagentResultContext } from "../pi-extension/subagents/harness/types.ts";
 
@@ -144,6 +145,40 @@ describe("Pi Harness Driver", () => {
   it("passes enabled spawning capability to child environment", () => {
     const built = driver.buildCommand(createMockLaunchContext({ spawning: true }));
     assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=1"));
+  });
+
+  for (const interactive of [false, true]) {
+    it(`ends blank-session ${interactive ? "interactive" : "autonomous"} task with the result line`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "task-hints-"));
+      try {
+        const hints = buildTaskHints(interactive);
+        driver.buildCommand(createMockLaunchContext({
+          artifactDir: dir,
+          taskDelivery: "artifact",
+          inheritsConversationContext: false,
+          effectiveInteractive: interactive,
+          ...hints,
+        }));
+        const files = readdirSync(join(dir, "context"));
+        assert.equal(files.length, 1);
+        const task = readFileSync(join(dir, "context", files[0]), "utf8");
+        assert.ok(task.endsWith("Your final message is your result: the agent that delegated this task sees nothing else."));
+        assert.ok(task.includes(interactive
+          ? "Complete your task, then wait for further instructions."
+          : "Complete your task autonomously."));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("keeps fork-mode tasks raw", () => {
+    const built = driver.buildCommand(createMockLaunchContext({
+      taskDelivery: "direct",
+      inheritsConversationContext: true,
+      ...buildTaskHints(false),
+    }));
+    assert.doesNotMatch(built.command, /final message is your result|autonomously/);
   });
 
   void it("keeps role body in direct Pi fork prompts when not system-routed", () => {

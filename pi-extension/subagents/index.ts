@@ -41,6 +41,7 @@ import {
   type ResolvedRuntimePlan,
   type ThinkingLevel,
 } from "./runtime-routing.ts";
+import { buildTaskHints } from "./child-prompt.ts";
 import {
   getHarnessDriver,
   buildSubagentToolAllowlist,
@@ -1247,10 +1248,7 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = effectiveInteractive
-    ? "Complete your task, then wait for further instructions."
-    : "Complete your task autonomously.";
-  const summaryInstruction = "Your FINAL assistant message should summarize what you accomplished.";
+  const { modeHint, summaryInstruction } = buildTaskHints(effectiveInteractive);
   const spawning = resolveSpawning(agentDefs);
   const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
