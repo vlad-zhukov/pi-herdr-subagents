@@ -26,6 +26,14 @@ _Avoid_: end
 Subagent has completed assigned work and submitted result to Orchestrator. Finalization ends current Parent subscription; it does not close retained Pi or Herdr pane unless Auto-exit is enabled.
 _Avoid_: end, session finalization
 
+**Expected result**:
+Plain-text statement of what Orchestrator needs back from delegated work, plus any context Subagent cannot see. Excludes method and output format; method is Subagent's choice, format belongs to the Subagent role.
+_Avoid_: brief, instructions, spec
+
+**Assignment ownership**:
+Delegated work belongs to its Subagent from launch until its Reportable event. Orchestrator never does, duplicates, or redoes that work; it only waits, does unrelated work, follows up with the same Subagent, or spot-checks the result.
+_Avoid_: shared work, verification by redoing
+
 **Parent subscription**:
 Temporary parent observation of one Subagent turn. Parent creates empty `<session>.exit`; child atomically replaces it with one structured payload; parent claims and removes payload, ending subscription. Local work without pending `.exit` is private. A later `subagent_prompt` creates new subscription.
 _Avoid_: observer, listener

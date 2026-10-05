@@ -92,7 +92,7 @@ Child sessions additionally expose `/subagent_finalize`, which sends an interact
 
 ### Named Agents
 
-Named agents load only from `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). Agent names, descriptions, and runtime defaults are included in subagent tool guidance.
+Named agents load only from `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). Agent names and descriptions are listed in the `subagent` tool guidance when the extension loads (use `/reload` after adding agents). `description` is the only routing signal; phrase it as "Use when …".
 
 ### Supported Harness CLIs
 
@@ -331,7 +331,7 @@ You are a specialized agent that does X...
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
-| `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
+| `description` | string  | Only routing signal in the model-facing catalog; phrase as "Use when …"                                                                                                                                                                                                     |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `lineage-only` when omitted; `standalone`, `lineage-only`, or `fork` |

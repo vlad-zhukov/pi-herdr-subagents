@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   RuntimeResolutionError,
-  buildAuthenticatedModelCatalog,
   modelForCli,
   resolveRuntimePlan,
   wrapPiModelRegistry,
@@ -208,36 +207,5 @@ describe("CLI model routing", () => {
       modelForCli("aider", { model: "anthropic/claude-3-5-sonnet", modelId: "claude-3-5-sonnet" }),
       "claude-3-5-sonnet",
     );
-  });
-});
-
-describe("authenticated model catalog", () => {
-  it("lists exact authenticated IDs with concise capability facts", () => {
-    const available = [
-      model("fake", "parent", { input: ["text", "image"], contextWindow: 200_000 }),
-      model("other", "plain", { reasoning: false, cost: { input: 0, output: 0 } }),
-    ];
-    const catalog = buildAuthenticatedModelCatalog(registry(available));
-    assert.match(catalog, /fake\/parent/);
-    assert.match(catalog, /reasoning \(off\/minimal\/low\/medium\/high\)/);
-    assert.match(catalog, /text\+image/);
-    assert.match(catalog, /200k context/);
-    assert.match(catalog, /other\/plain/);
-    assert.match(catalog, /non-reasoning/);
-    assert.match(catalog, /Configure named-agent models in config\.json/);
-  });
-
-  it("uses scoped models when provided", () => {
-    const available = [model("fake", "parent"), model("other", "fast")];
-    const catalog = buildAuthenticatedModelCatalog(registry(available), 24, [available[1]]);
-    assert.doesNotMatch(catalog, /fake\/parent/);
-    assert.match(catalog, /other\/fast/);
-  });
-
-  it("caps large catalogs and reports omitted models", () => {
-    const available = Array.from({ length: 30 }, (_, index) => model("fake", `model-${index}`));
-    const catalog = buildAuthenticatedModelCatalog(registry(available), 5);
-    assert.equal((catalog.match(/^- fake\//gm) ?? []).length, 5);
-    assert.match(catalog, /25 more authenticated models omitted/);
   });
 });

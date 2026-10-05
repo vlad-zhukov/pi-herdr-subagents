@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
+import { keyHint, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
@@ -36,7 +36,6 @@ import {
   type AssignmentFinalizationOutcome,
 } from "./assignment-finalization.ts";
 import {
-  buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
   wrapPiModelRegistry,
   type ResolvedRuntimePlan,
@@ -53,7 +52,6 @@ import {
   loadModelConfig,
   resolveModelDefault,
   resolveThinkingDefault,
-  type ModelConfig,
 } from "./model-config.ts";
 import {
   loadOrchestrationConfig,
@@ -126,19 +124,13 @@ const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
   }
 }
 
-function buildSubagentRoutingGuidelines(
-  modelCatalog?: string,
-  agentCatalog?: string,
-): string[] {
+function buildSubagentRoutingGuidelines(agentCatalog: string): string[] {
   return [
     "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
     "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); otherwise omit it. Bare child spawns without agent are rejected unless fork: true is set.",
-    agentCatalog ?? "Available named subagent catalog becomes available after session start.",
-    modelCatalog ?? "Authenticated subagent model catalog becomes available after session start.",
+    agentCatalog,
   ];
 }
-
-const subagentRoutingGuidelines = buildSubagentRoutingGuidelines();
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -224,17 +216,9 @@ function resolveSpawning(agentDefs: AgentDefaults | null): boolean {
   return agentDefs?.spawning === true;
 }
 
-function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  if (!match) return undefined;
-  const value = match[1].trim();
-  if (
-    value.length >= 2 &&
-    ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-  ) {
-    return value.slice(1, -1);
-  }
-  return value;
+function getFrontmatterValue(frontmatter: Record<string, unknown>, key: string): string | undefined {
+  const value = frontmatter[key];
+  return value == null || typeof value === "object" ? undefined : String(value).trim();
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
@@ -249,11 +233,9 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
+  if (!/^---\r?\n[\s\S]*?\r?\n---/.test(content)) return null;
 
-  const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const { frontmatter, body } = parseFrontmatter(content);
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 
   return {
@@ -282,7 +264,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   };
 }
 
-function discoverAgentDefinitions(): ListedAgentDefinition[] {
+function discoverAgentDefinitions(onError?: (message: string) => void): ListedAgentDefinition[] {
   const agents = new Map<string, ListedAgentDefinition>();
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: join(getAgentConfigDir(), "agents"), source: "global" },
@@ -296,11 +278,14 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
           readFileSync(join(dir, file), "utf8"),
           file.replace(/\.md$/, ""),
         );
-        if (!parsed) continue;
+        if (!parsed) {
+          onError?.(`${file}: missing YAML frontmatter`);
+          continue;
+        }
         agents.set(parsed.name, { ...parsed, source });
-      } catch {
-        // Skip unreadable or racy entries rather than aborting discovery
-        // for every other agent definition.
+      } catch (error) {
+        // Skip bad entries rather than aborting discovery for every other agent.
+        onError?.(`${file}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
       }
     }
   }
@@ -308,33 +293,32 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   return [...agents.values()];
 }
 
-function buildAvailableAgentCatalog(
-  agents: ListedAgentDefinition[],
-  limit = 24,
-  config: ModelConfig = modelConfig,
-): string {
+function escapeXml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** Model-visible agents: not hidden, and never the current child's own agent. */
+function isCatalogAgent(agent: ListedAgentDefinition): boolean {
+  return !agent.disableModelInvocation && agent.name !== process.env.PI_SUBAGENT_AGENT;
+}
+
+const CATALOG_LIMIT = 24;
+
+function buildAvailableAgentCatalog(agents: ListedAgentDefinition[]): string {
   const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
-  const visible = sorted.slice(0, limit);
-  const lines = [
-    "Available named subagents (choose by role; runtime comes from config and parent defaults):",
-  ];
+  const visible = sorted.slice(0, CATALOG_LIMIT);
+  const lines = ["<available_subagents>"];
 
   for (const agent of visible) {
-    const effectiveModel = resolveModelDefault(agent.name, config);
-    const effectiveThinking = resolveThinkingDefault(agent.name, config);
-    const defaults = [
-      effectiveModel ? `model ${effectiveModel}` : undefined,
-      effectiveThinking ? `thinking ${effectiveThinking}` : undefined,
-    ].filter(Boolean);
-    const runtime = defaults.length > 0 ? `; defaults: ${defaults.join(", ")}` : "";
-    const description = agent.description ? ` — ${agent.description}` : "";
-    lines.push(`- ${agent.name} [${agent.source}${runtime}]${description}`);
+    const description = escapeXml((agent.description ?? "").replace(/\s+/g, " ").trim());
+    lines.push(`  <agent name="${escapeXml(agent.name)}">${description}</agent>`);
   }
 
-  if (visible.length === 0) lines.push("- none discovered; use a bare spawn");
+  if (visible.length === 0) lines.push("  none; do the work yourself");
   if (sorted.length > visible.length) {
-    lines.push(`- … ${sorted.length - visible.length} more named subagents omitted`);
+    lines.push(`  … ${sorted.length - visible.length} more named subagents omitted`);
   }
+  lines.push("</available_subagents>");
 
   return lines.join("\n");
 }
@@ -579,8 +563,6 @@ interface SubagentRuntime {
   handles: Map<string, SubagentHandle>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
-  modelCatalog?: string;
-  agentCatalog?: string;
   halted?: boolean;
   stopTerminalInput?: () => void;
 }
@@ -1767,20 +1749,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
+    if (!process.env.PI_SUBAGENT_ID) {
+      for (const message of agentLoadErrors) ctx.ui?.notify?.(`Skipped agent ${message}`, "warning");
+    }
     restoreHandles(ctx.sessionManager?.getEntries?.() ?? []);
-    runtime.modelCatalog = buildAuthenticatedModelCatalog(
-      wrapPiModelRegistry(ctx.modelRegistry),
-      24,
-      ctx.scopedModels?.map(({ model }) => model) ?? [],
-    );
-    runtime.agentCatalog = buildAvailableAgentCatalog(
-      discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation),
-    );
-    const refreshedGuidelines = buildSubagentRoutingGuidelines(
-      runtime.modelCatalog,
-      runtime.agentCatalog,
-    );
-    subagentRoutingGuidelines.splice(0, subagentRoutingGuidelines.length, ...refreshedGuidelines);
     if (runningSubagents.size > 0) {
       startWidgetRefresh();
       startStatusRefresh(pi);
@@ -1823,6 +1795,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   const spawningEnabled =
     !process.env.PI_SUBAGENT_ID || process.env.PI_SUBAGENT_SPAWNING === "1";
   const shouldRegister = (name: string) => spawningEnabled || !SPAWNING_TOOLS.has(name);
+  // Built once at load: Pi snapshots guidelines at registration.
+  const agentLoadErrors: string[] = [];
+  const subagentRoutingGuidelines = buildSubagentRoutingGuidelines(
+    buildAvailableAgentCatalog(
+      discoverAgentDefinitions((message) => agentLoadErrors.push(message)).filter(isCatalogAgent),
+    ),
+  );
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))

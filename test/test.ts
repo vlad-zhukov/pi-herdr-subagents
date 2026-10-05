@@ -1242,26 +1242,6 @@ describe("subagent discovery", () => {
       assert.equal(loaded?.commandTemplate, "aider --model {model} --message {task}");
     });
   });
-
-  it("buildAvailableAgentCatalog reflects config model and thinking defaults", () => {
-    const agents = [
-      {
-        name: "config-override-test-agent",
-        source: "global" as const,
-        description: "Agent without a frontmatter model",
-        disableModelInvocation: false,
-      },
-    ];
-
-    const withoutOverride = testApi.buildAvailableAgentCatalog(agents, 24, { agents: {} });
-    assert.doesNotMatch(withoutOverride, /defaults:/);
-
-    const withOverride = testApi.buildAvailableAgentCatalog(agents, 24, {
-      agents: { "config-override-test-agent": "anthropic/test-config-model#low" },
-    });
-    assert.match(withOverride, /model anthropic\/test-config-model/);
-    assert.match(withOverride, /thinking low/);
-  });
 });
 describe("child assignment lifecycle", () => {
   it("finalizes a noninteractive settled child while default auto-exit retains Pi", () => {
@@ -1891,87 +1871,107 @@ describe("tool registration", () => {
     assert.equal(subagent.executionMode, "parallel");
   });
 
-  it("advertises named agents and tells callers to use configured runtime defaults", async () => {
+  it("registers subagent once with the catalog at load, without any event", async () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(
         globalAgentsDir,
         "researcher",
         [
           "name: researcher",
-          "description: Researches external topics using authoritative sources",
+          "description: \"Researches topics.\n  Use for external sources.\"",
         ].join("\n"),
       );
+      writeAgentFile(
+        globalAgentsDir,
+        "secret",
+        ["name: secret", "description: Hidden one", "disable-model-invocation: true"].join("\n"),
+      );
 
-      const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+      const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
 
-      const subagent = registeredTools.find((tool) => tool.name === "subagent");
-      assert.ok(subagent);
-      const sessionStart = eventHandlers.get("session_start")?.[0];
-      assert.ok(sessionStart);
-      sessionStart({}, {
-        hasUI: false,
-        modelRegistry: {
-          find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
-          getAvailable: () => [{
-            provider: "fake",
-            id: "parent",
-            reasoning: true,
-            input: ["text"],
-            contextWindow: 128_000,
-            maxTokens: 16_000,
-            cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
-          }],
-          hasConfiguredAuth: () => true,
-        },
-      });
-
-      const guidance = subagent.promptGuidelines.join("\n");
-      assert.match(guidance, /Available named subagents/);
+      const subagents = registeredTools.filter((tool) => tool.name === "subagent");
+      assert.equal(subagents.length, 1);
+      const guidance = subagents[0].promptGuidelines.join("\n");
+      assert.match(guidance, /<available_subagents>/);
       assert.match(
         guidance,
-        /researcher.*Researches external topics using authoritative sources/,
+        /<agent name="researcher">Researches topics\. Use for external sources\.<\/agent>/,
       );
-      assert.match(guidance, /runtime comes from config/i);
-      assert.doesNotMatch(guidance, /one-off.*override/i);
-      assert.equal(subagent.parameters.additionalProperties, false);
+      assert.doesNotMatch(guidance, /secret|Hidden one/);
+      assert.doesNotMatch(guidance, /"Researches|authenticated|model-id|runtime comes from config/i);
+      assert.equal(subagents[0].parameters.additionalProperties, false);
       for (const removed of ["model", "thinking", "systemPrompt", "skills", "tools"]) {
-        assert.equal(
-          subagent.parameters.properties[removed],
-          undefined,
-          `${removed} must not be a subagent parameter`,
-        );
+        assert.equal(subagents[0].parameters.properties[removed], undefined);
       }
     });
   });
 
-  it("refreshes subagent routing guidance from the live authenticated model registry", () => {
-    const { api, registeredTools, eventHandlers } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-
-    const subagent = registeredTools.find((tool) => tool.name === "subagent");
-    assert.ok(subagent);
-    const sessionStart = eventHandlers.get("session_start")?.[0];
-    assert.ok(sessionStart);
-    sessionStart({}, {
-      hasUI: false,
-      modelRegistry: {
-        find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
-        getAvailable: () => [{
-          provider: "fake",
-          id: "fast",
-          reasoning: true,
-          input: ["text"],
-          contextWindow: 128_000,
-          maxTokens: 16_000,
-          cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
-        }],
-        hasConfiguredAuth: () => true,
-      },
+  it("catalog handles folded, block, malformed, frontmatter-less and non-string agents", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      mkdirSync(globalAgentsDir, { recursive: true });
+      writeFileSync(join(globalAgentsDir, "folded.md"), "---\nname: folded\ndescription: >\n  Use when\n  folding.\n---\nbody\n");
+      writeFileSync(join(globalAgentsDir, "block.md"), "---\nname: block\ndescription: |\n  Line one\n  line two\n---\nbody\n");
+      writeFileSync(join(globalAgentsDir, "bad.md"), "---\nname: [unclosed\n---\nbody\n");
+      writeFileSync(join(globalAgentsDir, "plain.md"), "no frontmatter at all\n");
+      writeAgentFile(globalAgentsDir, "listy", "name: listy\ndescription:\n  - a\n  - b");
+      const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const guidance = registeredTools.find((tool) => tool.name === "subagent").promptGuidelines.join("\n");
+      assert.match(guidance, /<agent name="folded">Use when folding\.<\/agent>/);
+      assert.match(guidance, /<agent name="block">Line one line two<\/agent>/);
+      assert.match(guidance, /<agent name="listy"><\/agent>/);
+      assert.doesNotMatch(guidance, /plain|bad|unclosed/);
+      const warnings: string[] = [];
+      eventHandlers.get("session_start")![0]({}, { ui: { notify: (m: string) => warnings.push(m) } });
+      assert.ok(warnings.some((m) => /Skipped agent bad\.md/.test(m)));
+      assert.ok(warnings.some((m) => /Skipped agent plain\.md: missing YAML frontmatter/.test(m)));
     });
+  });
 
-    assert.match(subagent.promptGuidelines.join("\n"), /fake\/fast/);
-    assert.match(subagent.promptGuidelines.join("\n"), /inherit the parent model and thinking level/);
+  it("caps the catalog and reports omitted agents", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      for (let i = 0; i < 30; i++) {
+        writeAgentFile(globalAgentsDir, `agent-${String(i).padStart(2, "0")}`, `name: agent-${String(i).padStart(2, "0")}\ndescription: d`);
+      }
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const guidance = registeredTools.find((tool) => tool.name === "subagent").promptGuidelines.join("\n");
+      assert.equal((guidance.match(/<agent name=/g) ?? []).length, 24);
+      assert.match(guidance, /6 more named subagents omitted/);
+    });
+  });
+
+  it("empty catalog tells the model to do the work itself", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const guidance = registeredTools.find((tool) => tool.name === "subagent").promptGuidelines.join("\n");
+      assert.match(guidance, /none; do the work yourself/);
+      assert.doesNotMatch(guidance, /bare spawn/);
+    });
+  });
+
+  it("child orchestrator catalog excludes its own agent", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "lead", "name: lead\ndescription: Leads\nspawning: true");
+      writeAgentFile(globalAgentsDir, "worker", "name: worker\ndescription: Works");
+      const saved = { id: process.env.PI_SUBAGENT_ID, agent: process.env.PI_SUBAGENT_AGENT, sp: process.env.PI_SUBAGENT_SPAWNING };
+      process.env.PI_SUBAGENT_ID = "child";
+      process.env.PI_SUBAGENT_AGENT = "lead";
+      process.env.PI_SUBAGENT_SPAWNING = "1";
+      try {
+        const { api, registeredTools } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        const guidance = registeredTools.find((tool) => tool.name === "subagent").promptGuidelines.join("\n");
+        assert.match(guidance, /name="worker"/);
+        assert.doesNotMatch(guidance, /name="lead"/);
+      } finally {
+        for (const [k, v] of [["PI_SUBAGENT_ID", saved.id], ["PI_SUBAGENT_AGENT", saved.agent], ["PI_SUBAGENT_SPAWNING", saved.sp]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
   });
 
   it("keeps lifecycle tools in the base process", () => {
