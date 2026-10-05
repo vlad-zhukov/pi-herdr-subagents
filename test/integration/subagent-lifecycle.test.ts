@@ -18,7 +18,7 @@
 import { describe, it, before, after } from "node:test";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   getAvailableBackends,
@@ -53,6 +53,63 @@ function configureWaitAll(env: TestEnv): void {
   );
 }
 
+interface SessionEntry {
+  type?: string;
+  id?: unknown;
+  parentSession?: unknown;
+  customType?: string;
+  data?: { handle?: { id?: unknown } };
+  message?: { role?: string; content?: unknown };
+}
+
+/** Parse a Pi session JSONL file, skipping blank or half-written lines. */
+function readSessionEntries(sessionFile: string): SessionEntry[] {
+  return readFileSync(sessionFile, "utf8")
+    .split("\n")
+    .flatMap((line) => {
+      try {
+        return line.trim() ? [JSON.parse(line) as SessionEntry] : [];
+      } catch {
+        return [];
+      }
+    });
+}
+
+/** Every message from every Pi session file the test environment produced. */
+function readSessionMessages(env: TestEnv): Array<NonNullable<SessionEntry["message"]>> {
+  const root = join(env.agentDir, "sessions");
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { recursive: true, encoding: "utf8" })
+    .filter((file) => file.endsWith(".jsonl"))
+    .flatMap((file) => readSessionEntries(join(root, file)))
+    .flatMap((entry) => (entry.message ? [entry.message] : []));
+}
+
+function subagentToolCalls(env: TestEnv): Array<Record<string, unknown>> {
+  return readSessionMessages(env)
+    .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+    .filter((block): block is { type: string; name: string; arguments: Record<string, unknown> } =>
+      block?.type === "toolCall" && block.name === "subagent")
+    .map((block) => block.arguments);
+}
+
+function toolResultTexts(env: TestEnv): string[] {
+  return readSessionMessages(env)
+    .filter((message) => message.role === "toolResult" && Array.isArray(message.content))
+    .flatMap((message) => (message.content as Array<{ text?: string }>).map((block) => block.text ?? ""));
+}
+
+/** Poll until a recorded tool result matches; wait-all results land only after the child finishes. */
+async function waitForToolResult(env: TestEnv, pattern: RegExp, timeout: number): Promise<string> {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const match = toolResultTexts(env).find((text) => pattern.test(text));
+    if (match) return match;
+    await sleep(500);
+  }
+  throw new Error(`Timed out waiting for a tool result matching ${pattern}.`);
+}
+
 function workspacePaneIds(env: TestEnv): string[] {
   const output = execFileSync("herdr", ["pane", "list", "--workspace", env.workspaceId], { encoding: "utf8" });
   const parsed = JSON.parse(output) as { result?: { panes?: Array<{ pane_id?: unknown }> } };
@@ -78,13 +135,9 @@ async function waitForHandleId(surface: string, timeout: number): Promise<string
     const parsed = JSON.parse(output) as { result?: { pane?: { agent_session?: { value?: unknown } } } };
     const sessionFile = parsed.result?.pane?.agent_session?.value;
     if (typeof sessionFile === "string" && existsSync(sessionFile)) {
-      const entries = readFileSync(sessionFile, "utf8").trim().split("\n").reverse();
-      for (const line of entries) {
-        try {
-          const entry = JSON.parse(line) as { customType?: unknown; data?: { handle?: { id?: unknown } } };
-          const id = entry.data?.handle?.id;
-          if (entry.customType === "subagent_handle" && typeof id === "string") return id;
-        } catch {}
+      for (const entry of readSessionEntries(sessionFile).reverse()) {
+        const id = entry.data?.handle?.id;
+        if (entry.customType === "subagent_handle" && typeof id === "string") return id;
       }
     }
     await sleep(500);
@@ -215,12 +268,18 @@ for (const backend of backends) {
         const sessionFile = sessionMatch[1];
         assert.ok(existsSync(sessionFile), `Subagent session file should exist: ${sessionFile}`);
 
-        const lines = readFileSync(sessionFile, "utf8").trim().split("\n");
-        assert.ok(lines.length >= 2, `Session should have ≥2 entries, got ${lines.length}`);
+        const entries = readSessionEntries(sessionFile);
+        assert.ok(entries.length >= 2, `Session should have ≥2 entries, got ${entries.length}`);
 
-        const header = JSON.parse(lines[0]);
+        const header = entries[0];
         assert.equal(header.type, "session", "First entry should be session header");
         assert.ok(header.id, "Session header should have an id");
+
+        // The blank-session child's task tells it that its final message is the result.
+        const firstUser = entries.find((entry) => entry.message?.role === "user")?.message?.content;
+        const childTask = JSON.stringify(firstUser);
+        assert.match(childTask, /Your final message is your result: the agent that delegated this task sees nothing else\./);
+        assert.doesNotMatch(childTask, /summarize what you accomplished/i);
       }
     });
 
@@ -247,6 +306,10 @@ for (const backend of backends) {
       assert.match(parent, new RegExp(`PARENT_${id}`));
       assert.equal(existsSync(childFile), false, "async parent work must start before child completion");
       await waitForFile(childFile, PI_TIMEOUT, /CHILD_/);
+      assert.ok(
+        toolResultTexts(env).some((text) => text.includes(`"Async-${id}" owns this task now.`)),
+        "async launch result must restate Assignment ownership",
+      );
     });
 
     it("wait-all returns the terminal subagent result before parent work continues", async () => {
@@ -460,10 +523,9 @@ for (const backend of backends) {
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Fork-${id}"`,
         `  fork: true`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent or interactive parameters. Just set name, fork, and task.`,
+        `Do not set the name, agent or interactive parameters. Just set fork and task.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
@@ -476,9 +538,13 @@ for (const backend of backends) {
       // Wait for the outer pi to show the result
       const screen = await waitForScreen(
         surface,
-        /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
+        /FORK_COMPLETE|completed|Sub-agent.*"fork/i,
         PI_TIMEOUT,
       );
+
+      // With no name or agent the display name falls back to "fork", never "undefined".
+      await waitForToolResult(env, /"fork"/, PI_TIMEOUT);
+      assert.ok(!toolResultTexts(env).some((text) => /undefined/.test(text)), "no tool result may mention undefined");
 
       // Receiving the result proves the bare fork auto-exited and its child pane
       // was finalized instead of remaining at the editor as an interactive run.
@@ -489,10 +555,7 @@ for (const backend of backends) {
         const sessionFile = sessionMatch[1];
         assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
 
-        const entries = readFileSync(sessionFile, "utf8")
-          .trim()
-          .split("\n")
-          .map((l) => JSON.parse(l));
+        const entries = readSessionEntries(sessionFile);
         const header = entries[0];
         assert.equal(header.type, "session", "First entry should be session header");
         assert.ok(header.parentSession, "Fork session should have parentSession field");
@@ -559,6 +622,30 @@ for (const backend of backends) {
 
     // ── Agent discovery ──
 
+    it("unknown agent names are rejected without launching anything", async () => {
+      const id = uniqueId();
+      const surface = createTrackedSurface(env, `unknown-${id}`);
+      const existingPanes = new Set(workspacePaneIds(env));
+      await sleep(1000);
+
+      startPi(surface, env.dir, [
+        `Call the subagent tool exactly once with name "Typo-${id}", agent "no-such-agent-${id}", and task "anything".`,
+        `Then say UNKNOWN_DONE and do nothing else, even if the call fails.`,
+      ].join("\n"));
+
+      await waitForScreen(surface, /Unknown agent "no-such-agent/, PI_TIMEOUT, 300);
+      await sleep(1500); // let the session file catch up with the screen
+      assert.ok(
+        toolResultTexts(env).some((text) => text.startsWith(`Unknown agent "no-such-agent-${id}". Available:`)),
+        "the tool result must be the unknown-agent error",
+      );
+      assert.deepEqual(
+        workspacePaneIds(env).filter((pane) => !existingPanes.has(pane)),
+        [],
+        "no child pane may be launched",
+      );
+    });
+
     it("subagent finds a visible agent from the prompt catalog", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
@@ -580,6 +667,9 @@ for (const backend of backends) {
         ].join("\n"),
       );
 
+      // A malformed agent file is skipped with a warning; the good agent still loads.
+      writeFileSync(join(env.agentDir, "agents", `broken-${id}.md`), "---\nname: [unclosed\n---\nbody\n");
+
       const surface = createTrackedSurface(env, `discovery-${id}`);
       await sleep(1000);
 
@@ -593,8 +683,14 @@ for (const backend of backends) {
 
       startPi(surface, env.dir, task);
 
+      await waitForScreen(surface, new RegExp(`Skipped agent broken-${id}\\.md`), PI_TIMEOUT, 300);
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
+      // The prompt never named the agent, so the model got it from its catalog.
+      assert.ok(
+        subagentToolCalls(env).some((call) => call.agent === agentName),
+        `model must delegate to ${agentName} using the catalog`,
+      );
     });
 
     // ── Subagent with named role instructions ──
