@@ -41,6 +41,12 @@ import {
   type ResolvedRuntimePlan,
   type ThinkingLevel,
 } from "./runtime-routing.ts";
+import {
+  SUBAGENT_TOOL_BLURB,
+  buildAsyncAcknowledgement,
+  buildSubagentGuidelines,
+  resolveSubagentName,
+} from "./orchestrator-prompt.ts";
 import { buildTaskHints } from "./child-prompt.ts";
 import {
   getHarnessDriver,
@@ -125,21 +131,13 @@ const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
   }
 }
 
-function buildSubagentRoutingGuidelines(agentCatalog: string): string[] {
-  return [
-    "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
-    "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); otherwise omit it. Bare child spawns without agent are rejected unless fork: true is set.",
-    agentCatalog,
-  ];
-}
-
 const SubagentParams = Type.Object({
-  name: Type.String({ description: "Display name for the subagent" }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
+  name: Type.Optional(Type.String({ description: "Display label; defaults to agent name." })),
+  task: Type.String({ description: "Expected result in plain text, plus context the subagent cannot see." }),
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load role, tools, skills, and lifecycle defaults from the available named subagent catalog.",
+        "Subagent to delegate to; pick by description from available subagents.",
     }),
   ),
   cwd: Type.Optional(
@@ -151,19 +149,19 @@ const SubagentParams = Type.Object({
   fork: Type.Optional(
     Type.Boolean({
       description:
-        "Use only when the user explicitly requests a current-session fork (for example /iterate). Force full-context fork mode, overriding any agent session-mode; bare child spawns without agent require fork: true. Omit for normal named-agent calls.",
+        "Only when the user explicitly asks to fork this session (e.g. /iterate).",
     }),
   ),
   interactive: Type.Optional(
     Type.Boolean({
       description:
-        "Keep this subagent open after it finishes until /subagent_finalize is run in its pane. Also suppresses parent stalled/recovered notifications. Defaults to the agent's `interactive` frontmatter, otherwise false; independent from `auto-exit`.",
+        "Keep the subagent open for hands-on human work after it finishes. Only when the user asks for it.",
     }),
   ),
   resumeSessionId: Type.Optional(
     Type.String({
       description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use for retrying cancelled runs.",
+        "Claude Code only: resume that session by ID.",
     }),
   ),
 }, { additionalProperties: false });
@@ -459,15 +457,6 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 const statusConfig = loadStatusConfig();
 const modelConfig = loadModelConfig();
 const orchestrationConfig = loadOrchestrationConfig();
-
-function buildSubagentCompletionGuidance(mode: OrchestrationMode): string {
-  if (mode === "wait-all") {
-    return "This call waits for terminal Subagent result; do not poll for completion or invent results.";
-  }
-  return "This fire-and-forget call returns immediately. Completion is delivered automatically as a steer message; do not poll for completion or invent results.";
-}
-
-const subagentCompletionGuidance = buildSubagentCompletionGuidance(orchestrationConfig.mode);
 
 function resolveResultPresentation(
   result: Pick<
@@ -1135,7 +1124,6 @@ export const __test__ = {
   restoreHandles,
   ensureSubagentRuntime,
   formatElapsed,
-  buildSubagentCompletionGuidance,
   shouldSteerStatusTransition,
   abandonAllSubagents,
   handleParentTerminalInput,
@@ -1161,8 +1149,11 @@ function startWidgetRefresh() {
  *
  * Call watchSubagent() on the returned object to observe completion.
  */
+/** Tool params with the display name already resolved. */
+type LaunchParams = Static<typeof SubagentParams> & { name: string };
+
 async function launchSubagent(
-  params: typeof SubagentParams.static,
+  params: LaunchParams,
   ctx: {
     sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
     cwd: string;
@@ -1806,12 +1797,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   const spawningEnabled =
     !process.env.PI_SUBAGENT_ID || process.env.PI_SUBAGENT_SPAWNING === "1";
   const shouldRegister = (name: string) => spawningEnabled || !SPAWNING_TOOLS.has(name);
-  // Built once at load: Pi snapshots guidelines at registration.
+  // Built once at load (catalog, mode, and child-ness are fixed per process); Pi snapshots guidelines at registration.
   const agentLoadErrors: string[] = [];
-  const subagentRoutingGuidelines = buildSubagentRoutingGuidelines(
+  const isChildOrchestrator = Boolean(process.env.PI_SUBAGENT_ID);
+  const subagentGuidelines = buildSubagentGuidelines(
     buildAvailableAgentCatalog(
       discoverAgentDefinitions((message) => agentLoadErrors.push(message)).filter(isCatalogAgent),
     ),
+    orchestrationConfig.mode,
+    isChildOrchestrator,
   );
 
   // ── subagent tool ──
@@ -1819,17 +1813,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.registerTool({
       name: "subagent",
       label: "Subagent",
-      description:
-        "Spawn a sub-agent in a dedicated terminal herdr pane. " +
-        "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); do not choose it yourself. " +
-        "Bare child spawns without agent are rejected unless fork: true is set. " +
-        subagentCompletionGuidance,
-      promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal herdr pane. " +
-        "Use fork: true only when the user explicitly requests a current-session fork (for example /iterate); do not choose it yourself. " +
-        "Bare child spawns without agent are rejected unless fork: true is set. " +
-        subagentCompletionGuidance,
-      promptGuidelines: subagentRoutingGuidelines,
+      description: SUBAGENT_TOOL_BLURB,
+      promptSnippet: SUBAGENT_TOOL_BLURB,
+      promptGuidelines: subagentGuidelines,
       parameters: SubagentParams,
       executionMode: "parallel",
 
@@ -1881,7 +1867,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ) {
           throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
         }
-        const running = await launchSubagent(params, ctx, parentThinking);
+        const name = resolveSubagentName(params.name, params.agent);
+        const running = await launchSubagent({ ...params, name }, ctx, parentThinking);
         rememberPiHandle(running);
 
         // Create a separate AbortController for the watcher
@@ -1933,16 +1920,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
-                `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
-                `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+              text: buildAsyncAcknowledgement(name),
             },
           ],
           details: {
             id: running.id,
-            name: params.name,
+            name,
             task: params.task,
             agent: params.agent,
             sessionFile: running.sessionFile,
@@ -1957,7 +1940,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderCall(args, theme) {
         const partialArgs = args as Record<string, unknown>;
-        const name = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "(unnamed)";
+        const name = resolveSubagentName(partialArgs.name, partialArgs.agent);
         const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
         const agent = typeof partialArgs.agent === "string" && partialArgs.agent
           ? theme.fg("dim", ` (${partialArgs.agent})`)
@@ -1991,7 +1974,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderResult(result, _opts, theme) {
         const details = result.details as any;
-        const name = details?.name ?? "(unnamed)";
+        const name = details?.name ?? "fork";
 
         // "Started" result — tool returned immediately
         if (details?.status === "started") {
@@ -2126,10 +2109,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_prompt",
       label: "Continue Subagent",
       description:
-        "Continue a Pi-backed subagent session by immutable handle. " +
-        "Use after follow-up work, recovery from an interruption or failure, or a reply to its request. " +
-        "Live sessions receive the message in their existing pane; closed sessions reopen their saved Pi session with original launch settings.",
-      promptSnippet: "Continue a Pi-backed subagent session by immutable handle.",
+        "Send follow-up work or an answer to an existing subagent by id; it keeps its full context. Use to answer its questions or to correct or extend its result.",
+      promptSnippet: "Send follow-up work or an answer to an existing subagent by id; it keeps its full context.",
       parameters: Type.Object({
         id: Type.String({ description: "Immutable subagent handle" }),
         message: Type.String({ description: "Follow-up work, recovery instruction, or answer for the continued session" }),

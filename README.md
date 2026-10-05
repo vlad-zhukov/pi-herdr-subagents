@@ -77,7 +77,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
-| `subagent`           | Spawn a sub-agent in a dedicated herdr pane (`async` returns immediately; `wait-all` returns terminal result) |
+| `subagent`           | Delegate work to a specialist subagent (`async` returns immediately; `wait-all` returns terminal result) |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_prompt`    | Continue prior Pi subagent session by immutable handle                                      |

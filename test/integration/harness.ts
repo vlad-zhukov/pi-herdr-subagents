@@ -18,10 +18,11 @@ import {
   readFileSync,
   writeFileSync,
   unlinkSync,
+  symlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   isTerminalAvailable,
   createSubagentPane,
@@ -71,6 +72,12 @@ const TEST_AGENTS_SRC = join(HARNESS_DIR, "agents");
 const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.ts");
 
 // ── Configuration ──
+
+const HERDR_AGENT_STATE_EXTENSION = join(
+  process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+  "extensions",
+  "herdr-agent-state.ts",
+);
 
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
 export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openrouter/free";
@@ -184,6 +191,13 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
     "utf8",
   );
 
+  // Share real credentials (symlink so OAuth refreshes write through).
+  const realAuth = join(
+    process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+    "auth.json",
+  );
+  if (existsSync(realAuth)) symlinkSync(realAuth, join(agentDir, "auth.json"));
+
   // Keep child runtime selection in shared config, not agent frontmatter.
   writeFileSync(
     join(agentsDir, "config.json"),
@@ -234,7 +248,7 @@ export function cleanupTestEnv(env: TestEnv): void {
     } catch {}
   }
   try {
-    rmSync(env.dir, { recursive: true, force: true });
+    if (!process.env.PI_TEST_KEEP) rmSync(env.dir, { recursive: true, force: true });
   } catch {}
 }
 
@@ -282,6 +296,8 @@ export function startPi(
     `pi`,
     `-ne`,
     `-e ${shellQuote(EXTENSION_SOURCE)}`,
+    // Herdr's own Pi integration reports the session to the pane (agent_session).
+    existsSync(HERDR_AGENT_STATE_EXTENSION) ? `-e ${shellQuote(HERDR_AGENT_STATE_EXTENSION)}` : "",
     `--model ${shellQuote(model)}`,
     extra,
     shellQuote(task),

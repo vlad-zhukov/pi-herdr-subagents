@@ -236,8 +236,9 @@ for (const backend of backends) {
         "Call subagent exactly once with these parameters:",
         `name: "Async-${id}"`,
         'agent: "test-echo"',
-        `task: "Run: sleep 5; echo 'CHILD_${id}' > '${childFile}'"`,
-        `Immediately after subagent returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
+        `task: "Run: sleep 20; echo 'CHILD_${id}' > '${childFile}'"`,
+        `This next step is unrelated to the subagent's task, so do it right away without waiting for the subagent:`,
+        `run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
         "Then say ASYNC_COMPLETE.",
       ].join("\n"));
 
@@ -320,7 +321,7 @@ for (const backend of backends) {
       configureWaitAll(env);
       writeFileSync(
         `${env.agentDir}/agents/parallel-success-${id}.md`,
-        `---\nname: parallel-success-${id}\ncli: test-shell\ncommand: "date +%s%3N > '${successStart}'; sleep 5; printf done > '${successDone}'; true"\n---\n`,
+        `---\nname: parallel-success-${id}\ncli: test-shell\ncommand: "date +%s%3N > '${successStart}'; sleep 20; printf done > '${successDone}'; true"\n---\n`,
       );
       writeFileSync(
         `${env.agentDir}/agents/parallel-failure-${id}.md`,
@@ -343,7 +344,7 @@ for (const backend of backends) {
       assert.equal(existsSync(successDone), true, "successful sibling must finish before parent continues");
       assert.equal(existsSync(failureDone), true, "failed sibling must settle before parent continues");
       assert.ok(
-        Math.abs(Number(readFileSync(successStart, "utf8")) - Number(readFileSync(failureStart, "utf8"))) < 3_000,
+        Math.abs(Number(readFileSync(successStart, "utf8")) - Number(readFileSync(failureStart, "utf8"))) < 10_000,
         "siblings must launch concurrently, not after each other's terminal result",
       );
 

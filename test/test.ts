@@ -21,6 +21,7 @@ import {
 } from "../pi-extension/subagents/assignment-handles.ts";
 
 import { buildPiContinuationCommand } from "../pi-extension/subagents/harness/drivers/pi.ts";
+import { buildAsyncAcknowledgement, buildSubagentGuidelines, resolveSubagentName } from "../pi-extension/subagents/orchestrator-prompt.ts";
 
 import {
   getNewEntries,
@@ -650,10 +651,39 @@ describe("orchestration configuration", () => {
     );
   });
 
-  it("describes each completion mode accurately", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.match(testApi.buildSubagentCompletionGuidance("async"), /returns immediately/i);
-    assert.match(testApi.buildSubagentCompletionGuidance("wait-all"), /waits for terminal/i);
+  it("describes each orchestration mode and the Orchestrator role in the guidelines", () => {
+    const base = (mode: "async" | "wait-all") => buildSubagentGuidelines("<catalog/>", mode, false).join("\n");
+    const child = (mode: "async" | "wait-all") => buildSubagentGuidelines("<catalog/>", mode, true).join("\n");
+
+    assert.match(base("async"), /each result wakes you automatically/);
+    assert.match(base("async"), /Delegation is your default/);
+    assert.match(base("async"), /Parallelize aggressively/);
+    assert.doesNotMatch(base("async"), /return together/);
+    assert.match(base("wait-all"), /return together/);
+    assert.doesNotMatch(base("wait-all"), /wakes you/);
+
+    for (const mode of ["async", "wait-all"] as const) {
+      assert.match(child(mode), /decide exactly what result you need/);
+      assert.match(child(mode), /belongs to its subagent/);
+      assert.match(child(mode), /<catalog\/>/);
+      assert.doesNotMatch(child(mode), /Delegation is your default|Parallelize aggressively/);
+    }
+  });
+
+  it("async acknowledgement restates ownership", () => {
+    const text = buildAsyncAcknowledgement("scout");
+    assert.match(text, /^"scout" owns this task now\./);
+    assert.match(text, /Do not work on it yourself/);
+    assert.match(text, /wake you automatically/);
+  });
+
+  it("resolves the display name: name, then agent, then fork", () => {
+    assert.equal(resolveSubagentName("Label", "scout"), "Label");
+    assert.equal(resolveSubagentName("  ", "scout"), "scout");
+    assert.equal(resolveSubagentName(undefined, " scout "), "scout");
+    assert.equal(resolveSubagentName(undefined, undefined), "fork");
+    assert.equal(resolveSubagentName("", ""), "fork");
+    assert.equal(resolveSubagentName(42, null), "fork");
   });
 
   it("rejects invalid orchestration configuration", () => {
@@ -1921,7 +1951,8 @@ describe("tool registration", () => {
       assert.match(guidance, /<agent name="folded">Use when folding\.<\/agent>/);
       assert.match(guidance, /<agent name="block">Line one line two<\/agent>/);
       assert.match(guidance, /<agent name="listy"><\/agent>/);
-      assert.doesNotMatch(guidance, /plain|bad|unclosed/);
+      const catalogBlock = guidance.slice(guidance.indexOf("<available_subagents>"));
+      assert.doesNotMatch(catalogBlock, /plain|bad|unclosed/);
       const warnings: string[] = [];
       eventHandlers.get("session_start")![0]({}, { ui: { notify: (m: string) => warnings.push(m) } });
       assert.ok(warnings.some((m) => /Skipped agent bad\.md/.test(m)));
@@ -2088,8 +2119,16 @@ describe("tool registration", () => {
 
     const subagent = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagent);
-    assert.match(subagent.description, /fork: true only when the user explicitly requests/i);
-    assert.match(subagent.description, /bare child spawns without agent are rejected unless fork: true/i);
+    assert.equal(
+      subagent.description,
+      "Delegate work to a specialist subagent running in its own context; you get back its result.",
+    );
+    assert.equal(subagent.promptSnippet, subagent.description);
+    assert.match(subagent.parameters.properties.fork.description, /only when the user explicitly asks to fork/i);
+    assert.equal(subagent.parameters.required.includes("name"), false);
+    const rules = subagent.promptGuidelines.join("\n");
+    assert.doesNotMatch(rules, /fork|herdr|do not poll|generic default/i);
+    assert.doesNotMatch(subagent.description, /fork|herdr|do not poll/i);
 
     for (const params of [
       { name: "Bare", task: "T" },
@@ -2179,7 +2218,10 @@ describe("tool registration", () => {
     const rendered = subagentTool.renderCall({}, theme);
     const output = rendered.render(80).join("\n");
 
-    assert.match(output, /\(unnamed\)/);
+    assert.match(output, /▸ fork/);
+
+    const named = subagentTool.renderCall({ agent: "scout" }, theme).render(80).join("\n");
+    assert.match(named, /▸ scout/);
   });
 
 
