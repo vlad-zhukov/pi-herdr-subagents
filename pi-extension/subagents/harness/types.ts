@@ -112,6 +112,4 @@ export interface HarnessDriver {
   /** Whether this CLI writes structured .activity.json snapshots */
   readonly hasActivitySnapshots?: boolean;
 
-  /** Whether this CLI supports Turn-only Escape interrupts */
-  readonly supportsTurnInterrupt?: boolean;
 }

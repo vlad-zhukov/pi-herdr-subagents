@@ -4,7 +4,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusivel
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all tracked agents with their projected state — for example `starting`, `active`, `waiting`, `interrupted`, `stalled`, `running`, or `finalizing`. The header summarizes **active** (processing) vs **open** (not processing). When every tracked subagent is open, the border switches to amber. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all tracked agents with their projected state — for example `starting`, `active`, `waiting`, `stalled`, `running`, or `finalizing`. The header summarizes **active** (processing) vs **open** (not processing). When every tracked subagent is open, the border switches to amber. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────── 1 active · 1 open ─╮
@@ -78,8 +78,6 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Delegate work to a specialist subagent (`async` returns immediately; `wait-all` returns terminal result) |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
-| `subagents_list`     | List available agent definitions                                                            |
 | `subagent_prompt`    | Continue prior Pi subagent session by immutable handle                                      |
 
 | Command                    | Description                          |
@@ -100,7 +98,7 @@ Agents default to running with `pi`, but can run inside any supported harness CL
 
 | Harness CLI | Frontmatter `cli:` | Model format | Notes |
 | :--- | :--- | :--- | :--- |
-| **Pi** (default) | `pi` (or omitted) | `provider/model` | Full support for thinking levels, turn interrupts, and live activity snapshots |
+| **Pi** (default) | `pi` (or omitted) | `provider/model` | Full support for thinking levels and live activity snapshots |
 | **OpenCode** | `opencode` | `provider/model` | Runs `opencode run --model <model> <task>` |
 | **Codex** | `codex` | bare model ID | Runs `codex --model <model>` with optional `--reasoning-effort` |
 | **Claude Code** | `claude` | bare model ID | Runs `claude --model <model>` with autonomous completion hook |
@@ -145,7 +143,6 @@ Projected labels include:
 - `active` — processing work (agent turn, provider request, streaming, or tool execution)
 - `blocked` — Herdr reports the child as blocked
 - `waiting` — turn finished; the process is intentionally open for more input or another stage
-- `interrupted` — the current turn was cancelled (Escape / `subagent_interrupt`); the process stays open and is **not** treated as active processing
 - `stalled` — pane inspection is unhealthy long enough that the parent can no longer trust the run
 - `running` — fallback when only coarse process presence is known (e.g. non-Pi backends)
 - `finalizing` — completion was observed and delivery is in progress; the process elapsed timer freezes here
@@ -153,13 +150,13 @@ Projected labels include:
 The widget header counts **active** vs **open**:
 
 - **active** — `active`, `starting`, `running`, or `blocked`
-- **open** — everything else still tracked (`waiting`, `interrupted`, `stalled`, `finalizing`, …)
+- **open** — everything else still tracked (`waiting`, `stalled`, `finalizing`, …)
 
-When `activeCount === 0` (every tracked row is open), the border uses an amber accent. Process elapsed time (`MM:SS` on the left) freezes when the process reaches finalizing/completed/failed. Interrupt does **not** freeze that process clock; the interrupted state shows its own duration on the right while the process remains open.
+When `activeCount === 0` (every tracked row is open), the border uses an amber accent. Process elapsed time (`MM:SS` on the left) freezes when the process reaches finalizing/completed/failed.
 
-A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. Status transitions are shown in the widget only; the parent agent is never messaged about them.
 
-**Interactive subagents stay open.** Run child-only `/subagent_finalize` after Pi is idle to send their result. Interactive subagents also suppress parent `stalled`/`recovered` notifications. `interactive` defaults to `false` independently of `auto-exit`.
+**Interactive subagents stay open.** Run child-only `/subagent_finalize` after Pi is idle to send their result. `interactive` defaults to `false` independently of `auto-exit`.
 
 #### Configuration
 
@@ -192,7 +189,7 @@ If `PI_CODING_AGENT_DIR` is set, use `$PI_CODING_AGENT_DIR/agents/config.json` i
 
 `orchestration.mode` defaults to `async`: calls return immediately and Completion delivery arrives as a steer message. Set it to `wait-all` to make each `subagent` and `subagent_prompt` call return its terminal result; calls in one tool batch launch concurrently and Orchestrator reasoning resumes after every result. Interactive Subagents participate until explicit completion. Escape cancels only Orchestrator wait: Subagent continues and its incomplete or buffered terminal result reverts to Completion delivery exactly once. Mode is captured when Subagent launches; config changes apply after extension reload or new session.
 
-`status.enabled` controls live status supervision. Status notifications cap at four lines (`lineLimit: 4`); extra lines collapse into an overflow summary. This limit is fixed.
+`status.enabled` controls live status supervision.
 
 `models.default` sets the model for subagents without a per-agent entry. `models.agents` sets per-agent models, keyed by the name passed to `subagent({ agent: ... })`. Append `#off`, `#minimal`, `#low`, `#medium`, `#high`, `#xhigh`, or `#max` to set thinking (for example, `openai-codex/gpt-5.6-line#xhigh`). Model values must be exact authenticated `provider/model-id` references, optionally followed by a thinking suffix. Subagent tool calls do not accept runtime or prompt overrides.
 
@@ -224,28 +221,10 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load role, tools, skills, and lifecycle defaults from agent definition                           |
 | `fork`                 | boolean | `false`        | Use only for an explicitly requested current-session fork; overrides agent `session-mode`; bare calls without `agent` require `fork: true` |
-| `interactive`          | boolean | `false`        | Keep child session open until `/subagent_finalize` runs in its pane; also suppress parent stall/recovery notifications. Agent frontmatter can set the default. |
+| `interactive`          | boolean | `false`        | Keep child session open until `/subagent_finalize` runs in its pane. Agent frontmatter can set the default. |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
 
 Runtime and role prompts come from `config.json` and named agent definitions. `model`, `thinking`, `systemPrompt`, `skills`, and `tools` are not valid `subagent()` parameters; old calls fail schema validation.
-
----
-
-## Interrupting a running subagent
-
-Use `subagent_interrupt` to cancel the active turn of a running Pi-backed subagent:
-
-```typescript
-subagent_interrupt({ id: "abcd1234" });
-// or
-subagent_interrupt({ name: "Scout" });
-```
-
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `subagent_ask` still flow through normally.
-
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
-
-> **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
 
 ---
 
@@ -337,9 +316,9 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `lineage-only` when omitted; `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Defaults to `false` for child sessions; set `true` to allow nested subagent-spawning tools                                                                                                                                                                                        |
 | `auto-exit`   | boolean | `false` | Close Pi and its Herdr pane after the result is sent. Independent from `interactive`. |
-| `interactive` | boolean | `false` | Keep session open until `/subagent_finalize` runs in its pane; also suppress stall/recovery notifications. |
+| `interactive` | boolean | `false` | Keep session open until `/subagent_finalize` runs in its pane. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
-| `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+| `disable-model-invocation` | boolean | Hide this agent from the model-facing catalog. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
 Runtime model selection belongs in `config.json` under `models.agents`; append a thinking suffix to the selected model value when needed. `model` and `thinking` frontmatter fields are ignored.
 
@@ -393,7 +372,7 @@ Allows child sessions to use subagent lifecycle tools.
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_prompt`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_prompt`):
 
 ```yaml
 ---
@@ -455,7 +434,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 [scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
 [scout] — 12 available  (Ctrl+J to collapse)          ← expanded
   read, bash, edit, write, todo, ...
-  denied: subagent, subagents_list, ...
+  denied: subagent, subagent_prompt, ...
 ```
 
 ---
@@ -476,7 +455,7 @@ Other multiplexers and terminal backends are not supported.
 
 ## Acknowledgements
 
-The sub-agent status supervision and turn-only interruption features were inspired by [RepoPrompt](https://repoprompt.com/)'s sub-agent snapshot polling and run cancellation features.
+The sub-agent status supervision feature was inspired by [RepoPrompt](https://repoprompt.com/)'s sub-agent snapshot polling.
 
 ---
 

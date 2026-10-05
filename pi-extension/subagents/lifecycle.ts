@@ -34,8 +34,7 @@ export type TurnState =
   | { kind: "starting"; observedAt: number }
   | { kind: "active"; startedAt: number; source: "activity" | "herdr" | "fallback"; activity?: ActivityDetail }
   | { kind: "blocked"; startedAt: number }
-  | { kind: "waiting"; startedAt: number }
-  | { kind: "interrupted"; requestedAt: number; previousActivitySequence: number | null };
+  | { kind: "waiting"; startedAt: number };
 
 export type ActivityHealth =
   | { kind: "unseen" }
@@ -64,7 +63,7 @@ export interface SubagentLifecycle {
 }
 
 export interface LifecycleProjection {
-  kind: "starting" | "running" | "active" | "blocked" | "waiting" | "interrupted" | "stalled" | "finalizing" | "completed" | "failed";
+  kind: "starting" | "running" | "active" | "blocked" | "waiting" | "stalled" | "finalizing" | "completed" | "failed";
   label?: string;
   runtimeEndedAt?: number;
   stateDurationSince?: number;
@@ -136,12 +135,6 @@ export function observePaneInspection(
   const process: ProcessState = lifecycle.process.kind === "starting"
     ? { kind: "running", startedAt: lifecycle.process.startedAt, confirmedAt: observedAt }
     : lifecycle.process;
-
-  // A local interrupt has higher precedence than coarse Herdr status. Herdr
-  // can lag behind Escape; only newer Pi activity or completion clears it.
-  if (lifecycle.turn.kind === "interrupted") {
-    return { ...lifecycle, process, pane, hasWorked };
-  }
 
   let turn: TurnState = lifecycle.turn;
   if (agentStatus === "blocked") {
@@ -241,16 +234,6 @@ export function observeActivity(
     };
   }
 
-  let resumesInterruptedTurn = false;
-  if (lifecycle.turn.kind === "interrupted") {
-    const staleInterruptSnapshot = detail.observedAt < lifecycle.turn.requestedAt ||
-      (detail.observedAt === lifecycle.turn.requestedAt &&
-        lifecycle.turn.previousActivitySequence != null &&
-        detail.sequence <= lifecycle.turn.previousActivitySequence);
-    if (staleInterruptSnapshot) return lifecycle;
-    resumesInterruptedTurn = true;
-  }
-
   const process: ProcessState = lifecycle.process.kind === "starting"
     ? { kind: "running", startedAt: lifecycle.process.startedAt, confirmedAt: observedAt }
     : lifecycle.process;
@@ -265,29 +248,20 @@ export function observeActivity(
     ? lifecycle.turn.startedAt
     : detail.since;
 
-  if (resumesInterruptedTurn) {
+  if (lifecycle.pane.kind === "present" && lifecycle.pane.agentStatus === "working") {
     turn = {
       kind: "active",
       startedAt: detailStartedAt,
       source: "activity",
       activity: detail,
     };
-  } else if (lifecycle.turn.kind !== "interrupted") {
-    if (lifecycle.pane.kind === "present" && lifecycle.pane.agentStatus === "working") {
-      turn = {
-        kind: "active",
-        startedAt: detailStartedAt,
-        source: "activity",
-        activity: detail,
-      };
-    } else if (lifecycle.pane.kind === "unknown" || lifecycle.pane.kind === "read-error") {
-      turn = {
-        kind: "active",
-        startedAt: detailStartedAt,
-        source: "fallback",
-        activity: detail,
-      };
-    }
+  } else if (lifecycle.pane.kind === "unknown" || lifecycle.pane.kind === "read-error") {
+    turn = {
+      kind: "active",
+      startedAt: detailStartedAt,
+      source: "fallback",
+      activity: detail,
+    };
   }
 
   return {
@@ -308,21 +282,6 @@ export function markProcessRunning(
   return {
     ...lifecycle,
     process: { kind: "running", startedAt: lifecycle.process.startedAt, confirmedAt },
-  };
-}
-
-export function markInterruptRequested(
-  lifecycle: SubagentLifecycle,
-  requestedAt: number,
-): SubagentLifecycle {
-  if (lifecycle.process.kind === "finalizing" || isTerminal(lifecycle.process)) return lifecycle;
-  return {
-    ...lifecycle,
-    turn: {
-      kind: "interrupted",
-      requestedAt,
-      previousActivitySequence: lifecycle.lastActivitySequence,
-    },
   };
 }
 
@@ -404,8 +363,6 @@ export function projectLifecycle(lifecycle: SubagentLifecycle, now: number): Lif
 
   const turn = lifecycle.turn;
   switch (turn.kind) {
-    case "interrupted":
-      return { kind: "interrupted", stateDurationSince: turn.requestedAt };
     case "active": {
       if (turn.activity?.kind === "scope") {
         const label = turn.activity.label ?? turn.activity.scope;
@@ -422,56 +379,4 @@ export function projectLifecycle(lifecycle: SubagentLifecycle, now: number): Lif
     case "unknown":
       return process.kind === "running" ? { kind: "running" } : { kind: "starting" };
   }
-}
-
-export type LifecycleTransition = "stalled" | "recovered" | null;
-
-export function lifecycleTransition(
-  previous: LifecycleProjection["kind"] | undefined,
-  next: LifecycleProjection["kind"],
-): LifecycleTransition {
-  if (previous !== "stalled" && next === "stalled") return "stalled";
-  if (
-    previous === "stalled" &&
-    (next === "active" ||
-      next === "blocked" ||
-      next === "waiting" ||
-      next === "interrupted" ||
-      next === "running" ||
-      next === "starting")
-  ) {
-    return "recovered";
-  }
-  return null;
-}
-
-export function formatLifecycleTransitionLine(
-  name: string,
-  projection: LifecycleProjection,
-  transition: Exclude<LifecycleTransition, null>,
-  now: number,
-  startedAt: number,
-  formatElapsed: (ms: number) => string,
-): string {
-  const runtime = formatElapsed(Math.max(0, now - startedAt));
-  const duration = projection.stateDurationSince == null
-    ? ""
-    : ` ${formatElapsed(now - projection.stateDurationSince)}`;
-  if (transition === "stalled") {
-    return `${name} running ${runtime}, stalled${duration}.`;
-  }
-  if (projection.kind === "waiting") {
-    return `${name} running ${runtime}, recovered; waiting${duration}.`;
-  }
-  if (projection.kind === "active") {
-    const detail = projection.label ? ` (${projection.label}${duration})` : duration;
-    return `${name} running ${runtime}, recovered; active${detail}.`;
-  }
-  if (projection.kind === "blocked") {
-    return `${name} running ${runtime}, recovered; blocked${duration}.`;
-  }
-  if (projection.kind === "interrupted") {
-    return `${name} running ${runtime}, recovered; interrupted${duration}.`;
-  }
-  return `${name} running ${runtime}, recovered; running.`;
 }

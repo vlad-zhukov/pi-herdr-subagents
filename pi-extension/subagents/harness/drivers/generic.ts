@@ -12,7 +12,6 @@ export class GenericHarnessDriver implements HarnessDriver {
   readonly id: string;
   readonly name: string;
   readonly hasActivitySnapshots = false;
-  readonly supportsTurnInterrupt = false;
 
   constructor(cliId = "generic", displayName?: string) {
     this.id = cliId;

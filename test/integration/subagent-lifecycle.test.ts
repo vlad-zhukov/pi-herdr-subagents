@@ -19,6 +19,7 @@ import { describe, it, before, after } from "node:test";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   getAvailableBackends,
   setBackend,
@@ -343,6 +344,7 @@ for (const backend of backends) {
       await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
       assert.equal(existsSync(successDone), true, "successful sibling must finish before parent continues");
       assert.equal(existsSync(failureDone), true, "failed sibling must settle before parent continues");
+      // Success child sleeps 20s: a sequential launch would start >20s apart, so 10s still catches it.
       assert.ok(
         Math.abs(Number(readFileSync(successStart, "utf8")) - Number(readFileSync(failureStart, "utf8"))) < 10_000,
         "siblings must launch concurrently, not after each other's terminal result",
@@ -363,7 +365,7 @@ for (const backend of backends) {
 
     // ── In-progress activity snapshots ──
 
-    it("keeps a long active tool call from surfacing false stalled status", async () => {
+    it("keeps a long active tool call from showing stalled in the widget or messaging the Orchestrator", async () => {
       const id = uniqueId();
       const startFile = `/tmp/pi-integ-status-start-${id}.txt`;
       const markerFile = `/tmp/pi-integ-status-${id}.txt`;
@@ -385,14 +387,14 @@ for (const backend of backends) {
       startPi(surface, env.dir, task);
 
       const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
-      assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+      assert.doesNotMatch(activeScreen, /stalled \d+[sm]|Subagent status:/i);
 
       await waitForFile(startFile, PI_TIMEOUT, /START_/);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
       await sleep(65_000);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
       const watchdogScreen = readPane(surface, 300);
-      assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+      assert.doesNotMatch(watchdogScreen, /stalled \d+[sm]|Subagent status:/i);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
       assert.ok(content.includes(`STATUS_${id}`), `Marker file should contain STATUS_${id}`);
@@ -557,28 +559,40 @@ for (const backend of backends) {
 
     // ── Agent discovery ──
 
-    it("subagent discovers global test agents", async () => {
+    it("subagent finds a visible agent from the prompt catalog", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
       trackTempFile(env, markerFile);
+      const agentName = `marker-writer-${id}`;
+      writeFileSync(
+        join(env.agentDir, "agents", `${agentName}.md`),
+        [
+          "---",
+          `name: ${agentName}`,
+          "description: Use when a file with a given marker text must be written to disk.",
+          "tools: read, bash, write, edit",
+          "spawning: false",
+          "auto-exit: true",
+          "---",
+          "",
+          "You are a test agent. Complete the task given to you immediately. Be direct and concise.",
+          "",
+        ].join("\n"),
+      );
 
       const surface = createTrackedSurface(env, `discovery-${id}`);
       await sleep(1000);
 
-      // Use subagents_list to verify test agents are discoverable,
-      // then spawn one to prove it works end-to-end.
+      // No agent name in the prompt: the model must pick it from its catalog.
       const task = [
-        `First, call the subagents_list tool to see available agents.`,
-        `Then call the subagent tool:`,
+        `Use the subagent tool once, with the available subagent whose description says it writes marker files.`,
         `  name: "Disco-${id}"`,
-        `  agent: "test-echo"`,
         `  task: "Run: echo 'DISCO_${id}' > '${markerFile}'"`,
         `After you receive the subagent result, say DISCOVERY_DONE.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      // The test-echo agent from isolated global config should work
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
     });

@@ -12,7 +12,6 @@ export class GrokHarnessDriver implements HarnessDriver {
   readonly id = "grok";
   readonly name = "Grok";
   readonly hasActivitySnapshots = false;
-  readonly supportsTurnInterrupt = false;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.modelId;

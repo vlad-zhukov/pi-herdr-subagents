@@ -16,7 +16,6 @@ import {
   createSubagentPane,
   runScriptInPane,
   closePane,
-  interruptPane,
   promptPane,
   shellQuote,
   readPane,
@@ -72,10 +71,7 @@ import {
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
-  capStatusLines,
   formatElapsedDuration,
-  formatStatusAggregate,
-  normalizeStatusName,
   loadStatusConfig,
 } from "./status.ts";
 import {
@@ -92,13 +88,10 @@ import {
 } from "./assignment-handles.ts";
 import {
   createLifecycle,
-  formatLifecycleTransitionLine,
-  lifecycleTransition,
   markCompleted,
   markCompletionDetected,
   markDelivery,
   markFailed,
-  markInterruptRequested,
   markProcessRunning,
   observeActivity,
   observePaneInspection,
@@ -113,7 +106,7 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 // Survive /reload: replace presentation timers while keeping active completion
 // watchers and their registry alive. Old module closures continue watching the
-// children; the reloaded module adopts the shared registry for status/interrupts.
+// children; the reloaded module adopts the shared registry for status.
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
@@ -218,8 +211,6 @@ interface ListedAgentDefinition extends AgentDefinition {
 /** Tools controlled by child `spawning` capability. */
 const SPAWNING_TOOLS = new Set([
   "subagent",
-  "subagent_interrupt",
-  "subagents_list",
   "subagent_prompt",
 ]);
 
@@ -540,14 +531,9 @@ interface RunningSubagent {
   cli?: string;
   sentinelFile?: string;
   lifecycle: SubagentLifecycle;
-  /** Last projected kind used to detect stalled/recovered transitions. */
+  /** Last projected kind, used to refresh the widget when it changes. */
   lastProjectedKind?: LifecycleProjection["kind"];
-  /**
-   * When true, status transitions (stalled/recovered) do not wake the parent
-   * session via a steer message. The widget still updates locally. Used for
-   * long-running agents where the user drives the conversation in the
-   * subagent's pane (e.g. planner).
-   */
+  /** Long-running agent the user drives in its own pane. */
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
@@ -814,7 +800,6 @@ function formatLifecycleWidgetLabel(
   if (projection.kind === "blocked") return ` blocked${duration} `;
   if (projection.kind === "running") return " running… ";
   if (projection.kind === "waiting") return ` waiting${duration} `;
-  if (projection.kind === "interrupted") return ` interrupted${duration} `;
   if (projection.kind === "stalled") return ` stalled${duration} `;
   // completed/failed exist as lifecycle projections for delivery bookkeeping,
   // but the row is removed immediately after result delivery — so the only
@@ -937,103 +922,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
   running.lifecycle = observeActivity(ensureLifecycle(running), read, observedAt);
 }
 
-function resolveInterruptTarget(params: { id?: string; name?: string }):
-  | { running: RunningSubagent }
-  | { error: string } {
-  const requestedId = params.id?.trim();
-  if (requestedId) {
-    const running = runningSubagents.get(requestedId);
-    return running ? { running } : { error: `No running subagent with id "${requestedId}".` };
-  }
-
-  const requestedName = params.name?.trim();
-  if (!requestedName) {
-    return { error: "Provide a running subagent id or exact display name." };
-  }
-
-  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
-  if (matches.length === 1) return { running: matches[0] };
-  if (matches.length === 0) {
-    return { error: `No running subagent named "${requestedName}".` };
-  }
-
-  const candidates = matches.map((running) => `${running.name} [${running.id}]`).join(", ");
-  return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
-}
-
-function requestSubagentInterrupt(
-  running: RunningSubagent,
-  interruptPaneKey: (surface: string) => void = interruptPane,
-): { ok: true } | { error: string } {
-  try {
-    interruptPaneKey(running.surface);
-    return { ok: true };
-  } catch (error: any) {
-    return {
-      error:
-        `Failed to send Escape to subagent "${running.name}" via herdr: ` +
-        `${error?.message ?? String(error)}`,
-    };
-  }
-}
-
-function handleSubagentInterrupt(
-  params: { id?: string; name?: string },
-  interruptPaneKey: (surface: string) => void = interruptPane,
-) {
-  const resolved = resolveInterruptTarget(params);
-  if ("error" in resolved) {
-    return {
-      content: [{ type: "text" as const, text: resolved.error }],
-      details: { error: resolved.error },
-    };
-  }
-
-  const running = resolved.running;
-  const driver = getHarnessDriver(running.cli);
-  if (!driver.supportsTurnInterrupt) {
-    return {
-      content: [{
-        type: "text" as const,
-        text:
-          `Turn-only Escape interrupt is currently supported only for Pi-backed subagents. ${driver.name}-backed semantics have not been verified yet.`,
-      }],
-      details: {
-        error: `${running.cli ?? "external"} interrupt unsupported`,
-        id: running.id,
-        name: running.name,
-      },
-    };
-  }
-
-  const now = Date.now();
-  observeRunningSubagent(running, now);
-
-  const interruption = requestSubagentInterrupt(running, interruptPaneKey);
-  if ("error" in interruption) {
-    return {
-      content: [{ type: "text" as const, text: interruption.error }],
-      details: { error: interruption.error, id: running.id, name: running.name },
-    };
-  }
-
-  running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
-  updateWidget();
-
-  return {
-    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` }],
-    details: { id: running.id, name: running.name, status: "interrupt_requested" },
-  };
-}
-
-function shouldSteerStatusTransition(
-  running: Pick<RunningSubagent, "id" | "interactive" | "orchestrationMode">,
-): boolean {
-  return (subagentHandles.get(running.id)?.subscribed ?? true) &&
-    !running.interactive && running.orchestrationMode !== "wait-all";
-}
-
-function startStatusRefresh(pi: ExtensionAPI) {
+function startStatusRefresh() {
   if (!statusConfig.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
@@ -1046,51 +935,17 @@ function startStatusRefresh(pi: ExtensionAPI) {
       return;
     }
 
-    const transitionLines: string[] = [];
     const now = Date.now();
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
       observeRunningSubagent(running, now);
       const projection = projectLifecycle(ensureLifecycle(running), now);
-      const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
-      if (running.lastProjectedKind !== projection.kind) {
-        shouldRefreshWidget = true;
-      }
+      if (running.lastProjectedKind !== projection.kind) shouldRefreshWidget = true;
       running.lastProjectedKind = projection.kind;
-
-      // Interactive subagents (long-running, user-driven) intentionally don't
-      // wake the parent session on stalled/recovered transitions — the user is
-      // working in the subagent's pane, and a steer message here would burn an
-      // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
-      if (transition && shouldSteerStatusTransition(running)) {
-        transitionLines.push(
-          formatLifecycleTransitionLine(
-            normalizeStatusName(running.name),
-            projection,
-            transition,
-            now,
-            running.startTime,
-            formatElapsedDuration,
-          ),
-        );
-      }
     }
 
     if (shouldRefreshWidget) updateWidget();
-
-    if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
-      pi.sendMessage(
-        {
-          customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
-          display: true,
-          details: { lines: capped.visibleLines, overflow: capped.overflow },
-        },
-        completionDeliveryOptions(),
-      );
-    }
   }, 1000);
 
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
@@ -1112,9 +967,6 @@ export const __test__ = {
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveSpawning,
-  resolveInterruptTarget,
-  requestSubagentInterrupt,
-  handleSubagentInterrupt,
   resolveResultPresentation,
   resolveWaitAllResultPresentation,
   shouldClosePaneAfterFinalization,
@@ -1124,7 +976,6 @@ export const __test__ = {
   restoreHandles,
   ensureSubagentRuntime,
   formatElapsed,
-  shouldSteerStatusTransition,
   abandonAllSubagents,
   handleParentTerminalInput,
   haltOrchestrator,
@@ -1757,7 +1608,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     restoreHandles(ctx.sessionManager?.getEntries?.() ?? []);
     if (runningSubagents.size > 0) {
       startWidgetRefresh();
-      startStatusRefresh(pi);
+      startStatusRefresh();
       updateWidget();
     }
     if (!process.env.PI_SUBAGENT_ID && ctx.ui?.onTerminalInput) {
@@ -1878,7 +1729,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Start widget refresh and status supervision when the first agent launches
         startWidgetRefresh();
-        startStatusRefresh(pi);
+        startStatusRefresh();
 
         const completion = watchSubagent(running, watcherAbort.signal);
 
@@ -1997,112 +1848,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // ── subagent_interrupt tool ──
-  if (shouldRegister("subagent_interrupt"))
-    pi.registerTool({
-      name: "subagent_interrupt",
-      label: "Interrupt Subagent",
-      description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
-      promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
-      parameters: Type.Object({
-        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
-        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
-      }),
-
-      async execute(_toolCallId, params) {
-        return handleSubagentInterrupt(params);
-      },
-
-      renderCall(args, theme) {
-        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
-        return new Text(
-          theme.fg("accent", "▸") +
-            " " +
-            theme.fg("toolTitle", theme.bold(target)) +
-            theme.fg("dim", " — interrupt turn"),
-          0,
-          0,
-        );
-      },
-
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        if (details?.status === "interrupt_requested") {
-          return new Text(
-            theme.fg("accent", "▸") +
-              " " +
-              theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
-              theme.fg("dim", " — interrupt requested"),
-            0,
-            0,
-          );
-        }
-
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
-        return new Text(theme.fg("dim", text), 0, 0);
-      },
-    });
-
-  // ── subagents_list tool ──
-  if (shouldRegister("subagents_list"))
-    pi.registerTool({
-      name: "subagents_list",
-      label: "List Subagents",
-      description: "List all available global subagent definitions.",
-      promptSnippet: "List all available global subagent definitions.",
-      parameters: Type.Object({}),
-
-      async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
-
-        if (list.length === 0) {
-          return {
-            content: [{ type: "text", text: "No subagent definitions found." }],
-            details: { agents: [] },
-          };
-        }
-
-        const lines = list.map((a) => {
-          const desc = a.description ? ` — ${a.description}` : "";
-          const model = resolveModelDefault(a.name, modelConfig);
-          const thinking = resolveThinkingDefault(a.name, modelConfig);
-          const runtime = model ? ` [${model}${thinking ? ` · ${thinking}` : ""}]` : "";
-          return `• ${a.name}${runtime}${desc}`;
-        });
-
-        return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
-        };
-      },
-
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const agents = details?.agents ?? [];
-        if (agents.length === 0) {
-          return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
-        }
-        const lines = agents.map((a: any) => {
-          const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const configuredModel = resolveModelDefault(a.name, modelConfig);
-          const configuredThinking = resolveThinkingDefault(a.name, modelConfig);
-          const runtime = configuredModel
-            ? theme.fg("dim", ` [${configuredModel}${configuredThinking ? ` · ${configuredThinking}` : ""}]`)
-            : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${runtime}${desc}`;
-        });
-        return new Text(lines.join("\n"), 0, 0);
-      },
-    });
-
-
-
   // ── subagent_prompt tool ──
   if (shouldRegister("subagent_prompt"))
     pi.registerTool({
@@ -2155,7 +1900,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const controller = new AbortController();
           running.abortController = controller;
           startWidgetRefresh();
-          startStatusRefresh(pi);
+          startStatusRefresh();
           const completion = watchSubagent(running, controller.signal);
           if (running.orchestrationMode === "wait-all") {
             const waited = await waitForCompletionOrAbort(completion, signal);
@@ -2184,7 +1929,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const controller = new AbortController();
         resumed.abortController = controller;
         startWidgetRefresh();
-        startStatusRefresh(pi);
+        startStatusRefresh();
         const completion = watchSubagent(resumed, controller.signal);
 
         if (resumed.orchestrationMode === "wait-all") {
@@ -2327,35 +2072,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Render via Box for background + padding, with blank line above for separation
         const box = new Box(1, 1, bgFn);
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
-      },
-    };
-  });
-
-  // ── subagent_status message renderer ──
-  pi.registerMessageRenderer("subagent_status", (message, options, theme) => {
-    const details = message.details as any;
-    const lines = Array.isArray(details?.lines) ? details.lines : [];
-    const overflow = typeof details?.overflow === "number" ? details.overflow : 0;
-    if (lines.length === 0 && overflow === 0) return undefined;
-
-    return {
-      render(width: number): string[] {
-        const lineWidth = Math.max(0, width - 6);
-        const contentLines = [
-          `${theme.fg("accent", "•")} ${theme.fg("toolTitle", theme.bold("Subagent status"))}`,
-          ...lines.map((line: string) => theme.fg("dim", truncateToWidth(line, lineWidth))),
-        ];
-
-        if (overflow > 0) {
-          contentLines.push(theme.fg("muted", `+${overflow} more running.`));
-        }
-        if (!options.expanded) {
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
-        }
-
-        const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },

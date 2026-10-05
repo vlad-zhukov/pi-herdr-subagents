@@ -271,7 +271,7 @@ export function closeHerdrSurface(surface: string): void {
     herdrExec(["pane", "close", surface]);
   } catch (error: any) {
     // Closing a pane is cleanup. If the pane already disappeared (for example,
-    // after an interrupt or manual close), the desired end state is satisfied.
+    // after Escape abandonment or manual close), the desired end state is satisfied.
     if (isPaneMissingError(error)) return;
     throw error;
   }

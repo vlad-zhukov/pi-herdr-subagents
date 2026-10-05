@@ -35,7 +35,6 @@ export class ClaudeHarnessDriver implements HarnessDriver {
   readonly id = "claude";
   readonly name = "Claude Code";
   readonly hasActivitySnapshots = false;
-  readonly supportsTurnInterrupt = false;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.modelId;

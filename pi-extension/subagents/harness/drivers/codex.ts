@@ -12,7 +12,6 @@ export class CodexHarnessDriver implements HarnessDriver {
   readonly id = "codex";
   readonly name = "Codex";
   readonly hasActivitySnapshots = false;
-  readonly supportsTurnInterrupt = false;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.modelId;

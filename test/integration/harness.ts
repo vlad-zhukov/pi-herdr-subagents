@@ -73,8 +73,11 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 
 // ── Configuration ──
 
+/** The invoking user's real Pi agent dir (credentials and Herdr integration live here). */
+const REAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+
 const HERDR_AGENT_STATE_EXTENSION = join(
-  process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+  REAL_AGENT_DIR,
   "extensions",
   "herdr-agent-state.ts",
 );
@@ -192,10 +195,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   );
 
   // Share real credentials (symlink so OAuth refreshes write through).
-  const realAuth = join(
-    process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
-    "auth.json",
-  );
+  const realAuth = join(REAL_AGENT_DIR, "auth.json");
   if (existsSync(realAuth)) symlinkSync(realAuth, join(agentDir, "auth.json"));
 
   // Keep child runtime selection in shared config, not agent frontmatter.
@@ -248,6 +248,7 @@ export function cleanupTestEnv(env: TestEnv): void {
     } catch {}
   }
   try {
+    // PI_TEST_KEEP=1 keeps the temp dir (session logs) for debugging.
     if (!process.env.PI_TEST_KEEP) rmSync(env.dir, { recursive: true, force: true });
   } catch {}
 }

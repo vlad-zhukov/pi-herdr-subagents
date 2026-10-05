@@ -2,21 +2,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentConfigDir } from "./model-config.ts";
 
-export const DEFAULT_STATUS_LINE_LIMIT = 4;
-export const MAX_STATUS_NAME_LENGTH = 72;
-
 function getDefaultStatusConfigPath(): string {
   return join(getAgentConfigDir(), "agents", "config.json");
 }
 
 export interface StatusConfig {
   enabled: boolean;
-  lineLimit: number;
-}
-
-export interface CappedStatusLines {
-  visibleLines: string[];
-  overflow: number;
 }
 
 function invalidStatusConfig(source: string, message: string): never {
@@ -49,27 +40,13 @@ function rejectUnsupportedKeys(
   }
 }
 
-function truncateText(text: string, maxLength: number): string {
-  if (text.length <= maxLength) return text;
-  if (maxLength <= 1) return text.slice(0, maxLength);
-  return `${text.slice(0, maxLength - 1)}…`;
-}
-
-export function normalizeStatusName(name: string): string {
-  const collapsed = name.replace(/\s+/g, " ").trim() || "subagent";
-  return truncateText(collapsed, MAX_STATUS_NAME_LENGTH);
-}
-
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
   rejectUnsupportedKeys(status, ["enabled"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
 
-  return {
-    enabled,
-    lineLimit: DEFAULT_STATUS_LINE_LIMIT,
-  };
+  return { enabled };
 }
 
 function readStatusConfigFile(configPath: string, examplePath?: string): { sourcePath: string; rawConfig: string } {
@@ -97,10 +74,7 @@ function readStatusConfigFile(configPath: string, examplePath?: string): { sourc
   }
 }
 
-const DEFAULT_STATUS_CONFIG: StatusConfig = {
-  enabled: true,
-  lineLimit: DEFAULT_STATUS_LINE_LIMIT,
-};
+const DEFAULT_STATUS_CONFIG: StatusConfig = { enabled: true };
 
 export function loadStatusConfig(
   configPath = getDefaultStatusConfigPath(),
@@ -136,19 +110,4 @@ export function formatElapsedDuration(ms: number): string {
   if (hours > 0) return `${hours}h ${minutes}m`;
 
   return `${minutes}m`;
-}
-
-export function capStatusLines(lines: string[], lineLimit: number): CappedStatusLines {
-  const visibleLines = lines.slice(0, lineLimit);
-  return {
-    visibleLines,
-    overflow: Math.max(0, lines.length - visibleLines.length),
-  };
-}
-
-export function formatStatusAggregate(lines: string[], lineLimit: number): string {
-  const { visibleLines, overflow } = capStatusLines(lines, lineLimit);
-  const bulletLines = visibleLines.map((line) => `• ${line}`);
-  if (overflow > 0) bulletLines.push(`• +${overflow} more running.`);
-  return `Subagent status:\n${bulletLines.join("\n")}`;
 }

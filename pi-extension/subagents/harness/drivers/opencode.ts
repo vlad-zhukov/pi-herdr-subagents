@@ -12,7 +12,6 @@ export class OpenCodeHarnessDriver implements HarnessDriver {
   readonly id = "opencode";
   readonly name = "OpenCode";
   readonly hasActivitySnapshots = false;
-  readonly supportsTurnInterrupt = false;
 
   formatModel(runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">): string {
     return runtimePlan.model;

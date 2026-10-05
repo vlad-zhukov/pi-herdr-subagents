@@ -120,8 +120,7 @@ describe("Pi Harness Driver", () => {
     );
   });
 
-  it("supports turn interrupts and live activity snapshots", () => {
-    assert.equal(driver.supportsTurnInterrupt, true);
+  it("supports live activity snapshots", () => {
     assert.equal(driver.hasActivitySnapshots, true);
   });
 
