@@ -176,6 +176,19 @@ function validateSubagentRequest(params: Pick<Static<typeof SubagentParams>, "ag
   return !params.agent?.trim() && params.fork !== true ? BARE_SUBAGENT_FORK_ERROR : null;
 }
 
+/** Reject misspelled names; hidden agents count as known but are not listed. */
+function validateAgentKnown(agent: string | undefined): string | null {
+  if (!agent?.trim()) return null;
+  const agents = discoverAgentDefinitions();
+  if (agents.some((candidate) => candidate.name === agent)) return null;
+  const available = agents.filter(isCatalogAgent).map((candidate) => candidate.name);
+  return `Unknown agent "${agent}". Available: ${available.join(", ") || "none"}`;
+}
+
+function errorResult(error: string) {
+  return { content: [{ type: "text" as const, text: error }], details: { error } };
+}
+
 interface AgentDefaults {
   tools?: string;
   skills?: string;
@@ -1823,13 +1836,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       executionMode: "parallel",
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const validationError = validateSubagentRequest(params);
-        if (validationError) {
-          return {
-            content: [{ type: "text", text: validationError }],
-            details: { error: validationError },
-          };
-        }
+        const validationError = validateSubagentRequest(params) ?? validateAgentKnown(params.agent);
+        if (validationError) return errorResult(validationError);
 
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;

@@ -2112,6 +2112,55 @@ describe("tool registration", () => {
     assert.equal(testApi.validateSubagentRequest({ fork: true }), null);
   });
 
+  it("/subagent launches a hidden agent by exact name and rejects unknown names", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "secret", "name: secret\ndescription: Hid\ndisable-model-invocation: true");
+      const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const command = registeredCommands.find((entry) => entry.name === "subagent");
+      const notices: Array<[string, string]> = [];
+      const ctx = { ui: { notify: (message: string, level: string) => notices.push([message, level]) } };
+
+      await command.handler("secret do the thing", ctx);
+      assert.equal(notices.length, 0);
+      assert.equal(sentUserMessages.length, 1);
+      assert.match(sentUserMessages[0], /agent: "secret".*do the thing/);
+
+      await command.handler("nope", ctx);
+      assert.equal(sentUserMessages.length, 1);
+      assert.match(notices[0][0], /Agent "nope" not found/);
+      assert.equal(notices[0][1], "error");
+    });
+  });
+
+  it("rejects unknown agent names, listing only visible agents, but accepts hidden ones", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "worker", "name: worker\ndescription: Works");
+      writeAgentFile(globalAgentsDir, "secret", "name: secret\ndescription: Hid\ndisable-model-invocation: true");
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagent = registeredTools.find((tool) => tool.name === "subagent");
+      const run = (params: object) =>
+        subagent.execute("c", params, new AbortController().signal, undefined, {
+          sessionManager: { getSessionFile: () => undefined },
+        });
+
+      for (const params of [{ name: "x", task: "T", agent: "wrker" }, { task: "T", agent: "wrker", fork: true }]) {
+        const result = await run(params);
+        assert.equal(result.content[0].text, 'Unknown agent "wrker". Available: worker');
+        // Rejected before any launch: result carries only the error.
+        assert.deepEqual(Object.keys(result.details), ["error"]);
+        assert.equal(result.details.error, result.content[0].text);
+      }
+
+      const bareFork = await run({ name: "x", task: "T", fork: true });
+      assert.doesNotMatch(bareFork.content[0].text, /Unknown agent|Bare subagents/);
+
+      const hidden = await run({ name: "x", task: "T", agent: "secret" });
+      assert.doesNotMatch(hidden.content[0].text, /Unknown agent/);
+    });
+  });
+
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
