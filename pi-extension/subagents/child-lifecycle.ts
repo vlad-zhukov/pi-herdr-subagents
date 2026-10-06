@@ -1,8 +1,11 @@
 /** Child-session hooks and result command. */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { parseAgentMarkdown } from "./agent-markdown.ts";
 import {
   buildCompletionPayload,
   hasCompletionChannel,
@@ -17,7 +20,53 @@ export function shouldFinalizeOnAgentSettlement(messages: any[] | undefined): bo
   return false;
 }
 
+function loadChildIdentity(): string {
+  const file = process.env.PI_SUBAGENT_AGENT_FILE;
+  if (!file) {
+    if (process.env.PI_SUBAGENT_AGENT) throw new Error(`Subagent ${process.env.PI_SUBAGENT_AGENT} has no agent file path`);
+    return "";
+  }
+  if (!isAbsolute(file)) throw new Error(`Subagent agent file path must be absolute: ${file}`);
+  const content = readFileSync(file, "utf8");
+  const parsed = parseAgentMarkdown(content);
+  if (!parsed) throw new Error(`Subagent agent file has no YAML frontmatter: ${file}`);
+  return parsed.body.trim() ? parsed.body : "";
+}
+
+function fatalChildIdentity(
+  error: Error,
+  ctx: Pick<ExtensionContext, "mode" | "ui" | "shutdown" | "abort">,
+  duringRun = false,
+): Promise<never> | never {
+  const message = `Subagent identity error: ${error.message}`;
+  console.error(message);
+  publishCompletion(process.env.PI_SUBAGENT_SESSION, { reason: "error", exitCode: 1, errorMessage: message });
+  ctx.shutdown();
+  if (ctx.mode === "tui") {
+    if (duringRun) {
+      // Pi defers shutdown until agent_settled here, but this hook must not start the agent.
+      // The public TUI stop restores raw mode, cursor and keyboard protocols before forced exit.
+      return ctx.ui.custom<never>((tui) => {
+        tui.stop();
+        process.exit(1);
+      });
+    }
+    // At session_start Pi is idle: its graceful shutdown stops the TUI. Block startup meanwhile.
+    return new Promise<never>(() => {});
+  }
+  ctx.abort();
+  // Print/RPC do not restore a TUI; Pi can otherwise continue after a caught hook error.
+  return process.exit(1);
+}
+
 export function registerChildLifecycle(pi: ExtensionAPI): void {
+  let identity = "";
+  let identityError: Error | undefined;
+  try {
+    identity = loadChildIdentity();
+  } catch (error) {
+    identityError = error instanceof Error ? error : new Error(String(error));
+  }
   let toolNames: string[] = [];
   let expanded = false;
   let latestAgentMessages: any[] | undefined;
@@ -60,7 +109,8 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
     );
   }
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
+    if (identityError) await fatalChildIdentity(identityError, ctx);
     recorder.sessionStart();
     toolNames = pi.getAllTools().map((tool) => tool.name).sort();
     renderWidget(ctx, null);
@@ -70,7 +120,15 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
     awaitingAnswer = false;
     recorder.input();
   });
-  pi.on("before_agent_start", () => recorder.beforeAgentStart());
+  pi.on("before_agent_start", async (event, ctx) => {
+    recorder.beforeAgentStart();
+    if (!identity) return;
+    if (typeof event.systemPromptOptions?.appendSystemPrompt !== "string") {
+      await fatalChildIdentity(new Error("Pi 1.0+ systemPromptOptions.appendSystemPrompt is required for subagent identity"), ctx, true);
+    }
+    if (event.systemPrompt?.includes(identity) || event.systemPromptOptions.appendSystemPrompt.trimEnd().endsWith(identity.trimEnd())) return;
+    event.systemPromptOptions.appendSystemPrompt += `\n\n${identity}`;
+  });
   pi.on("agent_start", () => recorder.agentStart());
   pi.on("agent_end", (event) => {
     latestAgentMessages = (event as any).messages as any[] | undefined;

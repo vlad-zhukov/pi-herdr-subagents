@@ -1,7 +1,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -78,15 +79,21 @@ import {
 // Isolate the unit suite from inherited parent/child capability variables.
 const inheritedSubagentId = process.env.PI_SUBAGENT_ID;
 const inheritedSpawning = process.env.PI_SUBAGENT_SPAWNING;
+const inheritedAgent = process.env.PI_SUBAGENT_AGENT;
+const inheritedAgentFile = process.env.PI_SUBAGENT_AGENT_FILE;
 before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_SUBAGENT_SPAWNING;
+  delete process.env.PI_SUBAGENT_AGENT;
+  delete process.env.PI_SUBAGENT_AGENT_FILE;
 });
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
   if (inheritedSpawning == null) delete process.env.PI_SUBAGENT_SPAWNING;
   else process.env.PI_SUBAGENT_SPAWNING = inheritedSpawning;
+  restoreEnvVar("PI_SUBAGENT_AGENT", inheritedAgent);
+  restoreEnvVar("PI_SUBAGENT_AGENT_FILE", inheritedAgentFile);
 });
 
 // --- Helpers ---
@@ -275,6 +282,11 @@ describe("durable subagent handles", () => {
       data,
     })));
     assert.deepEqual(restored.get(handle.id), handle);
+    const named = { ...handle, agent: "scout", agentFile: "/original/config/agents/scout.md" };
+    saveSubagentHandle((customType, data) => saved.push({ customType, data }), named);
+    assert.equal(restoreSubagentHandles(saved.map(({ customType, data }) => ({
+      type: "custom", customType, data,
+    }))).get(handle.id)?.agentFile, named.agentFile);
   });
 
   it("reopens with original Pi launch settings without resolving config", () => {
@@ -282,6 +294,7 @@ describe("durable subagent handles", () => {
       handle: {
         ...handle,
         agent: "scout",
+        agentFile: "/original/config/agents/scout.md",
         agentDir: "/agents/scout",
         cwd: "/work/scout",
         spawning: true,
@@ -293,15 +306,23 @@ describe("durable subagent handles", () => {
     });
 
     assert.match(command, /^cd '\/work\/scout' && /);
-    assert.doesNotMatch(command, /\s-e\s/);
+    assert.match(command, /pi --session/);
+    assert.match(command, /PI_SUBAGENT_AGENT_FILE='\/original\/config\/agents\/scout.md'/);
     for (const setting of [
       "PI_CODING_AGENT_DIR='/agents/scout'",
       "PI_SUBAGENT_SPAWNING=1",
       "PI_SUBAGENT_NAME='Scout'",
       "PI_SUBAGENT_AGENT='scout'",
       "PI_SUBAGENT_AUTO_EXIT=1",
-      "pi --session '/tmp/child-001.jsonl'",
+      "--session '/tmp/child-001.jsonl'",
     ]) assert.match(command, new RegExp(setting.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  });
+
+  it("reopens no-agent Pi without an agent file", () => {
+    const command = buildPiContinuationCommand({
+      handle, surface: "pane", activityFile: "/activity.json", messageFile: "/prompt.md",
+    });
+    assert.match(command, /PI_SUBAGENT_AGENT_FILE=''/);
   });
 
   it("persists detached subscriptions without blocking continuation", () => {
@@ -801,6 +822,7 @@ describe("subagent discovery", () => {
           "name: removed-runtime-frontmatter-test-agent",
           "model: fake/frontmatter",
           "thinking: max",
+          "system-prompt: replace",
           "tools: read",
         ].join("\n"),
       );
@@ -809,6 +831,7 @@ describe("subagent discovery", () => {
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.model, undefined);
       assert.equal(loaded.thinking, undefined);
+      assert.equal(Object.hasOwn(loaded, "systemPromptMode"), false);
       assert.equal(loaded.tools, "read");
     });
   });
@@ -1133,6 +1156,7 @@ describe("subagent discovery", () => {
       );
       assert.equal(loadedByFrontmatterName.model, undefined);
       assert.equal(loadedByFrontmatterName.thinking, undefined);
+      assert.equal(loadedByFrontmatterName.file, join(globalAgentsDir, "renamed-file-test-agent.md"));
 
       const loadedByFilename = testApi.loadAgentDefaults("renamed-file-test-agent");
       assert.equal(
@@ -1192,6 +1216,160 @@ describe("subagent discovery", () => {
   });
 });
 describe("child assignment lifecycle", () => {
+  it("appends identity after the existing system append on each fresh Pi turn", () => {
+    withTempDir((dir) => {
+      const savedFile = process.env.PI_SUBAGENT_AGENT_FILE;
+      const savedAgent = process.env.PI_SUBAGENT_AGENT;
+      const agentFile = join(dir, "scout.md");
+      writeFileSync(agentFile, "---\nname: scout\n---\nYou are Scout.");
+      process.env.PI_SUBAGENT_AGENT_FILE = agentFile;
+      process.env.PI_SUBAGENT_AGENT = "scout";
+      try {
+        const { api, eventHandlers } = createMockExtensionApi();
+        registerChildLifecycle(api);
+        const hook = eventHandlers.get("before_agent_start")![0];
+        for (let i = 0; i < 2; i++) {
+          const event = { systemPromptOptions: { appendSystemPrompt: "Existing APPEND_SYSTEM.md" } };
+          hook(event, { shutdown: () => assert.fail("unexpected shutdown") });
+          assert.equal(event.systemPromptOptions.appendSystemPrompt, "Existing APPEND_SYSTEM.md\n\nYou are Scout.");
+        }
+        const duplicate = { systemPromptOptions: { appendSystemPrompt: "Existing APPEND_SYSTEM.md" } };
+        const other = createMockExtensionApi();
+        registerChildLifecycle(other.api);
+        hook(duplicate, {});
+        other.eventHandlers.get("before_agent_start")![0](duplicate, {});
+        assert.equal(duplicate.systemPromptOptions.appendSystemPrompt, "Existing APPEND_SYSTEM.md\n\nYou are Scout.");
+        writeFileSync(agentFile, "---\nname: scout\n---\n \t \n");
+        const bodyless = createMockExtensionApi();
+        registerChildLifecycle(bodyless.api);
+        const unchanged = { systemPromptOptions: { appendSystemPrompt: "Existing APPEND_SYSTEM.md" } };
+        bodyless.eventHandlers.get("before_agent_start")![0](unchanged, {});
+        assert.equal(unchanged.systemPromptOptions.appendSystemPrompt, "Existing APPEND_SYSTEM.md");
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AGENT_FILE", savedFile);
+        restoreEnvVar("PI_SUBAGENT_AGENT", savedAgent);
+      }
+    });
+  });
+
+  it("reads current definition at each startup despite child cwd and config differences", () => {
+    withTempDir((dir) => {
+      const saved = { agent: process.env.PI_SUBAGENT_AGENT, file: process.env.PI_SUBAGENT_AGENT_FILE };
+      const file = join(dir, "scout.md");
+      writeFileSync(file, "---\nname: scout\n---\nOriginal identity.");
+      process.env.PI_SUBAGENT_AGENT = "scout";
+      process.env.PI_SUBAGENT_AGENT_FILE = file;
+      try {
+        const first = createMockExtensionApi();
+        registerChildLifecycle(first.api);
+        const old = { systemPromptOptions: { appendSystemPrompt: "Existing append\n\nOriginal identity." } };
+        first.eventHandlers.get("before_agent_start")![0](old, {});
+        assert.equal(old.systemPromptOptions.appendSystemPrompt, "Existing append\n\nOriginal identity.");
+        writeFileSync(file, "---\nname: scout\n---\nChanged identity.");
+        const reopened = createMockExtensionApi();
+        registerChildLifecycle(reopened.api);
+        const next = { systemPromptOptions: { appendSystemPrompt: "Existing append" } };
+        reopened.eventHandlers.get("before_agent_start")![0](next, {});
+        assert.equal(next.systemPromptOptions.appendSystemPrompt, "Existing append\n\nChanged identity.");
+        const script = `import { registerChildLifecycle } from ${JSON.stringify(new URL("../pi-extension/subagents/child-lifecycle.ts", import.meta.url).href)};\n` +
+          `let hook; registerChildLifecycle({ on(name, fn) { if (name === 'before_agent_start') hook = fn; }, registerTool() {}, registerCommand() {}, registerShortcut() {} });\n` +
+          `const event = { systemPromptOptions: { appendSystemPrompt: 'APPEND_SYSTEM.md' } }; await hook(event, {}); console.log(event.systemPromptOptions.appendSystemPrompt);`;
+        const childCwd = join(dir, "unrelated");
+        mkdirSync(childCwd);
+        const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+          cwd: childCwd, env: { ...process.env, PI_CODING_AGENT_DIR: childCwd }, encoding: "utf8",
+        });
+        assert.equal(child.status, 0, child.stderr);
+        assert.match(child.stdout, /APPEND_SYSTEM\.md\n\nChanged identity\./);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+        restoreEnvVar("PI_SUBAGENT_AGENT_FILE", saved.file);
+      }
+    });
+  });
+
+  it("registers lifecycle before a bad identity, then exits without starting a model turn", () => {
+    withTempDir((dir) => {
+      const extension = fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url));
+      const baseEnv = { ...process.env, PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_AGENT: "scout", PI_SUBAGENT_ID: "bad-identity", PI_SUBAGENT_SESSION: join(dir, "child.jsonl") };
+      const run = (agentFile?: string) => {
+        const env = { ...baseEnv };
+        beginCompletionChannel(baseEnv.PI_SUBAGENT_SESSION);
+        if (agentFile === undefined) delete env.PI_SUBAGENT_AGENT_FILE;
+        else env.PI_SUBAGENT_AGENT_FILE = agentFile;
+        return spawnSync("pi", ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extension], {
+          env, cwd: dir, input: '{"id":"prompt","type":"prompt","message":"Must not call provider"}\n',
+          encoding: "utf8", timeout: 15000,
+        });
+      };
+      const missing = run(join(dir, "missing.md"));
+      assert.equal(missing.status, 1);
+      assert.match(missing.stderr, /Subagent identity error:.*ENOENT/);
+      assert.equal(JSON.parse(readFileSync(`${baseEnv.PI_SUBAGENT_SESSION}.exit`, "utf8")).reason, "error");
+      assert.doesNotMatch(missing.stdout, /agent_start|message_start/);
+      writeFileSync(join(dir, "empty.md"), "  ");
+      assert.match(run(join(dir, "empty.md")).stderr, /no YAML frontmatter/);
+      assert.match(run(dir).stderr, /Subagent identity error:.*EISDIR/);
+      assert.match(run().stderr, /Subagent scout has no agent file path/);
+      assert.match(run("scout.md").stderr, /agent file path must be absolute/);
+      const frontmatter = join(dir, "frontmatter.md");
+      writeFileSync(frontmatter, "---\nname: scout\n---\n");
+      const frontmatterOnly = run(frontmatter);
+      assert.equal(frontmatterOnly.status, 0, frontmatterOnly.stderr);
+      assert.match(frontmatterOnly.stdout, /"command":"prompt"/);
+      writeFileSync(frontmatter, "---\nname: scout\n---\n  \t  \n");
+      assert.equal(run(frontmatter).status, 0);
+      const noAgent = spawnSync("pi", ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extension], {
+        env: { ...baseEnv, PI_SUBAGENT_AGENT: "", PI_SUBAGENT_AGENT_FILE: "" }, cwd: dir,
+        input: '{"id":"prompt","type":"prompt","message":"No role"}\n', encoding: "utf8", timeout: 15000,
+      });
+      assert.equal(noAgent.status, 0, noAgent.stderr);
+
+      const body = join(dir, "valid.md");
+      writeFileSync(body, "---\nname: scout\n---\nYou are Scout.");
+      const script = `import { registerChildLifecycle } from ${JSON.stringify(new URL("../pi-extension/subagents/child-lifecycle.ts", import.meta.url).href)};\n` +
+        `let hook; registerChildLifecycle({ on(name, fn) { if (name === 'before_agent_start') hook = fn; }, registerTool() {}, registerCommand() {}, registerShortcut() {} });\n` +
+        `hook({ systemPromptOptions: {} }, { shutdown() {}, abort() {} }); console.log('unexpected provider');`;
+      const absentApi = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+        env: { ...baseEnv, PI_SUBAGENT_AGENT_FILE: body }, cwd: dir, encoding: "utf8", timeout: 15000,
+      });
+      assert.equal(absentApi.status, 1);
+      assert.match(absentApi.stderr, /systemPromptOptions\.appendSystemPrompt is required/);
+      assert.doesNotMatch(absentApi.stdout, /unexpected provider/);
+
+      const tuiScript = `import { registerChildLifecycle } from ${JSON.stringify(new URL("../pi-extension/subagents/child-lifecycle.ts", import.meta.url).href)};\n` +
+        `let hook; registerChildLifecycle({ on(name, fn) { if (name === 'before_agent_start') hook = fn; }, registerTool() {}, registerCommand() {}, registerShortcut() {} });\n` +
+        `process.exit = (code) => { console.log('exit:' + code); throw Error('intercepted'); };\n` +
+        `hook({ systemPromptOptions: {} }, { mode: 'tui', shutdown() { console.log('shutdown'); }, abort() {}, ui: { custom(factory) { return factory({ stop() { console.log('stopped'); } }); } } }).catch(() => {});`;
+      const tuiFailure = spawnSync(process.execPath, ["--input-type=module", "-e", tuiScript], {
+        env: { ...baseEnv, PI_SUBAGENT_AGENT_FILE: body }, cwd: dir, encoding: "utf8", timeout: 15000,
+      });
+      assert.equal(tuiFailure.status, 0, tuiFailure.stderr);
+      assert.match(tuiFailure.stdout, /shutdown\n(?:.*\n)*stopped\nexit:1/);
+    });
+  });
+
+  it("lets Pi restore the TUI before exiting and blocks a pending startup turn", async () => {
+    const saved = { file: process.env.PI_SUBAGENT_AGENT_FILE, session: process.env.PI_SUBAGENT_SESSION };
+    process.env.PI_SUBAGENT_AGENT_FILE = "/not-present/subagent-agent.md";
+    process.env.PI_SUBAGENT_SESSION = "/not-present/subagent-session.jsonl";
+    try {
+      const { api, eventHandlers } = createMockExtensionApi();
+      registerChildLifecycle(api);
+      let terminalRestored = false;
+      const startup = eventHandlers.get("session_start")![0]({}, {
+        mode: "tui",
+        shutdown: () => { terminalRestored = true; },
+        abort: () => assert.fail("TUI shutdown should not use the noninteractive abort path"),
+      });
+      assert.equal(terminalRestored, true);
+      assert.equal(await Promise.race([startup.then(() => "returned"), Promise.resolve("blocked")]), "blocked");
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_AGENT_FILE", saved.file);
+      restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
+    }
+  });
+
   it("finalizes a noninteractive settled child while default auto-exit retains Pi", () => {
     withTempDir((dir) => {
       const sessionFile = join(dir, "child.jsonl");
@@ -1865,7 +2043,8 @@ describe("tool registration", () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       writeAgentFile(globalAgentsDir, "lead", "name: lead\ndescription: Leads\nspawning: true");
       writeAgentFile(globalAgentsDir, "worker", "name: worker\ndescription: Works");
-      const saved = { id: process.env.PI_SUBAGENT_ID, agent: process.env.PI_SUBAGENT_AGENT, sp: process.env.PI_SUBAGENT_SPAWNING };
+      const saved = { id: process.env.PI_SUBAGENT_ID, agent: process.env.PI_SUBAGENT_AGENT, sp: process.env.PI_SUBAGENT_SPAWNING, file: process.env.PI_SUBAGENT_AGENT_FILE };
+      process.env.PI_SUBAGENT_AGENT_FILE = join(globalAgentsDir, "lead.md");
       process.env.PI_SUBAGENT_ID = "child";
       process.env.PI_SUBAGENT_AGENT = "lead";
       process.env.PI_SUBAGENT_SPAWNING = "1";
@@ -1876,7 +2055,7 @@ describe("tool registration", () => {
         assert.match(guidance, /name="worker"/);
         assert.doesNotMatch(guidance, /name="lead"/);
       } finally {
-        for (const [k, v] of [["PI_SUBAGENT_ID", saved.id], ["PI_SUBAGENT_AGENT", saved.agent], ["PI_SUBAGENT_SPAWNING", saved.sp]] as const) {
+        for (const [k, v] of [["PI_SUBAGENT_ID", saved.id], ["PI_SUBAGENT_AGENT", saved.agent], ["PI_SUBAGENT_SPAWNING", saved.sp], ["PI_SUBAGENT_AGENT_FILE", saved.file]] as const) {
           if (v === undefined) delete process.env[k]; else process.env[k] = v;
         }
       }

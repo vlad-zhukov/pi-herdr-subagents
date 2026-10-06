@@ -224,7 +224,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `interactive`          | boolean | `false`        | Keep child session open until `/subagent_finalize` runs in its pane. Agent frontmatter can set the default. |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
 
-Runtime and role prompts come from `config.json` and named agent definitions. `model`, `thinking`, `systemPrompt`, `skills`, and `tools` are not valid `subagent()` parameters; old calls fail schema validation.
+Runtime and role prompts come from `config.json` and named agent definitions.
 
 ---
 
@@ -304,6 +304,8 @@ spawning: false
 
 You are a specialized agent that does X...
 ```
+
+When present, the body is the agent identity. Pi receives the absolute path to the selected definition and reads its current body at each child startup, appending it to the system prompt on every turn alongside existing `APPEND_SYSTEM.md` content; it is not attached to the task. Frontmatter-only agents are supported. Missing or unreadable definitions stop the child before a model call. Continuations reuse the saved path, not a new name lookup; older session handles without a saved path cannot resume named agents. There is no prompt-mode frontmatter setting.
 
 ### Frontmatter Reference
 
@@ -441,7 +443,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) — the coding agent
+- [Pi 1.0+](https://github.com/badlogic/pi-mono) — the coding agent
 - [herdr](https://herdr.dev) — the required terminal workspace
 
 ```bash

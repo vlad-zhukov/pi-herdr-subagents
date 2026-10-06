@@ -60,13 +60,14 @@ export function buildPiContinuationCommand(params: {
     handle.agentDir ? `PI_CODING_AGENT_DIR=${shellQuote(handle.agentDir)}` : "",
     `PI_SUBAGENT_SPAWNING=${handle.spawning ? "1" : "0"}`,
     `PI_SUBAGENT_NAME=${shellQuote(handle.name)}`,
-    ...(handle.agent ? [`PI_SUBAGENT_AGENT=${shellQuote(handle.agent)}`] : []),
+    `PI_SUBAGENT_AGENT=${shellQuote(handle.agent ?? "")}`,
     `PI_SUBAGENT_SESSION=${shellQuote(handle.sessionFile)}`,
     `PI_SUBAGENT_ID=${shellQuote(handle.id)}`,
     `PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
     `PI_SUBAGENT_SURFACE=${shellQuote(surface)}`,
     `PI_SUBAGENT_INTERACTIVE=${handle.interactive ? "1" : "0"}`,
     ...(handle.autoExit ? ["PI_SUBAGENT_AUTO_EXIT=1"] : []),
+    `PI_SUBAGENT_AGENT_FILE=${shellQuote(handle.agentFile ?? "")}`,
   ].filter(Boolean).join(" ");
   const cwd = handle.cwd ? `cd ${shellQuote(handle.cwd)} && ` : "";
   return `${cwd}${env} pi --session ${shellQuote(handle.sessionFile)} ${shellQuote(`@${messageFile}`)}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -123,10 +124,6 @@ export class PiHarnessDriver implements HarnessDriver {
       effectiveInteractive,
       taskDelivery,
       spawning,
-      identity,
-      identityInSystemPrompt,
-      systemPromptMode,
-      roleBlock,
       modeHint,
       summaryInstruction,
       shellQuote,
@@ -140,21 +137,6 @@ export class PiHarnessDriver implements HarnessDriver {
     }
     if (effectiveThinking) {
       parts.push("--thinking", shellQuote(effectiveThinking));
-    }
-
-    if (identityInSystemPrompt && identity) {
-      const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-      const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const spSafeName = params.name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "");
-      const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
-      mkdirSync(dirname(syspromptPath), { recursive: true });
-      writeFileSync(syspromptPath, identity, "utf8");
-      parts.push(flag, shellQuote(syspromptPath));
     }
 
     const effectiveTools = agentDefs?.tools;
@@ -172,20 +154,19 @@ export class PiHarnessDriver implements HarnessDriver {
 
     envParts.push(`PI_SUBAGENT_SPAWNING=${spawning ? "1" : "0"}`);
     envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
-    if (params.agent) {
-      envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
-    }
+    envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent ?? "")}`);
     envParts.push(`PI_SUBAGENT_INTERACTIVE=${effectiveInteractive ? "1" : "0"}`);
     if (effectiveAutoExit) envParts.push("PI_SUBAGENT_AUTO_EXIT=1");
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
+    envParts.push(`PI_SUBAGENT_AGENT_FILE=${shellQuote(agentDefs?.file ?? "")}`);
     const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
     envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
 
     const fullTask = taskDelivery === "direct"
-      ? roleBlock ? `${roleBlock}\n\n${params.task}` : params.task
-      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
+      ? params.task
+      : `${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
 
     let taskArg: string;
     if (taskDelivery === "direct") {

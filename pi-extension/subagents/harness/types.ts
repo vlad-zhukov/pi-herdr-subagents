@@ -17,11 +17,11 @@ export interface AgentDefinition {
   tools?: string;
   skills?: string;
   sessionMode?: string;
-  systemPromptMode?: string;
   interactive?: boolean;
   cli?: string;
   commandTemplate?: string;
   body?: string;
+  file?: string;
   disableModelInvocation?: boolean;
 }
 
@@ -43,10 +43,6 @@ export interface SubagentLaunchContext {
   inheritsConversationContext: boolean;
   taskDelivery: "direct" | "artifact";
   spawning: boolean;
-  identity?: string | null;
-  identityInSystemPrompt?: boolean;
-  systemPromptMode?: string;
-  roleBlock?: string;
   modeHint?: string;
   summaryInstruction?: string;
   subagentsDir: string;

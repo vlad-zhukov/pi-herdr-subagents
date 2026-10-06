@@ -31,14 +31,13 @@ export class GenericHarnessDriver implements HarnessDriver {
       surface,
       shellQuote,
       inheritsConversationContext,
-      roleBlock,
       modeHint,
       summaryInstruction,
     } = context;
 
     const fullTask = inheritsConversationContext
       ? params.task
-      : `${roleBlock ?? ""}\n\n${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
+      : `${modeHint ?? ""}\n\n${params.task}\n\n${summaryInstruction ?? ""}`;
 
     const template = agentDefs?.commandTemplate;
     let commandBody: string;
@@ -49,7 +48,7 @@ export class GenericHarnessDriver implements HarnessDriver {
       // untrusted task/model/cwd text are inserted literally instead of
       // being interpreted as String.replace() special patterns.
       const quotedModel = effectiveModel ? shellQuote(effectiveModel) : "";
-      const quotedTask = shellQuote(fullTask);
+      const quotedTask = shellQuote(!inheritsConversationContext && agentDefs?.body ? `${agentDefs.body}\n\n${fullTask}` : fullTask);
       const quotedCwd = effectiveCwd ? shellQuote(effectiveCwd) : ".";
       const quotedName = shellQuote(params.name);
       const quotedId = shellQuote(params.id);

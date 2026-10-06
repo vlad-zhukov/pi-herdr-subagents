@@ -132,11 +132,13 @@ describe("Pi Harness Driver", () => {
     const built = driver.buildCommand(ctx);
 
     assert.equal(built.cli, "pi");
-    assert.ok(built.command.includes("pi --session '/tmp/sessions/subagent.jsonl'"));
+    assert.match(built.command, /pi --session '\/tmp\/sessions\/subagent\.jsonl'/);
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
     assert.ok(built.command.includes("PI_SUBAGENT_SPAWNING=0"));
     assert.ok(built.command.includes("PI_SUBAGENT_INTERACTIVE=0"));
+    assert.ok(built.command.includes("PI_SUBAGENT_AGENT=''"));
+    assert.ok(built.command.includes("PI_SUBAGENT_AGENT_FILE=''"));
     assert.doesNotMatch(built.command, /\s-e\s/);
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
   });
@@ -180,22 +182,37 @@ describe("Pi Harness Driver", () => {
     assert.doesNotMatch(built.command, /final message is your result|autonomously/);
   });
 
-  void it("keeps role body in direct Pi fork prompts when not system-routed", () => {
-    const built = driver.buildCommand(createMockLaunchContext({
-      taskDelivery: "direct",
-      inheritsConversationContext: true,
-      identity: "You are a forked specialist.",
-      identityInSystemPrompt: false,
-      roleBlock: "\n\nYou are a forked specialist.",
-      systemPromptMode: undefined,
-    }));
+  it("allows named agents without a body", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-bodyless-"));
+    try {
+      const sessionFile = join(dir, "child.jsonl");
+      const built = driver.buildCommand(createMockLaunchContext({
+        agentDefs: { name: "scout", file: "/agents/scout.md" },
+        params: { id: "abc12345", name: "worker", agent: "scout", task: "Analyze the repository structure" },
+        subagentSessionFile: sessionFile,
+      }));
+      assert.match(built.command, /PI_SUBAGENT_AGENT_FILE='\/agents\/scout.md'/);
+      assert.deepEqual(readdirSync(dir), []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
-    const bodyIndex = built.command.indexOf("You are a forked specialist.");
-    const taskIndex = built.command.indexOf("Analyze the repository structure");
-    assert.ok(bodyIndex >= 0);
-    assert.ok(taskIndex > bodyIndex);
-    assert.ok(!built.command.includes("--append-system-prompt"));
-    assert.ok(!built.command.includes("--system-prompt"));
+  it("passes absolute definition path, not captured body or prompt flag", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-identity-"));
+    try {
+      const sessionFile = join(dir, "child.jsonl");
+      const built = driver.buildCommand(createMockLaunchContext({
+        agentDefs: { name: "scout", file: "/other/config/agents/scout.md", body: "You are a forked specialist." },
+        params: { id: "abc12345", name: "worker", agent: "scout", task: "Analyze the repository structure" },
+        subagentSessionFile: sessionFile,
+      }));
+      assert.deepEqual(readdirSync(dir), []);
+      assert.match(built.command, /PI_SUBAGENT_AGENT_FILE='\/other\/config\/agents\/scout.md'/);
+      assert.doesNotMatch(built.command, /You are a forked specialist|--append-system-prompt|--system-prompt/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -245,6 +262,20 @@ describe("OpenCode Harness Driver", () => {
 
 describe("Codex Harness Driver", () => {
   const driver = new CodexHarnessDriver();
+
+  it("accepts frontmatter-only named agents without a prompt flag", () => {
+    const built = driver.buildCommand(createMockLaunchContext({ agentDefs: { name: "scout" } }));
+    assert.doesNotMatch(built.command, /--system-prompt/);
+  });
+
+  it("passes named identity once through its system prompt flag", () => {
+    const built = driver.buildCommand(createMockLaunchContext({
+      agentDefs: { name: "scout", body: "You are Scout." },
+      inheritsConversationContext: false,
+    }));
+    assert.equal(built.command.split("You are Scout.").length - 1, 1);
+    assert.match(built.command, /--system-prompt 'You are Scout.'/);
+  });
 
   it("formats model using bare modelId", () => {
     assert.equal(
@@ -394,6 +425,15 @@ describe("Claude Harness Driver", () => {
 });
 
 describe("Generic Harness Driver & Templates", () => {
+  it("includes identity in blank-session templates but keeps inherited-context prompts raw", () => {
+    const context = createMockLaunchContext({
+      agentDefs: { name: "scout", body: "You are Scout.", commandTemplate: "custom --prompt {task}" },
+      inheritsConversationContext: false,
+    });
+    const driver = new GenericHarnessDriver("custom");
+    assert.equal(driver.buildCommand(context).command.split("You are Scout.").length - 1, 1);
+    assert.doesNotMatch(driver.buildCommand({ ...context, inheritsConversationContext: true }).command, /You are Scout\./);
+  });
   it("interpolates commandTemplate variables", () => {
     const driver = new GenericHarnessDriver("custom");
     const ctx = createMockLaunchContext({

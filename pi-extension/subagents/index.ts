@@ -1,8 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { keyHint, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -47,6 +47,7 @@ import {
   resolveSubagentName,
 } from "./orchestrator-prompt.ts";
 import { buildTaskHints } from "./child-prompt.ts";
+import { parseAgentMarkdown } from "./agent-markdown.ts";
 import {
   getHarnessDriver,
   buildSubagentToolAllowlist,
@@ -187,12 +188,12 @@ interface AgentDefaults {
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
-  systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
   cwd?: string;
   cli?: string;
   commandTemplate?: string;
   body?: string;
+  file?: string;
   disableModelInvocation?: boolean;
 }
 
@@ -236,21 +237,14 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  if (!/^---\r?\n[\s\S]*?\r?\n---/.test(content)) return null;
-
-  const { frontmatter, body } = parseFrontmatter(content);
-  const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+  const parsed = parseAgentMarkdown(content);
+  if (!parsed) return null;
+  const { frontmatter, body } = parsed;
 
   return {
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
     tools: getFrontmatterValue(frontmatter, "tools"),
-    systemPromptMode:
-      systemPromptMode === "replace"
-        ? "replace"
-        : systemPromptMode === "append"
-          ? "append"
-          : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
@@ -285,7 +279,7 @@ function discoverAgentDefinitions(onError?: (message: string) => void): ListedAg
           onError?.(`${file}: missing YAML frontmatter`);
           continue;
         }
-        agents.set(parsed.name, { ...parsed, source });
+        agents.set(parsed.name, { ...parsed, file: resolve(dir, file), source });
       } catch (error) {
         // Skip bad entries rather than aborting discovery for every other agent.
         onError?.(`${file}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
@@ -516,6 +510,7 @@ interface RunningSubagent {
   name: string;
   task: string;
   agent?: string;
+  agentFile?: string;
   surface: string;
   startTime: number;
   sessionFile: string;
@@ -592,6 +587,7 @@ function rememberPiHandle(running: RunningSubagent): void {
     autoExit: running.autoExit,
     interactive: running.interactive,
     ...(running.agent ? { agent: running.agent } : {}),
+    ...(running.agentFile ? { agentFile: running.agentFile } : {}),
     ...(running.agentDir ? { agentDir: running.agentDir } : {}),
     ...(running.cwd ? { cwd: running.cwd } : {}),
     ...(running.spawning != null ? { spawning: running.spawning } : {}),
@@ -1023,6 +1019,7 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  if (params.agent && !agentDefs) throw new Error(`Agent definition disappeared: ${params.agent}`);
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
   const runtimePlan = resolveRuntimePlan(
     {
@@ -1092,10 +1089,6 @@ async function launchSubagent(
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
   const { modeHint, summaryInstruction } = buildTaskHints(effectiveInteractive);
   const spawning = resolveSpawning(agentDefs);
-  const identity = agentDefs?.body ?? null;
-  const systemPromptMode = agentDefs?.systemPromptMode;
-  const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const effectiveModel = driver.formatModel(runtimePlan);
 
   const built = driver.buildCommand({
@@ -1116,10 +1109,6 @@ async function launchSubagent(
     inheritsConversationContext,
     taskDelivery: launchBehavior.taskDelivery,
     spawning,
-    identity,
-    identityInSystemPrompt: Boolean(identityInSystemPrompt),
-    systemPromptMode,
-    roleBlock,
     modeHint,
     summaryInstruction,
     subagentsDir: SUBAGENTS_DIR,
@@ -1149,6 +1138,7 @@ async function launchSubagent(
     name: params.name,
     task: params.task,
     agent: params.agent,
+    agentFile: agentDefs?.file,
     surface,
     startTime,
     sessionFile: built.sessionFile ?? subagentSessionFile,
@@ -1532,6 +1522,7 @@ async function reopenPiSubagent(
     name: handle.name,
     task: message,
     ...(handle.agent ? { agent: handle.agent } : {}),
+    ...(handle.agentFile ? { agentFile: handle.agentFile } : {}),
     surface: launched.surface,
     startTime,
     sessionFile: handle.sessionFile,
@@ -1565,6 +1556,7 @@ function attachLivePiSubagent(
     name: handle.name,
     task: message,
     ...(handle.agent ? { agent: handle.agent } : {}),
+    ...(handle.agentFile ? { agentFile: handle.agentFile } : {}),
     surface: handle.surface!,
     startTime,
     sessionFile: handle.sessionFile,

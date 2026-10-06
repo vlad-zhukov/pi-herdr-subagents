@@ -13,6 +13,7 @@ export interface SubagentHandle {
   autoExit: boolean;
   interactive: boolean;
   agent?: string;
+  agentFile?: string;
   agentDir?: string;
   cwd?: string;
   spawning?: boolean;
@@ -36,6 +37,7 @@ function isHandle(value: unknown): value is SubagentHandle {
     typeof handle.autoExit === "boolean" &&
     typeof handle.interactive === "boolean" &&
     (handle.agent == null || typeof handle.agent === "string") &&
+    (handle.agentFile == null || typeof handle.agentFile === "string") &&
     (handle.agentDir == null || typeof handle.agentDir === "string") &&
     (handle.cwd == null || typeof handle.cwd === "string") &&
     (handle.spawning == null || typeof handle.spawning === "boolean") &&
