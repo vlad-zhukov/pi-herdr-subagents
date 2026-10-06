@@ -649,8 +649,8 @@ describe("orchestration configuration", () => {
     const child = (mode: "async" | "wait-all") => buildSubagentGuidelines("<catalog/>", mode, true).join("\n");
 
     assert.match(base("async"), /each result wakes you automatically/);
-    assert.match(base("async"), /Delegation is your default/);
-    assert.match(base("async"), /Parallelize aggressively/);
+    assert.match(base("async"), /reasoning and decisions/);
+    assert.match(base("async"), /Launch independent parts/);
     assert.doesNotMatch(base("async"), /return together/);
     assert.match(base("wait-all"), /return together/);
     assert.doesNotMatch(base("wait-all"), /wakes you/);
@@ -659,7 +659,7 @@ describe("orchestration configuration", () => {
       assert.match(child(mode), /decide exactly what result you need/);
       assert.match(child(mode), /belongs to its subagent/);
       assert.match(child(mode), /<catalog\/>/);
-      assert.doesNotMatch(child(mode), /Delegation is your default|Parallelize aggressively/);
+      assert.doesNotMatch(child(mode), /reasoning and decisions|Launch independent parts/);
     }
   });
 

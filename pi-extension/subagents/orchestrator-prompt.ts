@@ -4,13 +4,13 @@ export const SUBAGENT_TOOL_BLURB =
   "Delegate work to a specialist subagent running in its own context; you get back its result.";
 
 const DELEGATION_DEFAULT =
-  "Delegation is your default. Delegate any work needing more than a few tool calls or real reading. Do it yourself only for conversation, trivial edits, tight back-and-forth with the user, or when no available subagent fits the work.";
+  "Your context and attention are the most valuable resource here: spend them on reasoning and decisions. Offload token-heavy work (reading many files, searching, bulk or mechanical edits, running tests) to subagents, and use them for second opinions. Keep work that depends on this conversation, such as plans, specs, and design, unless you can fully state that context in `task`.";
 
 const EXPECTED_RESULT =
-  "Before delegating, decide exactly what result you need back. State it in plain text in `task`, with any context from this conversation the subagent needs; it cannot see this conversation. How to reach the result is the subagent's business.";
+  "Before delegating, decide exactly what result you need back. State it in plain text in `task`, with every decision and constraint the subagent needs; it cannot see this conversation. How to reach the result is the subagent's business.";
 
 const PARALLELIZE =
-  "Parallelize aggressively. Whenever work splits into independent parts (separate areas, questions, or files), launch one subagent per part as multiple subagent calls in the same turn. They run concurrently. Parallel parts must not edit the same files. Delegating independent parts one after another wastes the user's time.";
+  "Launch independent parts as multiple subagent calls in the same turn; they run concurrently. Parallel parts must not edit the same files.";
 
 const OWNERSHIP =
   "A delegated task belongs to its subagent. Never do, duplicate, or redo it yourself; reviewing or spot-checking a result is not redoing it. If a result fails or falls short, re-delegate: use subagent_prompt on the same subagent when its context helps, otherwise spawn a new one with a sharper expected result. If re-delegation keeps failing, report to the user.";
