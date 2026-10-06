@@ -66,9 +66,9 @@ export function runInPane(paneId: PaneId, command: string): void {
 }
 
 /** Submit a normal user prompt to recognized Pi agent in a live pane. */
-export function promptPane(paneId: PaneId, message: string): void {
+export function promptPane(paneId: PaneId, message: string, agentDir?: string): void {
   assertTerminalAvailable();
-  sendHerdrAgentPrompt(paneId, message);
+  sendHerdrAgentPrompt(paneId, message, agentDir);
 }
 
 export function interruptPane(paneId: PaneId): void {

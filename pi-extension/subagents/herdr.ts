@@ -1,4 +1,7 @@
 import { execFile, execSync, execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -254,8 +257,25 @@ function buildAgentPromptArgs(surface: string, message: string): string[] {
 }
 
 /** Submit through Herdr agent API, preserving Pi editor input semantics. */
-export function sendHerdrAgentPrompt(surface: string, message: string): void {
+export function sendHerdrAgentPrompt(surface: string, message: string, agentDir?: string): void {
   herdrExec(buildAgentPromptArgs(surface, message));
+  // `agent prompt` ends with Enter. If Pi rebinds submit away from Enter, send the real key too.
+  const key = piSubmitKeyOverride(agentDir);
+  if (key) herdrExec(["agent", "send-keys", surface, key]);
+}
+
+/** First configured `tui.input.submit` key, or undefined when Enter submits (default). */
+export function piSubmitKeyOverride(agentDir?: string): string | undefined {
+  let configured: unknown;
+  try {
+    const dir = agentDir || process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+    configured = JSON.parse(readFileSync(join(dir, "keybindings.json"), "utf8"))["tui.input.submit"];
+  } catch {
+    return undefined; // missing/invalid config → defaults
+  }
+  const keys = (Array.isArray(configured) ? configured : [configured]).filter((k): k is string => typeof k === "string");
+  if (keys.length === 0 || keys.some((k) => k.toLowerCase() === "enter")) return undefined;
+  return keys[0];
 }
 
 export function sendHerdrEscape(surface: string): void {

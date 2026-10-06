@@ -1882,7 +1882,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           running.lifecycle = createLifecycle(running.startTime);
           try {
             startParentSubscription(running);
-            promptPane(running.surface, params.message);
+            promptPane(running.surface, params.message, running.agentDir);
           } catch (cause: any) {
             cancelParentSubscription(running, handle);
             running.inputLocked = false;
