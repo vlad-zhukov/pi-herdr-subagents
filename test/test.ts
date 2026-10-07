@@ -61,6 +61,7 @@ import {
   interpretExitSidecar,
   publishCompletion,
   waitForCompletion,
+  type CompletionPayload,
 } from "../pi-extension/subagents/completion.ts";
 import {
   finalizeAssignment,
@@ -2314,6 +2315,12 @@ describe("Assignment finalization policy", () => {
         expected: { disposition: "finalized", lifecycle: "failed", handle: "finalized", parentSubscription: "consume", pane: "close", delivery: "deliver", haltOrchestrator: false, removeFromRunning: true },
       },
       {
+        name: "cancelled Pi failure remains ordinary result",
+        state: { cli: "pi", autoExit: false, delivery: "pending" as const },
+        event: { kind: "result" as const, exitCode: 1, errorMessage: "cancelled" },
+        expected: { disposition: "finalized", lifecycle: "failed", handle: "finalized", parentSubscription: "consume", pane: "retain", delivery: "deliver", haltOrchestrator: false, removeFromRunning: true },
+      },
+      {
         name: "user abandonment suppresses later delivery",
         state: { cli: "pi", autoExit: false, delivery: "pending" as const },
         event: { kind: "abandonment" as const, reason: "user" as const },
@@ -2450,6 +2457,7 @@ describe("subagent parent lifecycle", () => {
       sessionFile: string;
       exitCode: number;
       elapsed: number;
+      errorMessage?: string;
     };
     type TestApi = {
       runtime: { pi?: MockApi; halted: boolean };
@@ -2458,6 +2466,15 @@ describe("subagent parent lifecycle", () => {
         completion: Promise<CompletionResult>,
         pi: MockApi,
       ): void;
+      deliverPromptCompletion(
+        running: Record<string, unknown>,
+        completion: Promise<CompletionResult>,
+        pi: MockApi,
+      ): void;
+      completionResultMetadata(
+        running: { cli?: string },
+        completion: CompletionPayload,
+      ): { exitCode: number; errorMessage?: string };
       runningSubagents: Map<string, unknown>;
       subagentHandles: Map<string, unknown>;
     };
@@ -2474,6 +2491,20 @@ describe("subagent parent lifecycle", () => {
         currentMessages.push({ message, options });
       },
     };
+    const rendererApi = createMockExtensionApi();
+    subagentsModule.default(rendererApi.api);
+    const renderer = rendererApi.registeredMessageRenderers.find((entry) => entry.name === "subagent_result");
+    assert.ok(renderer);
+    const theme = {
+      fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+      bg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+      bold: (text: string) => text,
+    };
+    const renderPublished = (message: SentMessage["message"]) => renderer.renderer(
+      { customType: "subagent_result", content: message.content, details: message.details },
+      { expanded: true },
+      theme,
+    ).render(120).join("\n");
     const originalPi = testApi.runtime.pi;
     const originalHalted = testApi.runtime.halted;
     const running = {
@@ -2487,6 +2518,7 @@ describe("subagent parent lifecycle", () => {
       cli: "pi",
       autoExit: false,
       interactive: false,
+      cwd: "/work/worker",
       lifecycle: createLifecycle(1),
     };
 
@@ -2511,6 +2543,7 @@ describe("subagent parent lifecycle", () => {
       assert.equal(currentMessages[0].message.details.exitCode, 0);
       assert.equal(currentMessages[0].message.details.sessionFile, running.sessionFile);
       assert.equal(currentMessages[0].options.deliverAs, "steer");
+      assert.match(renderPublished(currentMessages[0].message), /completed/);
       assert.equal(running.lifecycle.delivery, "delivered");
 
       const failed = {
@@ -2532,6 +2565,130 @@ describe("subagent parent lifecycle", () => {
       assert.match(currentMessages[1].message.content, /real failure/);
       assert.doesNotMatch(currentMessages[1].message.content, /completionApi/);
       assert.equal(currentMessages[1].options.deliverAs, "steer");
+      assert.equal(currentMessages[1].message.details.id, failed.id);
+      assert.equal(currentMessages[1].message.details.agent, failed.agent);
+      assert.equal(currentMessages[1].message.details.cwd, failed.cwd);
+      assert.equal(currentMessages[1].message.details.sessionFile, failed.sessionFile);
+      assert.equal(currentMessages[1].message.details.exitCode, 1);
+      assert.equal(currentMessages[1].message.details.errorMessage, "real failure");
+      assert.equal(typeof currentMessages[1].message.details.elapsed, "number");
+      assert.match(renderPublished(currentMessages[1].message), /failed/);
+
+      const continued = {
+        ...running,
+        id: "continuation-failed",
+        sessionFile: "/tmp/continuation-failed.jsonl",
+        cli: "claude",
+        lifecycle: createLifecycle(1),
+      };
+      testApi.deliverPromptCompletion(continued, Promise.reject<CompletionResult>("plain rejection"), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      assert.equal(currentMessages.length, 3);
+      assert.equal(currentMessages[2].message.details.id, continued.id);
+      assert.equal(currentMessages[2].message.details.agent, continued.agent);
+      assert.equal(currentMessages[2].message.details.cwd, continued.cwd);
+      assert.equal(currentMessages[2].message.details.sessionFile, continued.sessionFile);
+      assert.equal(currentMessages[2].message.details.exitCode, 1);
+      assert.equal(currentMessages[2].message.details.errorMessage, "plain rejection");
+      assert.equal(typeof currentMessages[2].message.details.elapsed, "number");
+      assert.match(renderPublished(currentMessages[2].message), /failed/);
+
+      const watcherError = {
+        ...running,
+        id: "watcher-error",
+        sessionFile: "/tmp/watcher-error.jsonl",
+        cli: "claude",
+        lifecycle: createLifecycle(1),
+      };
+      testApi.deliverInitialCompletion(watcherError, Promise.resolve({
+        name: watcherError.name,
+        task: watcherError.task,
+        summary: "watcher failed",
+        sessionFile: watcherError.sessionFile,
+        ...testApi.completionResultMetadata(watcherError, {
+          reason: "error",
+          exitCode: 1,
+          errorMessage: "Subagent pane disappeared",
+        }),
+        elapsed: 4,
+      }), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      assert.equal(currentMessages.length, 4);
+      assert.equal(currentMessages[3].message.details.errorMessage, "Subagent pane disappeared");
+      assert.equal(currentMessages[3].message.details.exitCode, 1);
+      const watcherRendered = renderPublished(currentMessages[3].message);
+      assert.match(watcherRendered, /failed/);
+      assert.doesNotMatch(watcherRendered, /provider\/agent|internal error/);
+
+      const providerFailure = {
+        ...running,
+        id: "provider-failed",
+        sessionFile: "/tmp/provider-failed.jsonl",
+        cli: "claude",
+        lifecycle: createLifecycle(1),
+      };
+      testApi.deliverInitialCompletion(providerFailure, Promise.resolve({
+        name: providerFailure.name,
+        task: providerFailure.task,
+        summary: "ignored",
+        sessionFile: providerFailure.sessionFile,
+        ...testApi.completionResultMetadata(providerFailure, {
+          reason: "error",
+          exitCode: 1,
+          errorMessage: "rate limited",
+        }),
+        elapsed: 5,
+      }), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const providerRendered = renderPublished(currentMessages[4].message);
+      assert.match(providerRendered, /failed/);
+      assert.match(providerRendered, /rate limited/);
+
+      const exited = { ...providerFailure, id: "exit-17", lifecycle: createLifecycle(1) };
+      testApi.deliverInitialCompletion(exited, Promise.resolve({
+        name: exited.name, task: exited.task, summary: "exit", sessionFile: exited.sessionFile, exitCode: 17, elapsed: 6,
+      }), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      assert.match(renderPublished(currentMessages[5].message), /failed \(exit 17\)/);
+
+      const continuedSuccess = { ...providerFailure, id: "continuation-success", lifecycle: createLifecycle(1) };
+      testApi.deliverPromptCompletion(continuedSuccess, Promise.resolve({
+        name: continuedSuccess.name, task: continuedSuccess.task, summary: "done", sessionFile: continuedSuccess.sessionFile, exitCode: 0, elapsed: 7,
+      }), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      assert.match(renderPublished(currentMessages[6].message), /completed/);
+
+      const continuedProvider = { ...providerFailure, id: "continuation-provider", lifecycle: createLifecycle(1) };
+      testApi.deliverPromptCompletion(continuedProvider, Promise.resolve({
+        name: continuedProvider.name, task: continuedProvider.task, summary: "ignored", sessionFile: continuedProvider.sessionFile,
+        ...testApi.completionResultMetadata(continuedProvider, { reason: "error", exitCode: 1, errorMessage: "overloaded" }), elapsed: 8,
+      }), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      assert.match(renderPublished(currentMessages[7].message), /failed/);
+
+      const continuedExit = { ...providerFailure, id: "continuation-exit", lifecycle: createLifecycle(1) };
+      testApi.deliverPromptCompletion(continuedExit, Promise.resolve({
+        name: continuedExit.name, task: continuedExit.task, summary: "exit", sessionFile: continuedExit.sessionFile, exitCode: 17, elapsed: 9,
+      }), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      assert.match(renderPublished(currentMessages[8].message), /failed \(exit 17\)/);
+
+      const whitespace = { ...providerFailure, id: "whitespace-error", lifecycle: createLifecycle(1) };
+      testApi.deliverInitialCompletion(whitespace, Promise.resolve({
+        name: whitespace.name, task: whitespace.task, summary: "done", sessionFile: whitespace.sessionFile,
+        exitCode: 0, elapsed: 10, errorMessage: " \t\n ",
+      }), previousApi);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      assert.match(currentMessages[9].message.content, /completed/);
+      assert.match(renderPublished(currentMessages[9].message), /completed/);
+      assert.equal(currentMessages[9].message.details.errorMessage, undefined);
+
+      assert.deepEqual(
+        testApi.completionResultMetadata({ cli: "pi" }, { reason: "sentinel", exitCode: 0 }),
+        { exitCode: 1, errorMessage: "Subagent Pi process exited before completion evidence was recorded." },
+      );
     } finally {
       testApi.runtime.pi = originalPi;
       testApi.runtime.halted = originalHalted;
@@ -2914,12 +3071,9 @@ describe("subagent result presentation", () => {
     assert.match(presentation, /Session: \/tmp\/subagent.jsonl/);
   });
 
-  it("renders a clear provider/agent error when errorMessage is set", () => {
-    // Previously, an overload retry-exhaustion produced exitCode 0 with a
-    // stale summary — the orchestrator thought the subagent finished
-    // quickly. With the error sidecar plumbed through, the presentation
-    // must call out the failure, include the underlying error, and tell the
-    // orchestrator how to recover.
+  it("renders a clear failure when errorMessage is set", () => {
+    // An errorMessage is canonical for provider and watcher failures. The
+    // presentation must not infer a source category from it.
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
       {
@@ -2933,7 +3087,7 @@ describe("subagent result presentation", () => {
     );
 
     assert.match(presentation, /Sub-agent "Worker" failed/);
-    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.doesNotMatch(presentation, /provider\/agent|internal error/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
     assert.match(presentation, /retry by spawning a new subagent/);
     assert.match(presentation, /Session: \/tmp\/subagent.jsonl/);
@@ -2942,6 +3096,32 @@ describe("subagent result presentation", () => {
 });
 
 describe("subagent result renderer", () => {
+  void it("classifies persisted errors, provider errors, exits, and success", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const renderer = registeredMessageRenderers.find((entry) => entry.name === "subagent_result");
+    assert.ok(renderer);
+    const theme = {
+      fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+      bg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+      bold: (text: string) => text,
+    };
+    const render = (details: object) => renderer.renderer(
+      { customType: "subagent_result", content: "done", details },
+      { expanded: true },
+      theme,
+    ).render(120).join("\n");
+
+    const persistedErrorMessage = render({ name: "Worker", errorMessage: "old watcher error" });
+    assert.match(persistedErrorMessage, /failed/);
+    assert.match(persistedErrorMessage, /<toolErrorBg>/);
+    assert.doesNotMatch(persistedErrorMessage, /\?|completed|provider\/agent|internal error/);
+
+    assert.match(render({ name: "Worker", exitCode: 0, errorMessage: "rate limited" }), /failed/);
+    assert.match(render({ name: "Worker", exitCode: 17 }), /failed \(exit 17\)/);
+    assert.match(render({ name: "Worker", exitCode: 0 }), /completed/);
+  });
+
   it("shows durable continuation instead of raw-session resume", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
     (subagentsModule as any).default(api);

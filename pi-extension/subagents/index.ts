@@ -27,6 +27,7 @@ import {
   beginCompletionChannel,
   cancelCompletionChannel,
   waitForCompletion,
+  type CompletionPayload,
 } from "./completion.ts";
 import { registerChildLifecycle } from "./child-lifecycle.ts";
 import {
@@ -456,23 +457,27 @@ function resolveResultPresentation(
     ? `\nContinue: subagent_prompt({ id: "${handleId}", message: "..." })`
     : "";
 
-  if (result.errorMessage) {
-    // Auto-retry exhausted or other agent-loop error. The subagent did not
-    // produce a usable result — surface the underlying provider/network
-    // failure so the orchestrator can decide whether to retry, resume, or
-    // change approach instead of silently treating the run as completed.
+  if (hasErrorMessage(result.errorMessage)) {
     return (
-      `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
-      `(provider/agent error — auto-retry exhausted).\n\n` +
+      `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)}.\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
       `subagent.${continuation}${sessionRef}`
     );
   }
 
-  return result.exitCode !== 0
+  return isSubagentFailure(result)
     ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${continuation}${sessionRef}`
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${continuation}${sessionRef}`;
+}
+
+function hasErrorMessage(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isSubagentFailure(details: { exitCode?: unknown; errorMessage?: unknown }): boolean {
+  return hasErrorMessage(details.errorMessage) ||
+    (typeof details.exitCode === "number" && details.exitCode !== 0);
 }
 
 /**
@@ -486,8 +491,7 @@ interface SubagentResult {
   claudeSessionId?: string;
   exitCode: number;
   elapsed: number;
-  error?: string;
-  /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
+  /** Failure reason from agent, watcher, or parent completion handling. */
   errorMessage?: string;
   ask?: { question: string };
 }
@@ -1169,6 +1173,19 @@ async function launchSubagent(
  * the summary from the session file, cleans up the surface,
  * and removes the entry from runningSubagents.
  */
+function completionResultMetadata(
+  running: Pick<RunningSubagent, "cli">,
+  result: CompletionPayload,
+): { exitCode: number; errorMessage?: string } {
+  const unexpectedPiExit = running.cli === "pi" && result.reason === "sentinel";
+  return {
+    exitCode: unexpectedPiExit ? 1 : result.exitCode,
+    ...(unexpectedPiExit
+      ? { errorMessage: "Subagent Pi process exited before completion evidence was recorded." }
+      : "errorMessage" in result ? { errorMessage: result.errorMessage } : {}),
+  };
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1199,11 +1216,7 @@ async function watchSubagent(
     }
     // A Pi child normally publishes its sidecar before leaving. Its bare shell
     // sentinel means Pi disappeared without settlement evidence, even at exit 0.
-    const unexpectedPiExit = running.cli === "pi" && result.reason === "sentinel";
-    const exitCode = unexpectedPiExit ? 1 : result.exitCode;
-    const errorMessage = unexpectedPiExit
-      ? "Subagent Pi process exited before completion evidence was recorded."
-      : result.errorMessage;
+    const { exitCode, errorMessage } = completionResultMetadata(running, result);
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
 
@@ -1227,6 +1240,7 @@ async function watchSubagent(
           elapsed,
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
           ...extracted.details,
+          ...(hasErrorMessage(errorMessage) ? { errorMessage } : {}),
         };
       }
     }
@@ -1284,7 +1298,7 @@ async function watchSubagent(
       exitCode: exitCode,
       elapsed,
       ask: result.ask,
-      ...(errorMessage ? { errorMessage: errorMessage } : {}),
+      ...(hasErrorMessage(errorMessage) ? { errorMessage } : {}),
     };
   } catch (err: any) {
     if (signal.aborted) {
@@ -1294,18 +1308,11 @@ async function watchSubagent(
         summary: "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        errorMessage: "cancelled",
         sessionFile,
       };
     }
-    return {
-      name,
-      task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
-      exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: err?.message ?? String(err),
-    };
+    return subagentErrorResult(running, err);
   }
 }
 
@@ -1362,7 +1369,7 @@ function applyAssignmentFinalization(
 ): AssignmentFinalizationOutcome {
   const event: AssignmentFinalizationEvent = result.ask
     ? { kind: "ask" }
-    : { kind: "result", exitCode: result.exitCode, ...(result.error ? { error: result.error } : {}) };
+    : { kind: "result", exitCode: result.exitCode, ...(hasErrorMessage(result.errorMessage) ? { errorMessage: result.errorMessage } : {}) };
   const outcome = finalizeAssignment(
     {
       cli: running.cli,
@@ -1372,19 +1379,35 @@ function applyAssignmentFinalization(
     },
     event,
   );
-  return applyAssignmentOutcome(running, outcome, result.errorMessage ?? result.error ?? result.summary, ctx, closePane, runningSubagents, result.exitCode);
+  return applyAssignmentOutcome(running, outcome, hasErrorMessage(result.errorMessage) ? result.errorMessage : result.summary, ctx, closePane, runningSubagents, result.exitCode);
 }
 
 function subagentErrorResult(running: RunningSubagent, cause: unknown): SubagentResult {
-  const error = (cause as any)?.message ?? String(cause);
+  const errorMessage = (cause as any)?.message ?? String(cause);
   return {
     name: running.name,
     task: running.task,
-    summary: `Subagent error: ${error}`,
+    summary: `Subagent error: ${errorMessage}`,
     sessionFile: running.sessionFile,
     exitCode: 1,
     elapsed: Math.floor((Date.now() - running.startTime) / 1000),
-    error,
+    errorMessage,
+  };
+}
+
+function resultDetails(running: RunningSubagent, result: SubagentResult, status?: string) {
+  return {
+    id: running.id,
+    name: running.name,
+    task: running.task,
+    ...(running.agent ? { agent: running.agent } : {}),
+    ...(running.cwd ? { cwd: running.cwd } : {}),
+    exitCode: result.exitCode,
+    elapsed: result.elapsed,
+    ...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
+    ...(hasErrorMessage(result.errorMessage) ? { errorMessage: result.errorMessage } : {}),
+    ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+    ...(status ? { status } : {}),
   };
 }
 
@@ -1427,15 +1450,7 @@ function deliverInitialCompletion(
           content: presentation,
           display: true,
           details: {
-            id: running.id,
-            name: running.name,
-            task: running.task,
-            agent: running.agent,
-            exitCode: result.exitCode,
-            elapsed: result.elapsed,
-            sessionFile: result.sessionFile,
-            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-            ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+            ...resultDetails(running, result),
             ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
           },
         },
@@ -1447,9 +1462,9 @@ function deliverInitialCompletion(
       selectCompletionApi(pi, runtime.pi).sendMessage(
         {
           customType: "subagent_result",
-          content: `Sub-agent "${running.name}" error: ${result.error}`,
+          content: `Sub-agent "${running.name}" error: ${result.errorMessage}`,
           display: true,
-          details: { name: running.name, task: running.task, error: result.error },
+          details: resultDetails(running, result),
         },
         completionDeliveryOptions(),
       );
@@ -1474,15 +1489,7 @@ function deliverPromptCompletion(
           customType: "subagent_result",
           content: resolveResultPresentation(result, running.name, running.id),
           display: true,
-          details: {
-            id: running.id,
-            name: running.name,
-            task: running.task,
-            exitCode: result.exitCode,
-            elapsed: result.elapsed,
-            sessionFile: result.sessionFile,
-            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-          },
+          details: resultDetails(running, result),
         },
         completionDeliveryOptions(),
       );
@@ -1493,9 +1500,9 @@ function deliverPromptCompletion(
       selectCompletionApi(pi, runtime.pi).sendMessage(
         {
           customType: "subagent_result",
-          content: `Sub-agent "${running.name}" error: ${result.error}`,
+          content: `Sub-agent "${running.name}" error: ${result.errorMessage}`,
           display: true,
-          details: { id: running.id, name: running.name, task: running.task, error: result.error },
+          details: resultDetails(running, result),
         },
         completionDeliveryOptions(),
       );
@@ -1743,16 +1750,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 ? resolveWaitAllResultPresentation(result, running.name, running.id)
                 : "Subagent completion suppressed.",
             }],
-            details: {
-              id: running.id,
-              name: running.name,
-              task: running.task,
-              agent: running.agent,
-              exitCode: result.exitCode,
-              elapsed: result.elapsed,
-              sessionFile: result.sessionFile,
-              status: outcome.disposition,
-            },
+            details: resultDetails(running, result, outcome.disposition),
           };
         }
 
@@ -1906,7 +1904,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const outcome = applyAssignmentFinalization(running, waited.result, ctx);
             return {
               content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, running.name, running.id) }],
-              details: { id: running.id, name: running.name, sessionFile: running.sessionFile, status: outcome.disposition },
+              details: resultDetails(running, waited.result, outcome.disposition),
             };
           }
           deliverPromptCompletion(running, completion, pi);
@@ -1936,7 +1934,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const outcome = applyAssignmentFinalization(resumed, waited.result, ctx);
           return {
             content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, resumed.name, resumed.id) }],
-            details: { id: resumed.id, name: resumed.name, sessionFile: resumed.sessionFile, status: outcome.disposition },
+            details: resultDetails(resumed, waited.result, outcome.disposition),
           };
         }
 
@@ -1999,9 +1997,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
-        const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
-        const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
+        const errorMessage = hasErrorMessage(details.errorMessage) ? details.errorMessage : "";
+        const failed = isSubagentFailure(details);
+        const elapsed = typeof details.elapsed === "number" ? formatElapsed(details.elapsed) : undefined;
         const bgFn = failed
           ? (text: string) => theme.bg("toolErrorBg", text)
           : (text: string) => theme.bg("toolSuccessBg", text);
@@ -2009,23 +2007,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ? theme.fg("error", "✗")
           : theme.fg("success", "✓");
         const status = errorMessage
-          ? "failed (provider/agent error)"
+          ? "failed"
           : failed
             ? `failed (exit ${exitCode})`
             : "completed";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
 
-        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status}${elapsed ? ` ${theme.fg("dim", `(${elapsed})`)}` : ""}`;
         const rawContent = typeof message.content === "string" ? message.content : "";
 
         // Clean summary (remove session ref and leading label for display)
         const summary = rawContent
           .replace(/\n\nSession: .+$/, "")
-          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
+          .replace(`Sub-agent "${name}" completed (${elapsed ?? ""}).\n\n`, "")
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
           .replace(
             new RegExp(
-              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
+              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed ?? ""}\\.\\n\\n`,
             ),
             "",
           );

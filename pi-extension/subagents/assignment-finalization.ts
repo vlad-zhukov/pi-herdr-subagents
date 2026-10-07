@@ -1,5 +1,5 @@
 export type AssignmentFinalizationEvent =
-  | { kind: "result"; exitCode: number; error?: string }
+  | { kind: "result"; exitCode: number; errorMessage?: string }
   | { kind: "ask" }
   | { kind: "abandonment"; reason: "automatic" | "user" };
 
@@ -53,7 +53,7 @@ export function finalizeAssignment(
   }
 
   const abandoned = event.kind === "abandonment" ||
-    (state.cli === "pi" && event.exitCode !== 0 && event.error !== "cancelled");
+    (state.cli === "pi" && event.exitCode !== 0 && event.errorMessage !== "cancelled");
   if (abandoned) {
     return {
       disposition: "abandoned",
