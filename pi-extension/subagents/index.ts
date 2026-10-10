@@ -1979,6 +1979,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   if (shouldRegister("subagent"))
     pi.registerTool({
       name: "subagent",
+      exposure: "model-only",
       label: "Subagent",
       description: SUBAGENT_TOOL_BLURB,
       promptSnippet: SUBAGENT_TOOL_BLURB,
@@ -2113,6 +2114,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   if (shouldRegister("subagent_prompt"))
     pi.registerTool({
       name: "subagent_prompt",
+      exposure: "model-only",
       label: "Continue Subagent",
       description:
         "Send follow-up work or an answer to an existing subagent by id; it keeps its full context. Use to answer its questions or to correct or extend its result.",

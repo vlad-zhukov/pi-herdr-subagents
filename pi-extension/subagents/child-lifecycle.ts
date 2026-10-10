@@ -167,6 +167,7 @@ export function registerChildLifecycle(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "subagent_ask",
+    exposure: "model-only",
     label: "Ask Question",
     description:
       "Ask a question without closing this session. " +

@@ -1471,6 +1471,7 @@ describe("child assignment lifecycle", () => {
       registerChildLifecycle(api);
       const ask = registeredTools.find((tool) => tool.name === "subagent_ask");
       assert.ok(ask);
+      assert.equal(ask.exposure, "model-only");
       assert.match(ask.promptGuidelines.join("\n"), /Do not end a task with an unresolved question/);
       const result = await ask.execute("ask-1", { question: "Use v1 or v2?" });
       assert.equal(result.terminate, true);
@@ -2106,22 +2107,26 @@ describe("tool registration", () => {
     });
   });
 
-  it("keeps lifecycle tools in the base process", () => {
+  it("keeps delegation tools model-only and ask absent in the base process", () => {
     delete process.env.PI_SUBAGENT_ID;
     process.env.PI_SUBAGENT_SPAWNING = "0";
     try {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
-      assert.equal(registeredTools.some((tool) => tool.name === "subagent"), true);
+      for (const name of ["subagent", "subagent_prompt"]) {
+        const tool = registeredTools.find((tool) => tool.name === name);
+        assert.ok(tool);
+        assert.equal(tool.exposure, "model-only");
+      }
+      assert.equal(registeredTools.some((tool) => tool.name === "subagent_ask"), false);
       assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), false);
       assert.equal(registeredTools.some((tool) => tool.name === "subagents_list"), false);
-      assert.equal(registeredTools.some((tool) => tool.name === "subagent_prompt"), true);
     } finally {
       delete process.env.PI_SUBAGENT_SPAWNING;
     }
   });
 
-  it("gates all lifecycle tools in a child process with spawning", () => {
+  it("omits delegation but retains ask in a child with spawning disabled", () => {
     process.env.PI_SUBAGENT_ID = "child-test";
     process.env.PI_SUBAGENT_SPAWNING = "0";
     try {
@@ -2133,6 +2138,7 @@ describe("tool registration", () => {
       ]) {
         assert.equal(registeredTools.some((tool) => tool.name === name), false);
       }
+      assert.ok(registeredTools.find((tool) => tool.name === "subagent_ask"));
       for (const name of ["subagent_interrupt", "subagents_list"]) {
         assert.equal(registeredTools.some((tool) => tool.name === name), false);
       }
@@ -2142,7 +2148,7 @@ describe("tool registration", () => {
     }
   });
 
-  it("allows all lifecycle tools in a child with spawning enabled", () => {
+  it("keeps delegation tools model-only and ask available in a child with spawning enabled", () => {
     process.env.PI_SUBAGENT_ID = "child-test";
     process.env.PI_SUBAGENT_SPAWNING = "1";
     try {
@@ -2152,8 +2158,11 @@ describe("tool registration", () => {
         "subagent",
         "subagent_prompt",
       ]) {
-        assert.equal(registeredTools.some((tool) => tool.name === name), true);
+        const tool = registeredTools.find((tool) => tool.name === name);
+        assert.ok(tool);
+        assert.equal(tool.exposure, "model-only");
       }
+      assert.ok(registeredTools.find((tool) => tool.name === "subagent_ask"));
       for (const name of ["subagent_interrupt", "subagents_list"]) {
         assert.equal(registeredTools.some((tool) => tool.name === name), false);
       }

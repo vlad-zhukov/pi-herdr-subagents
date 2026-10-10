@@ -73,20 +73,24 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus child-only finalization and help controls:
+**Subagents** — 2 base-session tools + 2 commands, plus child-only question and finalization controls:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Delegate work to a specialist subagent (`async` returns immediately; `wait-all` returns terminal result) |
 | `subagent_prompt`    | Continue prior Pi subagent session by immutable handle                                      |
+| `subagent_ask`       | Ask for help and end the current turn while waiting for a reply (child sessions only)        |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
-| `/plan`                    | Start a full planning workflow       |
 | `/iterate`                 | Fork into a subagent for quick fixes |
-| `/subagent <agent> <task>` | Spawn a named agent directly         |
+| `/subagent <agent> <task>` | Request named-agent delegation      |
+| `/subagent_finalize`       | Send child result after Pi is idle (child sessions only) |
 
-Child sessions additionally expose `/subagent_finalize`, which sends an interactive subagent result after Pi is idle.
+Base sessions have `subagent` and `subagent_prompt`; children retain these only
+with spawning enabled. Children always have `subagent_ask`. `/iterate` and
+`/subagent` are registered in both contexts and request model delegation;
+`/subagent_finalize` is child-only.
 
 ### Named Agents
 
@@ -255,26 +259,6 @@ Answer a reported question with original handle ID using `subagent_prompt`.
 
 ---
 
-## The `/plan` Workflow
-
-The `/plan` command orchestrates a full planning-to-implementation pipeline.
-
-```
-/plan Add a dark mode toggle to the settings page
-```
-
-```
-Phase 1: Investigation    → Quick codebase scan
-Phase 2: Planning         → Interactive planner subagent (user collaborates)
-Phase 3: Review Plan      → Confirm todos, adjust if needed
-Phase 4: Execute          → Scout + sequential workers implement todos
-Phase 5: Review           → Reviewer subagent checks all changes
-```
-
-The parent workspace and tab names stay unchanged. Subagents are created in newly named tabs or panes for each phase.
-
----
-
 ## The `/iterate` Workflow
 
 For quick, focused work without polluting the main session's context.
@@ -366,15 +350,29 @@ auto-exit: false
 
 ## Tool Access Control
 
+`subagent`, `subagent_prompt`, and `subagent_ask` are available only through
+direct model calls, not codemode. Pi's `model-only` exposure keeps their direct
+declarations available in both codemode modes (`on` and `only`), while excluding
+them from inline codemode declarations, `ALL_TOOLS`, `searchTools`,
+`describeTool`, and `describeNamespace`. Known-name script calls cannot invoke
+any of these tools.
+Spawning permissions remain unchanged: Orchestrators and children with
+`spawning: true` retain direct delegation access; children with spawning disabled
+have neither delegation tool. `subagent_ask` remains child-only and available
+regardless of spawning permission; question handling and Parent subscriptions
+are unchanged. Async and Wait-all behavior, command workflows, and unrelated
+tools are unchanged. Reload the extension or start a new session to apply this
+restriction.
+
 By default, child sessions cannot spawn further sub-agents. Set `spawning: true` when nested delegation is intentional:
 
 ### `spawning: true`
 
-Allows child sessions to use subagent lifecycle tools.
+Allows child sessions to use delegation tools (`subagent`, `subagent_prompt`).
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_prompt`):
+Denies delegation tools (`subagent`, `subagent_prompt`), but retains `subagent_ask`:
 
 ```yaml
 ---
