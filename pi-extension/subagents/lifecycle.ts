@@ -376,7 +376,7 @@ export function projectLifecycle(lifecycle: SubagentLifecycle, now: number): Lif
       return { kind: "waiting", stateDurationSince: turn.startedAt };
     case "starting":
       return { kind: "starting", stateDurationSince: turn.observedAt };
-    case "unknown":
+    default:
       return process.kind === "running" ? { kind: "running" } : { kind: "starting" };
   }
 }

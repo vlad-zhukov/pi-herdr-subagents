@@ -117,7 +117,7 @@ function getHerdrCurrentPaneInfo(): {
   return { pane_id: paneId, tab_id: tabId, workspace_id: workspaceId };
 }
 
-function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): string[] {
+function buildTabCreateArgs(name: string, cwd: string, workspaceId: string, focus = false): string[] {
   return [
     "tab",
     "create",
@@ -127,16 +127,16 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
     name,
     "--cwd",
     cwd,
-    "--no-focus",
+    focus ? "--focus" : "--no-focus",
   ];
 }
 
-export function createHerdrSurface(name: string): string {
+export function createHerdrSurface(name: string, focus = false): string {
   // Create a new tab per subagent so parallel spawns each get a full tab
   // instead of ever-narrower splits of the parent pane. Target the current
   // workspace explicitly because Herdr's implicit default may be another space.
   const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
-  const output = herdrExec(buildTabCreateArgs(name, process.cwd(), workspaceId));
+  const output = herdrExec(buildTabCreateArgs(name, process.cwd(), workspaceId, focus));
   const paneId = extractHerdrRootPaneId(output, "tab create");
   try {
     herdrExec(["pane", "rename", paneId, name]);
@@ -244,6 +244,97 @@ export async function inspectHerdrPane(surface: string): Promise<PaneInspectionR
   } catch (error: any) {
     return parsePaneGetError(error);
   }
+}
+
+export type PaneFocusOutcome =
+  | { kind: "focused" }
+  | { kind: "missing" | "unavailable"; code?: string }
+  | { kind: "error"; code?: string; panePresent?: true };
+
+type FocusEnvelope = {
+  error?: { code?: unknown };
+  result?: { pane?: { pane_id?: unknown; agent?: unknown }; agent?: { pane_id?: unknown; focused?: unknown } };
+};
+
+function parseFocusEnvelope(output: string): FocusEnvelope | null {
+  const parsed = parseHerdrJson(output);
+  return parsed && typeof parsed === "object" ? parsed : null;
+}
+
+function focusError(code?: string): Exclude<PaneFocusOutcome, { kind: "focused" }> {
+  if (code === "pane_not_found" || code === "tab_not_found") return { kind: "missing", code };
+  if (code === "server_not_running" || code === "ENOENT") return { kind: "unavailable", code };
+  return { kind: "error", ...(code ? { code } : {}) };
+}
+
+function focusEnvelopeError(envelope: FocusEnvelope | null): Exclude<PaneFocusOutcome, { kind: "focused" }> | undefined {
+  if (!envelope?.error) return undefined;
+  return focusError(typeof envelope.error.code === "string" ? envelope.error.code : undefined);
+}
+
+async function focusCommand(
+  args: string[],
+  run: typeof herdrExecAsync,
+): Promise<{ envelope: FocusEnvelope | null } | { failure: Exclude<PaneFocusOutcome, { kind: "focused" }> }> {
+  try {
+    const envelope = parseFocusEnvelope(await run(args));
+    const failure = focusEnvelopeError(envelope);
+    return failure ? { failure } : { envelope };
+  } catch (cause: unknown) {
+    if (cause && typeof cause === "object") {
+      for (const stream of [Reflect.get(cause, "stderr"), Reflect.get(cause, "stdout")]) {
+        if (typeof stream !== "string") continue;
+        const failure = focusEnvelopeError(parseFocusEnvelope(stream));
+        if (failure) return { failure };
+      }
+      if (Reflect.get(cause, "code") === "ENOENT") return { failure: focusError("ENOENT") };
+    }
+    return { failure: { kind: "error" } };
+  }
+}
+
+export type StrictPaneInspection =
+  | { kind: "present"; agent?: string }
+  | Exclude<PaneFocusOutcome, { kind: "focused" }>;
+
+function isValidPaneId(surface: string): boolean {
+  return typeof surface === "string" && !!surface.trim() && !surface.startsWith("-") &&
+    !surface.split("").some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127);
+}
+
+/** Only exact structured absence authorizes another saved-session writer. */
+export async function inspectHerdrPaneStrict(surface: string, run: typeof herdrExecAsync = herdrExecAsync): Promise<StrictPaneInspection> {
+  if (!isValidPaneId(surface)) return { kind: "error" };
+  if (run === herdrExecAsync && !isHerdrAvailable()) return { kind: "unavailable" };
+  const response = await focusCommand(["pane", "get", surface], run);
+  if ("failure" in response) return response.failure;
+  const pane = response.envelope?.result?.pane;
+  if (pane?.pane_id !== surface) return { kind: "error" };
+  if (pane.agent != null && typeof pane.agent !== "string") return { kind: "error" };
+  return { kind: "present", ...(typeof pane.agent === "string" && pane.agent.trim() ? { agent: pane.agent } : {}) };
+}
+
+async function inspectFocusTarget(surface: string, run: typeof herdrExecAsync): Promise<PaneFocusOutcome | undefined> {
+  const response = await focusCommand(["pane", "get", surface], run);
+  if ("failure" in response) return response.failure;
+  return response.envelope?.result?.pane?.pane_id === surface ? undefined : { kind: "error" };
+}
+
+/** Strict exact-pane focus; agent names and ambiguous absence never authorize selection. */
+export async function focusHerdrPane(surface: string, run: typeof herdrExecAsync = herdrExecAsync): Promise<PaneFocusOutcome> {
+  if (!isValidPaneId(surface)) return { kind: "error" };
+  if (run === herdrExecAsync && !isHerdrAvailable()) return { kind: "unavailable" };
+  const inspection = await inspectFocusTarget(surface, run);
+  if (inspection) return inspection;
+  const response = await focusCommand(["agent", "focus", surface], run);
+  if ("failure" in response) {
+    if (response.failure.kind === "error" && response.failure.code === "agent_not_found") {
+      return await inspectFocusTarget(surface, run) ?? { ...response.failure, panePresent: true };
+    }
+    return response.failure;
+  }
+  const agent = response.envelope?.result?.agent;
+  return agent?.pane_id === surface && agent.focused === true ? { kind: "focused" } : { kind: "error" };
 }
 
 export function sendHerdrCommand(surface: string, command: string): void {

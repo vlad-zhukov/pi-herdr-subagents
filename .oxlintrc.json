@@ -1,0 +1,39 @@
+{
+  "env": {
+    "deno": true,
+    "node": true,
+    "es2024": true
+  },
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "plugins": ["eslint", "import", "oxc", "node", "promise", "typescript", "unicorn"],
+  "options": {
+    "typeAware": true,
+    "typeCheck": false,
+    "reportUnusedDisableDirectives": "error"
+  },
+  "rules": {
+    "typescript/no-invalid-void-type": ["error", { "allowAsThisParameter": true }],
+    "import/export": "error",
+    "import/named": "error",
+    "import/no-amd": "error",
+    "import/no-commonjs": "error",
+    "import/no-cycle": ["error", { "maxDepth": 5 }],
+    "import/no-duplicates": "error",
+    "import/no-dynamic-require": "error",
+    "import/no-mutable-exports": "error",
+    "import/no-webpack-loader-syntax": "error",
+    "typescript/no-floating-promises": "off",
+    "node/no-process-env": "off",
+    "typescript/no-unsafe-type-assertion": "off",
+    "eslint/no-underscore-dangle": "off",
+    "unicorn/consistent-function-scoping": "off",
+    "eslint/no-shadow": "off",
+    "eslint/preserve-caught-error": "off",
+    "typescript/no-unnecessary-type-assertion": "off",
+    "unicorn/no-array-sort": "off",
+    "promise/always-return": "off"
+  }
+}

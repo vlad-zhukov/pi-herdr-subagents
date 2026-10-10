@@ -20,6 +20,7 @@ import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import {
   getAvailableBackends,
   setBackend,
@@ -110,6 +111,71 @@ async function waitForToolResult(env: TestEnv, pattern: RegExp, timeout: number)
   throw new Error(`Timed out waiting for a tool result matching ${pattern}.`);
 }
 
+function paneSessionFile(surface: string): string | undefined {
+  const output = execFileSync("herdr", ["pane", "get", surface], { encoding: "utf8" });
+  const parsed: unknown = JSON.parse(output);
+  const result: unknown = parsed && typeof parsed === "object" ? Reflect.get(parsed, "result") : undefined;
+  const pane: unknown = result && typeof result === "object" ? Reflect.get(result, "pane") : undefined;
+  if (!pane || typeof pane !== "object" || Reflect.get(pane, "pane_id") !== surface) return undefined;
+  const agentSession: unknown = Reflect.get(pane, "agent_session");
+  const sessionFile: unknown = agentSession && typeof agentSession === "object" ? Reflect.get(agentSession, "value") : undefined;
+  return typeof sessionFile === "string" ? sessionFile : undefined;
+}
+
+/** Count model-facing results by original call identity, not private text hidden by the TUI. */
+function assertWaitAllDelivery(surface: string, name: string, outcomes: Array<"completed" | "failed" | "asks">): void {
+  const sessionFile = paneSessionFile(surface);
+  assert.ok(sessionFile, "parent pane must report its native persisted session");
+  const entries = parseSessionEntries(readFileSync(sessionFile, "utf8"));
+  const messages = entries.flatMap((entry) => entry.type === "message" ? [entry.message] : []);
+  const calls = messages.flatMap((message) => message.role === "assistant"
+    ? message.content.filter((block) => block.type === "toolCall") : []);
+  const initialCalls = calls.filter((call) => call.name === "subagent" && call.arguments.name === name);
+  assert.equal(initialCalls.length, 1, "one initial call must own this assignment");
+  const results = messages.filter((message) => message.role === "toolResult");
+  const initialResults = results.filter((message) => message.toolCallId === initialCalls[0].id);
+  assert.equal(initialResults.length, 1, "initial call needs exactly one native result");
+  const initialDetails = initialResults[0].details;
+  assert.ok(initialDetails && typeof initialDetails === "object");
+  const handleId: unknown = Reflect.get(initialDetails, "id");
+  assert.equal(typeof handleId, "string");
+  const assignmentCalls = [initialCalls[0], ...calls.filter((call) =>
+    call.name === "subagent_prompt" && call.arguments.id === handleId)];
+  assert.equal(assignmentCalls.length, outcomes.length, "one original call per observed turn");
+  for (const [index, call] of assignmentCalls.entries()) {
+    const ownResults = results.filter((message) => message.toolCallId === call.id);
+    assert.equal(ownResults.length, 1, "each original call needs exactly one native result");
+    const ownResult = ownResults[0];
+    assert.equal(ownResult.toolName, call.name);
+    const text = ownResult.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n");
+    assert.ok(text.includes(`Sub-agent "${name}" ${outcomes[index]}`), text);
+    const details = ownResult.details;
+    assert.ok(details && typeof details === "object");
+    assert.equal(Reflect.get(details, "id"), handleId);
+    assert.equal(Reflect.get(details, "name"), name);
+    assert.equal(Reflect.get(details, "async"), false);
+    assert.equal(Reflect.get(details, "status"), outcomes[index] === "asks" ? "awaiting_answer" : "finalized");
+    assert.equal(typeof Reflect.get(details, "elapsed"), "number");
+    assert.equal(Reflect.get(details, "exitCode"), outcomes[index] === "failed" ? 1 : 0);
+    assert.equal(Reflect.get(details, "task"), call.arguments.task ?? call.arguments.message);
+    if (outcomes[index] === "asks") assert.match(text, /PING/);
+    else if (call.arguments.agent === "test-echo" || call.name === "subagent_prompt") {
+      const childSessionFile: unknown = Reflect.get(details, "sessionFile");
+      assert.ok(typeof childSessionFile === "string");
+      const childMessages = parseSessionEntries(readFileSync(childSessionFile, "utf8")).flatMap((entry) =>
+        entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "stop" ? [entry.message] : []);
+      const summary = childMessages[index]?.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n");
+      assert.ok(summary, "child must have a nonempty final response");
+      assert.ok(text.includes(summary), "original result must retain full private child response for the model");
+    }
+  }
+  assert.deepEqual(entries.filter((entry) => entry.type === "custom_message" &&
+    (entry.customType === "subagent_result" || entry.customType === "subagent_ask") &&
+    ((entry.details && typeof entry.details === "object" && Reflect.get(entry.details, "id") === handleId) ||
+      JSON.stringify(entry.content).includes(name))),
+  [], "wait-all must not duplicate original results as completion steer messages");
+}
+
 function workspacePaneIds(env: TestEnv): string[] {
   const output = execFileSync("herdr", ["pane", "list", "--workspace", env.workspaceId], { encoding: "utf8" });
   const parsed = JSON.parse(output) as { result?: { panes?: Array<{ pane_id?: unknown }> } };
@@ -135,7 +201,7 @@ async function waitForHandleId(surface: string, timeout: number): Promise<string
     const parsed = JSON.parse(output) as { result?: { pane?: { agent_session?: { value?: unknown } } } };
     const sessionFile = parsed.result?.pane?.agent_session?.value;
     if (typeof sessionFile === "string" && existsSync(sessionFile)) {
-      for (const entry of readSessionEntries(sessionFile).reverse()) {
+      for (const entry of readSessionEntries(sessionFile).toReversed()) {
         const id = entry.data?.handle?.id;
         if (entry.customType === "subagent_handle" && typeof id === "string") return id;
       }
@@ -333,9 +399,8 @@ for (const backend of backends) {
       assert.match(parent, new RegExp(`PARENT_${id}`));
       assert.equal(existsSync(childFile), true, "child must finish before parent continues");
       assert.match(readFileSync(childFile, "utf8"), new RegExp(`CHILD_${id}`));
-      const screen = await waitForScreen(surface, /WAIT_ALL_COMPLETE/, PI_TIMEOUT);
-      const completed = screen.match(new RegExp(`Sub-agent "WaitAll-${id}" completed`, "g")) ?? [];
-      assert.equal(completed.length, 1, "wait-all must return one terminal result without a completion steer");
+      await waitForScreen(surface, /WAIT_ALL_COMPLETE/, PI_TIMEOUT);
+      assertWaitAllDelivery(surface, `WaitAll-${id}`, ["completed"]);
     });
 
 
@@ -362,12 +427,8 @@ for (const backend of backends) {
 
       await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
       assert.match(await waitForFile(resumedFile, PI_TIMEOUT, /RESUMED_/), new RegExp(`RESUMED_${id}`));
-      const screen = await waitForScreen(surface, /RESUME_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
-      assert.equal(
-        (screen.match(new RegExp(`Sub-agent "${firstName}" completed`, "g")) ?? []).length,
-        2,
-        "continued subagent needs one completion per turn",
-      );
+      await waitForScreen(surface, /RESUME_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
+      assertWaitAllDelivery(surface, firstName, ["completed", "completed"]);
     });
 
     it("wait-all settles a parallel batch with distinct success and failure results", async () => {
@@ -413,17 +474,9 @@ for (const backend of backends) {
         "siblings must launch concurrently, not after each other's terminal result",
       );
 
-      const screen = await waitForScreen(surface, /PARALLEL_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
-      assert.equal(
-        (screen.match(new RegExp(`Sub-agent "${successName}" completed`, "g")) ?? []).length,
-        1,
-        "successful sibling needs one original-call result",
-      );
-      assert.equal(
-        (screen.match(new RegExp(`Sub-agent "${failureName}" failed`, "g")) ?? []).length,
-        1,
-        "failed sibling needs one original-call result",
-      );
+      await waitForScreen(surface, /PARALLEL_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
+      assertWaitAllDelivery(surface, successName, ["completed"]);
+      assertWaitAllDelivery(surface, failureName, ["failed"]);
     });
 
     // ── In-progress activity snapshots ──
@@ -612,12 +665,8 @@ for (const backend of backends) {
       ].join("\n"));
 
       await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
-      const screen = await waitForScreen(surface, /WAIT_ALL_ASK_COMPLETE/, PI_TIMEOUT);
-      assert.equal(
-        (screen.match(new RegExp(`Sub-agent "${name}" asks`, "g")) ?? []).length,
-        1,
-        "subagent_ask needs one original-call result without a steer duplicate",
-      );
+      await waitForScreen(surface, /WAIT_ALL_ASK_COMPLETE/, PI_TIMEOUT);
+      assertWaitAllDelivery(surface, name, ["asks"]);
     });
 
     // ── Agent discovery ──

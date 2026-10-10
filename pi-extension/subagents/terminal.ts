@@ -9,6 +9,8 @@ import {
   readHerdrScreen,
   readHerdrScreenAsync,
   inspectHerdrPane,
+  inspectHerdrPaneStrict,
+  focusHerdrPane,
   renameHerdrTab,
   renameHerdrWorkspace,
   reportHerdrPaneTask,
@@ -39,9 +41,9 @@ export function shellQuote(value: string): string {
 }
 
 /** Create a new herdr tab and return its root pane ID. */
-export function createSubagentPane(name: string): PaneId {
+export function createSubagentPane(name: string, focus = false): PaneId {
   assertTerminalAvailable();
-  return createHerdrSurface(name);
+  return createHerdrSurface(name, focus);
 }
 
 /** Split the current herdr pane and return the child pane ID. */
@@ -79,7 +81,7 @@ export function interruptPane(paneId: PaneId): void {
 export function runScriptInPane(
   paneId: PaneId,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; beforeSend?: () => void },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -95,6 +97,7 @@ export function runScriptInPane(
   scriptLines.push(command);
   writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
 
+  options?.beforeSend?.();
   runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
   return scriptPath;
 }
@@ -118,6 +121,16 @@ export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.t
     return { kind: "present", observedAt: Date.now(), ...result };
   }
   return result;
+}
+
+export type { PaneFocusOutcome, StrictPaneInspection } from "./herdr.ts";
+
+export async function inspectPaneStrict(paneId: PaneId): Promise<import("./herdr.ts").StrictPaneInspection> {
+  return inspectHerdrPaneStrict(paneId);
+}
+
+export async function focusPane(paneId: PaneId): Promise<import("./herdr.ts").PaneFocusOutcome> {
+  return focusHerdrPane(paneId);
 }
 
 export function closePane(paneId: PaneId): void {

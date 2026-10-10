@@ -1,31 +1,35 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { Box, Text, matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
   readFileSync,
   existsSync,
   mkdirSync,
+  statSync,
 } from "node:fs";
 import {
-  isTerminalAvailable,
+  isTerminalAvailable as defaultIsTerminalAvailable,
   terminalSetupHint,
-  createSubagentPane,
+  createSubagentPane as defaultCreateSubagentPane,
   runScriptInPane,
-  closePane,
-  promptPane,
+  closePane as defaultClosePane,
+  promptPane as defaultPromptPane,
+  focusPane as defaultFocusPane,
   shellQuote,
   readPane,
   readPaneAsync,
   inspectPane,
+  inspectPaneStrict as defaultInspectPaneStrict,
   setPaneTask,
 } from "./terminal.ts";
 import {
   beginCompletionChannel,
   cancelCompletionChannel,
+  removeEmptyCompletionChannel,
   waitForCompletion,
   type CompletionPayload,
 } from "./completion.ts";
@@ -53,7 +57,7 @@ import {
   getHarnessDriver,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
-  launchPiContinuation,
+  launchPiContinuation as defaultLaunchPiContinuation,
 } from "./harness/index.ts";
 import {
   getAgentConfigDir,
@@ -88,6 +92,12 @@ import {
   saveSubagentHandle,
   type SubagentHandle,
 } from "./assignment-handles.ts";
+import {
+  presentationFromRecordedDetails,
+  renderSubagentPresentation,
+  subagentMouseRegion,
+  type SubagentPresentation,
+} from "./subagent-ui.ts";
 import {
   createLifecycle,
   markCompleted,
@@ -179,8 +189,8 @@ function validateAgentKnown(agent: string | undefined): string | null {
   return `Unknown agent "${agent}". Available: ${available.join(", ") || "none"}`;
 }
 
-function errorResult(error: string) {
-  return { content: [{ type: "text" as const, text: error }], details: { error } };
+function errorResult(errorMessage: string) {
+  return { content: [{ type: "text" as const, text: errorMessage }], details: { errorMessage } };
 }
 
 interface AgentDefaults {
@@ -223,7 +233,10 @@ function resolveSpawning(agentDefs: AgentDefaults | null): boolean {
 
 function getFrontmatterValue(frontmatter: Record<string, unknown>, key: string): string | undefined {
   const value = frontmatter[key];
-  return value == null || typeof value === "object" ? undefined : String(value).trim();
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint" || typeof value === "symbol") return String(value).trim();
+  if (typeof value === "function") return value.toString().trim();
+  return undefined;
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
@@ -426,7 +439,7 @@ function muxUnavailableResult() {
         text: `Subagents require herdr. ${terminalSetupHint()}`,
       },
     ],
-    details: { error: "herdr not available" },
+    details: { errorMessage: "herdr not available" },
   };
 }
 
@@ -475,9 +488,10 @@ function hasErrorMessage(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function isSubagentFailure(details: { exitCode?: unknown; errorMessage?: unknown }): boolean {
-  return hasErrorMessage(details.errorMessage) ||
-    (typeof details.exitCode === "number" && details.exitCode !== 0);
+function isSubagentFailure(details: object): boolean {
+  const errorMessage = Reflect.get(details, "errorMessage");
+  const exitCode = Reflect.get(details, "exitCode");
+  return hasErrorMessage(errorMessage) || (typeof exitCode === "number" && exitCode !== 0);
 }
 
 /**
@@ -544,6 +558,8 @@ interface RunningSubagent {
   spawning?: boolean;
   inputLocked?: boolean;
   abandoned?: boolean;
+  /** Parent tool-call identity for the current assignment. */
+  initialToolCallId?: string;
 }
 
 interface SubagentRuntime {
@@ -553,10 +569,12 @@ interface SubagentRuntime {
   latestCtx?: ExtensionContext;
   halted?: boolean;
   stopTerminalInput?: () => void;
+  launchGates: Map<string, Promise<void>>;
+  shuttingDown?: boolean;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
-  return { runningSubagents: new Map<string, RunningSubagent>(), handles: new Map() };
+  return { runningSubagents: new Map<string, RunningSubagent>(), handles: new Map(), launchGates: new Map() };
 }
 
 /** Upgrade reload-persisted runtime objects without replacing old watcher references. */
@@ -565,6 +583,8 @@ function ensureSubagentRuntime(value: Partial<SubagentRuntime> | undefined): Sub
   runtime.runningSubagents ??= new Map<string, RunningSubagent>();
   runtime.handles ??= new Map<string, SubagentHandle>();
   runtime.halted ??= false;
+  runtime.launchGates ??= new Map();
+  runtime.shuttingDown ??= false;
   return runtime as SubagentRuntime;
 }
 
@@ -574,9 +594,13 @@ const runtime = ensureSubagentRuntime((globalThis as any)[RUNTIME_KEY]);
 const runningSubagents = runtime.runningSubagents;
 const subagentHandles = runtime.handles;
 
+function initialRunningSubagent(toolCallId: string): RunningSubagent | undefined {
+  return Array.from(runningSubagents.values()).find((running) => running.initialToolCallId === toolCallId);
+}
+
 function saveHandle(handle: SubagentHandle): void {
-  subagentHandles.set(handle.id, handle);
   if (runtime.pi?.appendEntry) saveSubagentHandle(runtime.pi.appendEntry.bind(runtime.pi), handle);
+  subagentHandles.set(handle.id, handle);
 }
 
 function rememberPiHandle(running: RunningSubagent): void {
@@ -634,25 +658,41 @@ export function cleanupSubagentsForShutdown(
   agents.clear();
 }
 
+function userAbandonmentOutcome(running: RunningSubagent): AssignmentFinalizationOutcome {
+  return finalizeAssignment(
+    {
+      cli: running.cli,
+      autoExit: running.autoExit,
+      abandoned: running.abandoned,
+      delivery: running.lifecycle.delivery,
+    },
+    { kind: "abandonment", reason: "user" },
+  );
+}
+
 /** User Escape abandons every running Assignment; pane closure remains best effort. */
 export function abandonAllSubagents(
   ctx: Pick<ExtensionContext, "abort"> | undefined = runtime.latestCtx,
   agents: Map<string, RunningSubagent> = runningSubagents,
   close: (surface: string) => void = closePane,
 ): number {
+  const pi = runtime.pi;
+  if (!pi && Array.from(agents.values()).some((running) => userAbandonmentOutcome(running).disposition === "abandoned")) {
+    throw new Error("Subagent outcome requires an initialized extension runtime.");
+  }
+
   let abandoned = 0;
   for (const running of Array.from(agents.values())) {
-    const outcome = finalizeAssignment(
-      {
-        cli: running.cli,
-        autoExit: running.autoExit,
-        abandoned: running.abandoned,
-        delivery: running.lifecycle.delivery,
-      },
-      { kind: "abandonment", reason: "user" },
-    );
+    const outcome = userAbandonmentOutcome(running);
     applyAssignmentOutcome(running, outcome, "Abandoned by user.", ctx, close, agents);
-    abandoned += 1;
+    if (outcome.disposition === "abandoned" && pi) {
+      pi.appendEntry("subagent_outcome", resultDetails(running, {
+        sessionFile: running.sessionFile,
+        elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+        errorMessage: "Abandoned by user.",
+      }, "abandoned"));
+      abandoned += 1;
+    }
   }
   updateWidget();
   return abandoned;
@@ -982,12 +1022,41 @@ export const __test__ = {
   clearOrchestratorHalt,
   completionDeliveryOptions,
   deliverInitialCompletion,
+  deliverPromptCompletion,
+  completionResultMetadata,
+  presentationFromDetails,
+  setFocusTestAdapter(focus?: typeof focusPane): void {
+    focusPane = focus ?? defaultFocusPane;
+  },
+  setExecutionTestAdapters(
+    launch: typeof launchSubagent | undefined,
+    watch: typeof watchSubagent | undefined,
+    terminalAvailable: (() => boolean) | undefined,
+    prompt?: typeof promptPane,
+    continuationLaunch?: typeof launchPiContinuation,
+  ): void {
+    launchSubagent = launch ?? defaultLaunchSubagent;
+    watchSubagent = watch ?? defaultWatchSubagent;
+    isTerminalAvailable = terminalAvailable ?? defaultIsTerminalAvailable;
+    promptPane = prompt ?? defaultPromptPane;
+    launchPiContinuation = continuationLaunch ?? defaultLaunchPiContinuation;
+  },
+  setInspectionTestAdapters(adapters: {
+    inspectPaneStrict?: typeof inspectPaneStrict;
+    createSubagentPane?: typeof createSubagentPane;
+    closePane?: typeof closePane;
+  } = {}): void {
+    inspectPaneStrict = adapters.inspectPaneStrict ?? defaultInspectPaneStrict;
+    createSubagentPane = adapters.createSubagentPane ?? defaultCreateSubagentPane;
+    closePane = adapters.closePane ?? defaultClosePane;
+  },
+  activateSubagent,
   runtime,
 };
 
 function startWidgetRefresh() {
+  updateWidget();
   if (widgetInterval) return;
-  updateWidget(); // immediate first render
   widgetInterval = setInterval(() => {
     updateWidget();
   }, 1000);
@@ -1003,7 +1072,7 @@ function startWidgetRefresh() {
 /** Tool params with the display name already resolved. */
 type LaunchParams = Static<typeof SubagentParams> & { name: string };
 
-async function launchSubagent(
+async function defaultLaunchSubagent(
   params: LaunchParams,
   ctx: {
     sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
@@ -1017,7 +1086,7 @@ async function launchSubagent(
     };
   },
   parentThinking: ThinkingLevel,
-  options?: { surface?: string },
+  options?: { surface?: string; toolCallId?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1162,6 +1231,7 @@ async function launchSubagent(
       : createLifecycle(startTime),
     // Initial task already owns child input until Pi reports settlement.
     inputLocked: driver.id === "pi",
+    ...(options?.toolCallId ? { initialToolCallId: options.toolCallId } : {}),
   };
 
   runningSubagents.set(id, running);
@@ -1186,7 +1256,7 @@ function completionResultMetadata(
   };
 }
 
-async function watchSubagent(
+async function defaultWatchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
@@ -1316,6 +1386,16 @@ async function watchSubagent(
   }
 }
 
+let launchSubagent = defaultLaunchSubagent;
+let watchSubagent = defaultWatchSubagent;
+let isTerminalAvailable = defaultIsTerminalAvailable;
+let promptPane = defaultPromptPane;
+let focusPane = defaultFocusPane;
+let inspectPaneStrict = defaultInspectPaneStrict;
+let createSubagentPane = defaultCreateSubagentPane;
+let closePane = defaultClosePane;
+let launchPiContinuation = defaultLaunchPiContinuation;
+
 export function shouldClosePaneAfterFinalization(
   running: Pick<RunningSubagent, "autoExit">,
 ): boolean {
@@ -1334,6 +1414,7 @@ function applyAssignmentOutcome(
   agents: Map<string, RunningSubagent> = runningSubagents,
   exitCode = 1,
 ): AssignmentFinalizationOutcome {
+  running.initialToolCallId = undefined;
   if (outcome.lifecycle === "completed") running.lifecycle = markCompleted(running.lifecycle, Date.now());
   if (outcome.lifecycle === "failed") running.lifecycle = markFailed(running.lifecycle, reason, Date.now(), exitCode);
   if (outcome.delivery === "suppress") running.lifecycle = markDelivery(running.lifecycle, "suppressed");
@@ -1395,15 +1476,21 @@ function subagentErrorResult(running: RunningSubagent, cause: unknown): Subagent
   };
 }
 
-function resultDetails(running: RunningSubagent, result: SubagentResult, status?: string) {
+function resultDetails(
+  running: RunningSubagent,
+  result: Partial<Pick<SubagentResult, "elapsed" | "sessionFile" | "errorMessage" | "claudeSessionId" | "exitCode">>,
+  status?: string,
+) {
   return {
     id: running.id,
     name: running.name,
     task: running.task,
     ...(running.agent ? { agent: running.agent } : {}),
     ...(running.cwd ? { cwd: running.cwd } : {}),
-    exitCode: result.exitCode,
-    elapsed: result.elapsed,
+    ...(running.orchestrationMode ? { async: running.orchestrationMode === "async" } : {}),
+    ...(running.surface ? { surface: running.surface } : {}),
+    ...(typeof result.exitCode === "number" ? { exitCode: result.exitCode } : {}),
+    ...(typeof result.elapsed === "number" ? { elapsed: result.elapsed } : {}),
     ...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
     ...(hasErrorMessage(result.errorMessage) ? { errorMessage: result.errorMessage } : {}),
     ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
@@ -1418,7 +1505,7 @@ function sendSubagentAsk(pi: ExtensionAPI, running: RunningSubagent, result: Sub
       customType: "subagent_ask",
       content: `Sub-agent "${running.name}" asks (${formatElapsed(result.elapsed)}):\n\n${question}\nContinue: subagent_prompt({ id: "${running.id}", message: "..." })`,
       display: true,
-      details: { id: running.id, name: running.name, question, agent: running.agent, sessionFile: result.sessionFile },
+      details: { ...resultDetails(running, result), question },
     },
     completionDeliveryOptions(),
   );
@@ -1458,7 +1545,8 @@ function deliverInitialCompletion(
       );
     } catch (err: unknown) {
       const result = subagentErrorResult(running, err);
-      if (applyAssignmentFinalization(running, result).delivery === "suppress") return;
+      const outcome = applyAssignmentFinalization(running, result);
+      if (outcome.delivery === "suppress") return;
       selectCompletionApi(pi, runtime.pi).sendMessage(
         {
           customType: "subagent_result",
@@ -1510,19 +1598,118 @@ function deliverPromptCompletion(
   );
 }
 
+// ponytail: process-local gates; separate parent processes need external coordination.
+async function acquireLaunchGate(id: string): Promise<() => void> {
+  const previous = runtime.launchGates.get(id);
+  let unlock!: () => void;
+  const barrier = new Promise<void>((done) => { unlock = done; });
+  runtime.launchGates.set(id, barrier);
+  if (previous) await previous;
+  return () => {
+    if (runtime.launchGates.get(id) === barrier) runtime.launchGates.delete(id);
+    unlock();
+  };
+}
+
+function ownsParentSession(parentId: string | undefined): boolean {
+  // Captured context getters invalidate on reload; only the current native id owns work.
+  try {
+    return typeof parentId === "string" && !!parentId.trim() && !runtime.shuttingDown &&
+      runtime.latestCtx?.sessionManager?.getSessionId?.() === parentId;
+  } catch {
+    return false;
+  }
+}
+
+function requireParentSession(parentId: string | undefined): void {
+  if (!ownsParentSession(parentId)) throw new Error("Parent session changed or is shutting down.");
+}
+
+/** Pi owns format validation; missing or empty files would create a fresh session. */
+function validateSavedPiSession(handle: SubagentHandle): void {
+  if (!handle.cwd?.trim() || !isAbsolute(handle.cwd) || !isAbsolute(handle.sessionFile) || !statSync(handle.cwd).isDirectory()) {
+    throw new Error("Saved Pi session or working directory is unavailable.");
+  }
+  const file = statSync(handle.sessionFile);
+  if (!file.isFile() || file.size === 0) throw new Error("Saved Pi session is unavailable or empty.");
+}
+
+function closeOwnedEmptyPane(surface: string): void {
+  try { closePane(surface); } catch { /* Never broaden cleanup to another target. */ }
+}
+
+function cancelOwnedCompletionChannel(sessionFile: string): void {
+  try { cancelCompletionChannel(sessionFile); } catch { /* Keep the original pre-dispatch failure. */ }
+}
+
+/** Caller owns the new target only until the synchronous send boundary. */
+async function launchSavedPiSession(
+  handle: SubagentHandle,
+  parentId: string | undefined,
+  message?: string,
+): Promise<Awaited<ReturnType<typeof launchPiContinuation>> | { failure: unknown }> {
+  let surface: string | undefined;
+  let channelOpened = false;
+  let dispatchAttempted = false;
+  try {
+    requireParentSession(parentId);
+    if (runningSubagents.has(handle.id)) throw new Error("Subagent still has a running owner.");
+    validateSavedPiSession(handle);
+    if (message === undefined) removeEmptyCompletionChannel(handle.sessionFile);
+    surface = createSubagentPane(handle.name, message === undefined);
+    requireParentSession(parentId);
+    const fresh = subagentHandles.get(handle.id);
+    if (!fresh || fresh.sessionFile !== handle.sessionFile || fresh.cwd !== handle.cwd || fresh.surface !== handle.surface || runningSubagents.has(handle.id)) {
+      throw new Error("Subagent target changed.");
+    }
+    if (!runtime.pi?.appendEntry) throw new Error("Cannot persist subagent target.");
+    const saved = { ...fresh, surface };
+    saveHandle(saved);
+    if (message !== undefined) {
+      beginCompletionChannel(saved.sessionFile);
+      channelOpened = true;
+    }
+    const launched = await launchPiContinuation({
+      handle: saved,
+      message,
+      surface,
+      artifactDir: getArtifactDir(runtime.latestCtx!.sessionManager.getSessionDir(), parentId!),
+      shellReadyDelayMs: getShellReadyDelayMs(),
+      beforeSend() {
+        requireParentSession(parentId);
+        const current = subagentHandles.get(saved.id);
+        if (!current || current.surface !== surface || current.sessionFile !== saved.sessionFile || current.cwd !== saved.cwd || runningSubagents.has(saved.id)) {
+          throw new Error("Subagent target changed.");
+        }
+        validateSavedPiSession(current);
+        if (message !== undefined) {
+          const error = handlePromptError(current, false);
+          if (error) throw new Error(error);
+        }
+        dispatchAttempted = true;
+      },
+    });
+    return launched;
+  } catch (cause) {
+    if (dispatchAttempted) throw cause;
+    if (surface !== undefined) closeOwnedEmptyPane(surface);
+    if (channelOpened) cancelOwnedCompletionChannel(handle.sessionFile);
+    return { failure: cause };
+  }
+}
+
 async function reopenPiSubagent(
   handle: SubagentHandle,
   message: string,
-  ctx: Pick<ExtensionContext, "sessionManager">,
-): Promise<RunningSubagent> {
-  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
-  beginCompletionChannel(handle.sessionFile);
-  const launched = await launchPiContinuation({
-    handle,
-    message,
-    artifactDir,
-    shellReadyDelayMs: getShellReadyDelayMs(),
-  });
+  parentId: string | undefined,
+): Promise<RunningSubagent | { failure: unknown }> {
+  const launched = await launchSavedPiSession(handle, parentId, message);
+  if ("failure" in launched) return launched;
+  requireParentSession(parentId);
+  const fresh = subagentHandles.get(handle.id);
+  if (!fresh || fresh.surface !== launched.surface) throw new Error("Subagent target changed.");
+  const error = handlePromptError(fresh, false);
+  if (error) throw new Error(error);
   const startTime = Date.now();
   const running: RunningSubagent = {
     id: handle.id,
@@ -1547,7 +1734,7 @@ async function reopenPiSubagent(
     inputLocked: true,
   };
   runningSubagents.set(handle.id, running);
-  saveHandle({ ...handle, surface: launched.surface, state: "active", subscribed: true });
+  saveHandle({ ...fresh, state: "active", subscribed: true });
   return running;
 }
 
@@ -1579,7 +1766,6 @@ function attachLivePiSubagent(
     lifecycle: createLifecycle(startTime),
     inputLocked: true,
   };
-  runningSubagents.set(handle.id, running);
   return running;
 }
 
@@ -1593,6 +1779,135 @@ function cancelParentSubscription(running: RunningSubagent, previous: SubagentHa
   saveHandle({ ...previous, surface: running.surface, subscribed: false });
 }
 
+function presentationFromRunning(running: RunningSubagent): SubagentPresentation {
+  const projection = projectLifecycle(ensureLifecycle(running), Date.now());
+  return {
+    name: running.name,
+    agent: running.agent,
+    cwd: running.cwd,
+    state: projection.kind,
+    elapsed: formatElapsed(Math.floor((Date.now() - running.startTime) / 1000)),
+    async: running.orchestrationMode !== "wait-all",
+  };
+}
+
+function presentationFromDetails(details: object, toolCallId?: string, isError = false): SubagentPresentation {
+  const failed = isError || isSubagentFailure(details);
+  const status = Reflect.get(details, "status");
+  const id = Reflect.get(details, "id");
+  const running = (status === "started" || status === "continued") && typeof id === "string" && toolCallId
+    ? runningSubagents.get(id)
+    : undefined;
+  if (!failed && toolCallId && running?.initialToolCallId === toolCallId) return presentationFromRunning(running);
+
+  const exitCode = Reflect.get(details, "exitCode");
+  return presentationFromRecordedDetails(details, {
+    failed,
+    hasTerminalEvidence: isError || typeof exitCode === "number" || hasErrorMessage(Reflect.get(details, "errorMessage")),
+    formatElapsed,
+  });
+}
+
+function currentSubagentPane(details: object): string | undefined {
+  const id = Reflect.get(details, "id");
+  if (typeof id !== "string" || !id.trim()) return undefined;
+  const running = runningSubagents.get(id);
+  const handle = subagentHandles.get(id);
+  const pending = running?.lifecycle.delivery === "pending" &&
+    (!handle || running.cli !== "pi" || (handle.state === "active" && handle.subscribed !== false));
+  const association = pending ? running : handle ?? running ?? details;
+  const surface = association && Reflect.get(association, "surface");
+  return typeof surface === "string" && surface.trim() ? surface : undefined;
+}
+
+/** False means a newer association must be resolved by the gate-owning click. */
+async function reopenForInspection(
+  details: object,
+  id: string,
+  pane: string,
+  parentId: string | undefined,
+  notify: (text: string, level?: "warning" | "error") => void,
+): Promise<boolean> {
+  try {
+    const handle = subagentHandles.get(id);
+    if (!handle?.surface || handle.surface !== pane || runningSubagents.has(id) || !ownsParentSession(parentId)) {
+      notify("Subagent pane no longer exists."); return true;
+    }
+    const inspection = await inspectPaneStrict(pane);
+    if (currentSubagentPane(details) !== pane) return false;
+    if (inspection.kind !== "missing") { notify("Could not confirm missing subagent pane."); return true; }
+    requireParentSession(parentId);
+    const fresh = subagentHandles.get(id);
+    if (!fresh || fresh.surface !== pane) return false;
+    const launched = await launchSavedPiSession(fresh, parentId);
+    if ("failure" in launched) throw launched.failure;
+    return true;
+  } catch {
+    notify("Could not reopen saved subagent session.", "error");
+    return true;
+  }
+}
+
+async function activateSubagent(details: object): Promise<void> {
+  const ctx = runtime.latestCtx;
+  const parentId = ctx?.sessionManager?.getSessionId?.();
+  if (ctx?.mode !== "tui") return;
+  const id = Reflect.get(details, "id");
+  if (typeof id !== "string" || !id.trim() || !currentSubagentPane(details)) {
+    ctx.ui.notify("No current subagent pane is available.", "warning");
+    return;
+  }
+  const release = await acquireLaunchGate(id);
+  const notify = (text: string, level: "warning" | "error" = "warning") => {
+    if (ownsParentSession(parentId)) runtime.latestCtx?.ui.notify(text, level);
+  };
+  try {
+    if (!ownsParentSession(parentId)) return;
+    while (true) {
+      if (!ownsParentSession(parentId)) return;
+      const pane = currentSubagentPane(details);
+      if (!pane) { notify("No current subagent pane is available."); return; }
+      const outcome = await focusPane(pane);
+      if (!ownsParentSession(parentId)) return;
+      if (currentSubagentPane(details) !== pane) continue;
+      if (outcome.kind === "focused") return;
+      if (outcome.kind === "unavailable") { notify("Herdr is unavailable."); return; }
+      if (outcome.kind === "error") {
+        notify(outcome.code === "agent_not_found" && outcome.panePresent
+          ? "Pane exists, but no focusable agent was found." : "Could not focus subagent pane.", "error");
+        return;
+      }
+      if (await reopenForInspection(details, id, pane, parentId, notify)) return;
+    }
+  } catch {
+    notify("Could not focus subagent pane.", "error");
+  } finally {
+    release();
+  }
+}
+
+function renderInitialToolCall(
+  args: Static<typeof SubagentParams>,
+  theme: Theme,
+  toolCallId: string,
+  executionStarted: boolean,
+  state: Record<string, unknown>,
+): Component {
+  return subagentMouseRegion({
+    invalidate() {},
+    render: (width: number) => {
+      // Pi constructs call before result; defer ownership check until rendering.
+      if (state.resultRendered === true) return [];
+      const running = initialRunningSubagent(toolCallId);
+      if (executionStarted && !running) return [];
+      const presentation = running
+        ? presentationFromRunning(running)
+        : { name: args.name, agent: args.agent, cwd: args.cwd, state: "starting" };
+      return renderSubagentPresentation(presentation, theme, width);
+    },
+  }, () => { void activateSubagent(initialRunningSubagent(toolCallId) ?? {}); });
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   if (process.env.PI_SUBAGENT_ID) registerChildLifecycle(pi);
   runtime.pi = pi;
@@ -1601,6 +1916,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
+    runtime.shuttingDown = false;
     if (!process.env.PI_SUBAGENT_ID) {
       for (const message of agentLoadErrors) ctx.ui?.notify?.(`Skipped agent ${message}`, "warning");
     }
@@ -1627,6 +1943,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    if (!shouldPreserveSubagentsOnShutdown(event.reason)) runtime.shuttingDown = true;
     runtime.stopTerminalInput?.();
     runtime.stopTerminalInput = undefined;
     if (widgetInterval) {
@@ -1668,6 +1985,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       promptGuidelines: subagentGuidelines,
       parameters: SubagentParams,
       executionMode: "parallel",
+      renderShell: "self",
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const validationError = validateSubagentRequest(params) ?? validateAgentKnown(params.agent);
@@ -1683,7 +2001,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 text: `You are the ${currentAgent} agent — do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.`,
               },
             ],
-            details: { error: "self-spawn blocked" },
+            details: { errorMessage: "self-spawn blocked" },
           };
         }
 
@@ -1700,7 +2018,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 text: "Error: no session file. Start pi with a persistent session to use subagents.",
               },
             ],
-            details: { error: "no session file" },
+            details: { errorMessage: "no session file" },
           };
         }
 
@@ -1715,10 +2033,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parentThinking !== "xhigh" &&
           parentThinking !== "max"
         ) {
-          throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
+          throw new Error(`Unsupported parent thinking level: ${String(parentThinking)}`);
         }
         const name = resolveSubagentName(params.name, params.agent);
-        const running = await launchSubagent({ ...params, name }, ctx, parentThinking);
+        const running = await launchSubagent({ ...params, name }, ctx, parentThinking, { toolCallId: _toolCallId });
         rememberPiHandle(running);
 
         // Create a separate AbortController for the watcher
@@ -1735,10 +2053,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (running.orchestrationMode === "wait-all") {
           const waiting = await waitForCompletionOrAbort(completion, _signal);
           if ("cancelled" in waiting) {
-            deliverCompletion();
+            deliverInitialCompletion(running, completion, pi);
             return {
               content: [{ type: "text" as const, text: "Wait cancelled. Subagent continues; terminal result will arrive through Completion delivery." }],
-              details: { id: running.id, name: running.name, status: "wait_cancelled" },
+              details: resultDetails(running, { sessionFile: running.sessionFile }, "wait_cancelled"),
             };
           }
           const result = waiting.result;
@@ -1765,76 +2083,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             },
           ],
           details: {
-            id: running.id,
-            name,
-            task: params.task,
-            agent: params.agent,
-            sessionFile: running.sessionFile,
+            ...resultDetails(running, { sessionFile: running.sessionFile }, "started"),
             launchScriptFile: running.launchScriptFile,
             model: running.runtimePlan?.model,
             thinking: running.runtimePlan?.thinking,
             runtimePlan: running.runtimePlan,
-            status: "started",
           },
         };
       },
 
-      renderCall(args, theme) {
-        const partialArgs = args as Record<string, unknown>;
-        const name = resolveSubagentName(partialArgs.name, partialArgs.agent);
-        const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
-        const agent = typeof partialArgs.agent === "string" && partialArgs.agent
-          ? theme.fg("dim", ` (${partialArgs.agent})`)
-          : "";
-        const cwdHint = typeof partialArgs.cwd === "string" && partialArgs.cwd
-          ? theme.fg("dim", ` in ${partialArgs.cwd}`)
-          : "";
-        let text =
-          "▸ " +
-          theme.fg("toolTitle", theme.bold(name)) +
-          agent +
-          cwdHint;
-
-        // Show a one-line task preview. renderCall is called repeatedly as the
-        // LLM generates tool arguments, so args.task grows token by token.
-        // We keep it compact here — Ctrl+O on renderResult expands the full content.
-        if (task) {
-          const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
-          const preview = firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine;
-          if (preview) {
-            text += "\n" + theme.fg("toolOutput", preview);
-          }
-          const totalLines = task.split("\n").length;
-          if (totalLines > 1) {
-            text += theme.fg("muted", ` (${totalLines} lines)`);
-          }
-        }
-
-        return new Text(text, 0, 0);
+      renderCall(args, theme, context) {
+        return renderInitialToolCall(args, theme, context.toolCallId, context.executionStarted, context.state);
       },
 
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const name = details?.name ?? "fork";
-
-        // "Started" result — tool returned immediately
-        if (details?.status === "started") {
-          const runtime = details?.model
-            ? ` — ${details.model}${details.thinking ? ` · ${details.thinking}` : ""}`
-            : " — started";
-          return new Text(
-            theme.fg("accent", "▸") +
-              " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              theme.fg("dim", runtime),
-            0,
-            0,
-          );
-        }
-
-        // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
-        return new Text(theme.fg("dim", text), 0, 0);
+      renderResult(result, _opts, theme, context) {
+        context.state.resultRendered = true;
+        const { toolCallId, isError } = context;
+        const details = result.details && typeof result.details === "object" ? result.details : isError ? {} : undefined;
+        if (!details) return new Text("", 0, 0);
+        return subagentMouseRegion({
+          invalidate() {},
+          render: (width: number) =>
+            renderSubagentPresentation(presentationFromDetails(details, toolCallId, isError), theme, width),
+        }, () => { void activateSubagent(details); });
       },
     });
 
@@ -1851,98 +2122,170 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         message: Type.String({ description: "Follow-up work, recovery instruction, or answer for the continued session" }),
       }),
       executionMode: "parallel",
+      renderShell: "self",
 
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const handle = subagentHandles.get(params.id);
-        let running = runningSubagents.get(params.id);
-        const error = handlePromptError(handle, running?.inputLocked === true);
-        if (error) {
-          return { content: [{ type: "text" as const, text: error }], details: { error, id: params.id } };
-        }
-        if (!handle || !existsSync(handle.sessionFile)) {
-          const text = `Subagent handle ${params.id} has no saved session file.`;
-          return { content: [{ type: "text" as const, text }], details: { error: text, id: params.id } };
-        }
-
-        if (!running && handle.surface) {
-          if (!isTerminalAvailable()) return muxUnavailableResult();
-          try {
-            const inspection = await inspectPane(handle.surface);
-            if (inspection.kind === "present") running = attachLivePiSubagent(handle, params.message, ctx);
-          } catch {
-            // Closed and unavailable panes both fall through to session reopen.
+        const parentId = ctx.sessionManager?.getSessionId?.();
+        const known = ownsParentSession(parentId) ? subagentHandles.get(params.id) : undefined;
+        const identity = {
+          id: params.id,
+          ...(known ? {
+            name: known.name,
+            ...(known.agent ? { agent: known.agent } : {}),
+            ...(known.cwd ? { cwd: known.cwd } : {}),
+            ...(known.surface ? { surface: known.surface } : {}),
+            sessionFile: known.sessionFile,
+          } : {}),
+        };
+        const failure = (text: string) => ({ content: [{ type: "text" as const, text }], details: { errorMessage: text, ...identity } });
+        const release = await acquireLaunchGate(params.id);
+        try {
+          if (!ownsParentSession(parentId)) return failure("Parent session changed or is shutting down.");
+          const handle = subagentHandles.get(params.id);
+          let running = runningSubagents.get(params.id);
+          const error = handlePromptError(handle, running?.inputLocked === true || running?.lifecycle.delivery === "pending");
+          if (error) {
+            return { content: [{ type: "text" as const, text: error }], details: { errorMessage: error, ...identity } };
           }
-        }
-
-        if (running) {
-          running.inputLocked = true;
-          running.task = params.message;
-          running.lifecycle = createLifecycle(running.startTime);
-          try {
-            startParentSubscription(running);
-            promptPane(running.surface, params.message, running.agentDir);
-          } catch (cause: any) {
-            cancelParentSubscription(running, handle);
-            running.inputLocked = false;
-            const text = `Could not prompt subagent ${params.id}: ${cause?.message ?? String(cause)}`;
-            return { content: [{ type: "text" as const, text }], details: { error: text, id: params.id } };
+          if (!handle || !existsSync(handle.sessionFile)) {
+            const text = `Subagent handle ${params.id} has no saved session file.`;
+            return { content: [{ type: "text" as const, text }], details: { errorMessage: text, ...identity } };
           }
-          const controller = new AbortController();
-          running.abortController = controller;
-          startWidgetRefresh();
-          startStatusRefresh();
-          const completion = watchSubagent(running, controller.signal);
-          if (running.orchestrationMode === "wait-all") {
-            const waited = await waitForCompletionOrAbort(completion, signal);
-            if ("cancelled" in waited) {
-              deliverPromptCompletion(running, completion, pi);
+
+          if (!ownsParentSession(parentId)) return failure("Parent session changed or is shutting down.");
+          if (!running) {
+            if (!isTerminalAvailable()) {
+              const result = muxUnavailableResult();
+              return { ...result, details: { ...result.details, ...identity } };
+            }
+            if (!handle.surface) return failure("No current subagent pane is available.");
+            const inspection = await inspectPaneStrict(handle.surface);
+            if (!ownsParentSession(parentId)) return failure("Parent session changed or is shutting down.");
+            const fresh = subagentHandles.get(params.id);
+            if (!fresh || fresh.surface !== handle.surface || fresh.sessionFile !== handle.sessionFile || runningSubagents.has(params.id)) {
+              return failure("Subagent target changed.");
+            }
+            const eligibilityError = handlePromptError(fresh, false);
+            if (eligibilityError) return failure(eligibilityError);
+            if (inspection.kind === "present" && inspection.agent === "pi") running = attachLivePiSubagent(fresh, params.message, runtime.latestCtx!);
+            else if (inspection.kind !== "missing") return failure("Could not confirm a live Pi agent or missing subagent pane.");
+          }
+
+          if (running) {
+            running.inputLocked = true;
+            running.task = params.message;
+            try {
+              startParentSubscription(running);
+              promptPane(running.surface, params.message, running.agentDir);
+            } catch (cause: any) {
+              cancelParentSubscription(running, handle);
+              running.inputLocked = false;
+              const text = `Could not prompt subagent ${params.id}: ${cause?.message ?? String(cause)}`;
+              return { content: [{ type: "text" as const, text }], details: { errorMessage: text, ...identity } };
+            }
+            running.startTime = Date.now();
+            running.lifecycle = createLifecycle(running.startTime);
+            running.initialToolCallId = _toolCallId;
+            const controller = new AbortController();
+            running.abortController = controller;
+            runningSubagents.set(running.id, running);
+            startWidgetRefresh();
+            startStatusRefresh();
+            const completion = watchSubagent(running, controller.signal);
+            release();
+            if (running.orchestrationMode === "wait-all") {
+              const waited = await waitForCompletionOrAbort(completion, signal);
+              if ("cancelled" in waited) {
+                if (running.initialToolCallId === _toolCallId) running.initialToolCallId = undefined;
+                deliverPromptCompletion(running, completion, pi);
+                return {
+                  content: [{ type: "text" as const, text: "Wait cancelled. Continued subagent session remains live." }],
+                  details: resultDetails(running, { sessionFile: running.sessionFile }, "wait_cancelled"),
+                };
+              }
+              const outcome = applyAssignmentFinalization(running, waited.result, ctx);
               return {
-                content: [{ type: "text" as const, text: "Wait cancelled. Continued subagent session remains live." }],
-                details: { id: running.id, name: running.name, status: "wait_cancelled" },
+                content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, running.name, running.id) }],
+                details: resultDetails(running, waited.result, outcome.disposition),
               };
             }
-            const outcome = applyAssignmentFinalization(running, waited.result, ctx);
+            deliverPromptCompletion(running, completion, pi);
             return {
-              content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, running.name, running.id) }],
-              details: resultDetails(running, waited.result, outcome.disposition),
+              content: [{ type: "text" as const, text: `Continuation sent to subagent ${params.id}.` }],
+              details: resultDetails(running, { sessionFile: running.sessionFile }, "continued"),
             };
           }
-          deliverPromptCompletion(running, completion, pi);
-          return {
-            content: [{ type: "text" as const, text: `Continuation sent to subagent ${params.id}.` }],
-            details: { id: params.id, name: handle.name, status: "continued" },
-          };
-        }
 
-        if (!isTerminalAvailable()) return muxUnavailableResult();
-        const resumed = await reopenPiSubagent(handle, params.message, ctx);
-        const controller = new AbortController();
-        resumed.abortController = controller;
-        startWidgetRefresh();
-        startStatusRefresh();
-        const completion = watchSubagent(resumed, controller.signal);
+          if (!isTerminalAvailable()) {
+            const result = muxUnavailableResult();
+            return { ...result, details: { ...result.details, ...identity } };
+          }
+          const fresh = subagentHandles.get(params.id)!;
+          const resumed = await reopenPiSubagent(fresh, params.message, parentId);
+          if ("failure" in resumed) {
+            const cause = resumed.failure;
+            const text = cause instanceof Error ? cause.message : String(cause);
+            const result = failure("Could not reopen saved subagent session.");
+            return { ...result, content: [{ type: "text" as const, text }] };
+          }
+          resumed.initialToolCallId = _toolCallId;
+          const controller = new AbortController();
+          resumed.abortController = controller;
+          startWidgetRefresh();
+          startStatusRefresh();
+          const completion = watchSubagent(resumed, controller.signal);
+          release();
 
-        if (resumed.orchestrationMode === "wait-all") {
-          const waited = await waitForCompletionOrAbort(completion, signal);
-          if ("cancelled" in waited) {
-            deliverPromptCompletion(resumed, completion, pi);
+          if (resumed.orchestrationMode === "wait-all") {
+            const waited = await waitForCompletionOrAbort(completion, signal);
+            if ("cancelled" in waited) {
+              if (resumed.initialToolCallId === _toolCallId) resumed.initialToolCallId = undefined;
+              deliverPromptCompletion(resumed, completion, pi);
+              return {
+                content: [{ type: "text" as const, text: "Wait cancelled. Continued subagent session remains live." }],
+                details: resultDetails(resumed, { sessionFile: resumed.sessionFile }, "wait_cancelled"),
+              };
+            }
+            const outcome = applyAssignmentFinalization(resumed, waited.result, ctx);
             return {
-              content: [{ type: "text" as const, text: "Wait cancelled. Continued subagent session remains live." }],
-              details: { id: resumed.id, name: resumed.name, status: "wait_cancelled" },
+              content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, resumed.name, resumed.id) }],
+              details: resultDetails(resumed, waited.result, outcome.disposition),
             };
           }
-          const outcome = applyAssignmentFinalization(resumed, waited.result, ctx);
-          return {
-            content: [{ type: "text" as const, text: resolveWaitAllResultPresentation(waited.result, resumed.name, resumed.id) }],
-            details: resultDetails(resumed, waited.result, outcome.disposition),
-          };
-        }
 
-        deliverPromptCompletion(resumed, completion, pi);
-        return {
-          content: [{ type: "text" as const, text: `Subagent ${resumed.id} reopened and is continuing.` }],
-          details: { id: resumed.id, name: resumed.name, sessionFile: resumed.sessionFile, status: "continued" },
-        };
+          deliverPromptCompletion(resumed, completion, pi);
+          return {
+            content: [{ type: "text" as const, text: `Subagent ${resumed.id} reopened and is continuing.` }],
+            details: resultDetails(resumed, { sessionFile: resumed.sessionFile }, "continued"),
+          };
+        } finally {
+          release();
+        }
+      },
+
+      renderCall(args, theme, context) {
+        return subagentMouseRegion({
+          invalidate() {},
+          render: (width: number) => {
+            if (context.state.resultRendered === true) return [];
+            const running = runningSubagents.get(args.id);
+            const handle = subagentHandles.get(args.id);
+            const presentation = running?.initialToolCallId === context.toolCallId && context.toolCallId
+              ? presentationFromRunning(running)
+              : { name: handle?.name, agent: handle?.agent, cwd: handle?.cwd };
+            return renderSubagentPresentation(presentation, theme, width);
+          },
+        }, () => { void activateSubagent({ id: args.id }); });
+      },
+
+      renderResult(result, _opts, theme, context) {
+        context.state.resultRendered = true;
+        const details = result.details && typeof result.details === "object" ? result.details : {};
+        return subagentMouseRegion({
+          invalidate() {},
+          render: (width: number) =>
+            renderSubagentPresentation(presentationFromDetails(details, context.toolCallId, context.isError), theme, width),
+        }, () => { void activateSubagent(details); });
       },
     });
 
@@ -1989,83 +2332,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // ── subagent_result message renderer ──
-  pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
-    const details = message.details as any;
-    if (!details) return undefined;
+  pi.registerMessageRenderer("subagent_result", (message, _options, theme) => {
+    const details = message.details;
+    if (!details || typeof details !== "object") return new Text("", 0, 0);
+    return subagentMouseRegion({
+      invalidate() {},
+      render: (width: number) => renderSubagentPresentation(presentationFromDetails(details), theme, width),
+    }, () => { void activateSubagent(details); });
+  });
 
-    return {
-      render(width: number): string[] {
-        const name = details.name ?? "subagent";
-        const exitCode = details.exitCode ?? 0;
-        const errorMessage = hasErrorMessage(details.errorMessage) ? details.errorMessage : "";
-        const failed = isSubagentFailure(details);
-        const elapsed = typeof details.elapsed === "number" ? formatElapsed(details.elapsed) : undefined;
-        const bgFn = failed
-          ? (text: string) => theme.bg("toolErrorBg", text)
-          : (text: string) => theme.bg("toolSuccessBg", text);
-        const icon = failed
-          ? theme.fg("error", "✗")
-          : theme.fg("success", "✓");
-        const status = errorMessage
-          ? "failed"
-          : failed
-            ? `failed (exit ${exitCode})`
-            : "completed";
-        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
-
-        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status}${elapsed ? ` ${theme.fg("dim", `(${elapsed})`)}` : ""}`;
-        const rawContent = typeof message.content === "string" ? message.content : "";
-
-        // Clean summary (remove session ref and leading label for display)
-        const summary = rawContent
-          .replace(/\n\nSession: .+$/, "")
-          .replace(`Sub-agent "${name}" completed (${elapsed ?? ""}).\n\n`, "")
-          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
-          .replace(
-            new RegExp(
-              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed ?? ""}\\.\\n\\n`,
-            ),
-            "",
-          );
-
-        // Build content for the box
-        const contentLines = [header];
-
-        if (options.expanded) {
-          // Full view: complete summary + session info
-          if (summary) {
-            for (const line of summary.split("\n")) {
-              contentLines.push(line.slice(0, width - 6));
-            }
-          }
-          if (details.sessionFile) {
-            contentLines.push("");
-            contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
-          }
-          if (details.id) {
-            contentLines.push(theme.fg("dim", `Continue: subagent_prompt({ id: "${details.id}", message: "..." })`));
-          }
-        } else {
-          // Collapsed: preview + expand hint
-          if (summary) {
-            const previewLines = summary.split("\n").slice(0, 5);
-            for (const line of previewLines) {
-              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
-            }
-            const totalLines = summary.split("\n").length;
-            if (totalLines > 5) {
-              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
-            }
-          }
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
-        }
-
-        // Render via Box for background + padding, with blank line above for separation
-        const box = new Box(1, 1, bgFn);
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
-      },
-    };
+  pi.registerEntryRenderer<object>("subagent_outcome", (entry, _options, theme) => {
+    const details = entry.data;
+    if (!details || typeof details !== "object") return undefined;
+    return subagentMouseRegion({
+      invalidate() {},
+      render: (width: number) => renderSubagentPresentation(presentationFromRecordedDetails(details, {
+        failed: isSubagentFailure(details),
+        hasTerminalEvidence: typeof Reflect.get(details, "exitCode") === "number" || hasErrorMessage(Reflect.get(details, "errorMessage")),
+        abandoned: Reflect.get(details, "status") === "abandoned",
+        formatElapsed,
+      }), theme, width),
+    }, () => { void activateSubagent(details); });
   });
 
   // ── subagent_ask message renderer ──
@@ -2074,6 +2361,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";

@@ -39,6 +39,11 @@ export function cancelCompletionChannel(sessionFile: string): void {
   rmSync(exitFile(sessionFile), { force: true });
 }
 
+/** Inspection has no delivery channel; never discard an unconsumed reply. */
+export function removeEmptyCompletionChannel(sessionFile: string): void {
+  if (hasCompletionChannel(sessionFile)) cancelCompletionChannel(sessionFile);
+}
+
 /** True only while parent has opened a channel and child has not replied. */
 export function hasCompletionChannel(sessionFile: string | undefined): boolean {
   if (!sessionFile) return false;

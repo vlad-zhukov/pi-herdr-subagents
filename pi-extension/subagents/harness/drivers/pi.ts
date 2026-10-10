@@ -8,7 +8,7 @@ import type {
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import type { SubagentHandle } from "../../assignment-handles.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
-import { createSubagentPane, runScriptInPane, setPaneTask, shellQuote } from "../../terminal.ts";
+import { runScriptInPane, setPaneTask, shellQuote } from "../../terminal.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["subagent_ask"] as const;
 
@@ -53,7 +53,7 @@ export function buildPiContinuationCommand(params: {
   handle: SubagentHandle;
   surface: string;
   activityFile: string;
-  messageFile: string;
+  messageFile?: string;
 }): string {
   const { handle, surface, activityFile, messageFile } = params;
   const env = [
@@ -66,35 +66,39 @@ export function buildPiContinuationCommand(params: {
     `PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
     `PI_SUBAGENT_SURFACE=${shellQuote(surface)}`,
     `PI_SUBAGENT_INTERACTIVE=${handle.interactive ? "1" : "0"}`,
-    ...(handle.autoExit ? ["PI_SUBAGENT_AUTO_EXIT=1"] : []),
+    `PI_SUBAGENT_AUTO_EXIT=${handle.autoExit ? "1" : "0"}`,
     `PI_SUBAGENT_AGENT_FILE=${shellQuote(handle.agentFile ?? "")}`,
   ].filter(Boolean).join(" ");
   const cwd = handle.cwd ? `cd ${shellQuote(handle.cwd)} && ` : "";
-  return `${cwd}${env} pi --session ${shellQuote(handle.sessionFile)} ${shellQuote(`@${messageFile}`)}; echo '__SUBAGENT_DONE_'$?'__'`;
+  return `${cwd}${env} pi --session ${shellQuote(handle.sessionFile)}${messageFile === undefined ? "" : ` ${shellQuote(`@${messageFile}`)}`}; echo '__SUBAGENT_DONE_'$?'__'`;
 }
 
 export async function launchPiContinuation(params: {
   handle: SubagentHandle;
-  message: string;
+  message?: string;
   artifactDir: string;
   shellReadyDelayMs: number;
+  surface: string;
+  beforeSend?: () => void;
 }): Promise<{ surface: string; activityFile: string; launchScriptFile: string }> {
-  const { handle, message, artifactDir, shellReadyDelayMs } = params;
-  const surface = createSubagentPane(handle.name);
-  setPaneTask(surface, message);
+  const { handle, message, surface, artifactDir, shellReadyDelayMs } = params;
+  if (message !== undefined) setPaneTask(surface, message);
   await new Promise<void>((resolve) => setTimeout(resolve, shellReadyDelayMs));
 
   const activityFile = getSubagentActivityFile(artifactDir, handle.id);
-  const messageFile = join(artifactDir, "subagent-prompts", `${handle.id}-${Date.now()}.md`);
+  let messageFile: string | undefined;
   mkdirSync(dirname(activityFile), { recursive: true });
-  mkdirSync(dirname(messageFile), { recursive: true });
-  writeFileSync(messageFile, message, "utf8");
+  if (message !== undefined) {
+    messageFile = join(artifactDir, "subagent-prompts", `${handle.id}-${Date.now()}.md`);
+    mkdirSync(dirname(messageFile), { recursive: true });
+    writeFileSync(messageFile, message, "utf8");
+  }
 
   const launchScriptFile = join(artifactDir, "subagent-scripts", `${handle.id}-continue-${Date.now()}.sh`);
   runScriptInPane(
     surface,
     buildPiContinuationCommand({ handle, surface, activityFile, messageFile }),
-    { scriptPath: launchScriptFile },
+    { scriptPath: launchScriptFile, beforeSend: params.beforeSend },
   );
   return { surface, activityFile, launchScriptFile };
 }
