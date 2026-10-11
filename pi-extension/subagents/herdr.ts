@@ -51,15 +51,6 @@ function parseHerdrJson(value: string): unknown {
   }
 }
 
-function extractHerdrPaneId(output: string, context: string): string {
-  const parsed = parseHerdrJson(output);
-  const paneId = (parsed as { result?: { pane?: { pane_id?: unknown } } })?.result?.pane?.pane_id;
-  if (typeof paneId !== "string" || !paneId) {
-    throw new Error(`Unexpected herdr ${context} output: ${output.trim() || "(empty)"}`);
-  }
-  return paneId;
-}
-
 function extractHerdrRootPaneId(output: string, context: string): string {
   const parsed = parseHerdrJson(output);
   const paneId = (parsed as { result?: { root_pane?: { pane_id?: unknown } } })?.result?.root_pane
@@ -77,14 +68,6 @@ function herdrExec(args: string[]): string {
 async function herdrExecAsync(args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8" });
   return stdout;
-}
-
-function getHerdrParentPaneId(): string {
-  const paneId = process.env.HERDR_PANE_ID;
-  if (!paneId) {
-    throw new Error("HERDR_PANE_ID not set");
-  }
-  return paneId;
 }
 
 function getHerdrCurrentPaneInfo(): {
@@ -142,30 +125,6 @@ export function createHerdrSurface(name: string, focus = false): string {
     herdrExec(["pane", "rename", paneId, name]);
   } catch {
     // Optional — pane label is cosmetic.
-  }
-  return paneId;
-}
-
-export function createHerdrSurfaceSplit(
-  name: string,
-  direction: "right" | "down",
-): string {
-  const parentPaneId = getHerdrParentPaneId();
-  const output = herdrExec([
-    "pane",
-    "split",
-    parentPaneId,
-    "--direction",
-    direction,
-    "--no-focus",
-    "--cwd",
-    process.cwd(),
-  ]);
-  const paneId = extractHerdrPaneId(output, "pane split");
-  try {
-    herdrExec(["pane", "rename", paneId, name]);
-  } catch {
-    // Optional.
   }
   return paneId;
 }
@@ -388,16 +347,6 @@ export function closeHerdrSurface(surface: string): void {
   }
 }
 
-export function renameHerdrTab(title: string): void {
-  const { tab_id: tabId } = getHerdrCurrentPaneInfo();
-  herdrExec(["tab", "rename", tabId, title]);
-}
-
-export function renameHerdrWorkspace(title: string): void {
-  const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
-  herdrExec(["workspace", "rename", workspaceId, title]);
-}
-
 function buildPaneReportTaskArgs(
   paneId: string,
   task: string,
@@ -434,7 +383,6 @@ export const __herdrTest__ = {
   buildPaneReportTaskArgs,
   buildAgentPromptArgs,
   parseHerdrJson,
-  extractHerdrPaneId,
   extractHerdrRootPaneId,
   parsePaneGetOutput,
   parsePaneGetError,

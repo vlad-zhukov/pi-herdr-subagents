@@ -11,9 +11,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
 import {
-  getAvailableBackends,
-  setBackend,
-  restoreBackend,
+  isTerminalAvailable,
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
@@ -33,40 +31,35 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
+const herdrAvailable = isTerminalAvailable();
 const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
-if (backends.length === 0) {
+if (!herdrAvailable) {
   console.log("⚠️  herdr is unavailable — skipping terminal integration tests");
   console.log("   Run inside herdr to enable these tests.");
-}
-
-for (const backend of backends) {
-  describe(`herdr terminal [${backend}]`, { timeout: 60_000 }, () => {
-    let prevMux: string | undefined;
+} else {
+  describe("herdr terminal [herdr]", { timeout: 60_000 }, () => {
     let env: TestEnv;
 
     before(() => {
-      prevMux = setBackend(backend);
-      env = createTestEnv(backend);
+      env = createTestEnv();
     });
 
     after(() => {
       cleanupTestEnv(env);
-      restoreBackend(prevMux);
     });
 
     it("keeps focus on the current pane while creating and targeting subagent tabs", async () => {
-      const focusedPane = getFocusedSurface(backend);
+      const focusedPane = getFocusedSurface();
       assert.ok(focusedPane, "Expected herdr to report the currently focused pane");
 
       const childA = createTrackedSurface(env, "focus-child-a");
       await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
-      assert.equal(getFocusedSurface(backend), focusedPane);
+      assert.equal(getFocusedSurface(), focusedPane);
 
       const childB = createTrackedSurface(env, "focus-child-b");
       await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
-      assert.equal(getFocusedSurface(backend), focusedPane);
+      assert.equal(getFocusedSurface(), focusedPane);
 
       const markerA = uniqueId();
       const markerB = uniqueId();
@@ -77,7 +70,7 @@ for (const backend of backends) {
         waitForScreen(childA, new RegExp(`FOCUS_A_${markerA}`), 20_000, 50),
         waitForScreen(childB, new RegExp(`FOCUS_B_${markerB}`), 20_000, 50),
       ]);
-      assert.equal(getFocusedSurface(backend), focusedPane);
+      assert.equal(getFocusedSurface(), focusedPane);
     });
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {

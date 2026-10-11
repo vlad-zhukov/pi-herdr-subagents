@@ -22,9 +22,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import {
-  getAvailableBackends,
-  setBackend,
-  restoreBackend,
+  isTerminalAvailable,
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
@@ -41,7 +39,7 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
+const herdrAvailable = isTerminalAvailable();
 
 function configureWaitAll(env: TestEnv): void {
   writeFileSync(
@@ -229,24 +227,19 @@ async function waitForWidgetClear(surface: string, timeout: number): Promise<voi
   throw new Error("Timed out waiting for the Subagents widget to clear.");
 }
 
-if (backends.length === 0) {
+if (!herdrAvailable) {
   console.log("⚠️  herdr is unavailable — skipping subagent lifecycle integration tests");
   console.log("   Run inside herdr to enable these tests.");
-}
-
-for (const backend of backends) {
-  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
-    let prevMux: string | undefined;
+} else {
+  describe("subagent-lifecycle [herdr]", { timeout: PI_TIMEOUT * 3 }, () => {
     let env: TestEnv;
 
     before(() => {
-      prevMux = setBackend(backend);
-      env = createTestEnv(backend);
+      env = createTestEnv();
     });
 
     after(() => {
       cleanupTestEnv(env);
-      restoreBackend(prevMux);
     });
 
     // ── Parent Escape hard stop ──
@@ -431,53 +424,6 @@ for (const backend of backends) {
       assertWaitAllDelivery(surface, firstName, ["completed", "completed"]);
     });
 
-    it("wait-all settles a parallel batch with distinct success and failure results", async () => {
-      const id = uniqueId();
-      const successStart = `/tmp/pi-integ-parallel-success-start-${id}.txt`;
-      const failureStart = `/tmp/pi-integ-parallel-failure-start-${id}.txt`;
-      const successDone = `/tmp/pi-integ-parallel-success-done-${id}.txt`;
-      const failureDone = `/tmp/pi-integ-parallel-failure-done-${id}.txt`;
-      const parentFile = `/tmp/pi-integ-parallel-parent-${id}.txt`;
-      trackTempFile(env, successStart);
-      trackTempFile(env, failureStart);
-      trackTempFile(env, successDone);
-      trackTempFile(env, failureDone);
-      trackTempFile(env, parentFile);
-      configureWaitAll(env);
-      writeFileSync(
-        `${env.agentDir}/agents/parallel-success-${id}.md`,
-        `---\nname: parallel-success-${id}\ncli: test-shell\ncommand: "date +%s%3N > '${successStart}'; sleep 20; printf done > '${successDone}'; true"\n---\n`,
-      );
-      writeFileSync(
-        `${env.agentDir}/agents/parallel-failure-${id}.md`,
-        `---\nname: parallel-failure-${id}\ncli: test-shell\ncommand: "date +%s%3N > '${failureStart}'; sleep 1; printf done > '${failureDone}'; false"\n---\n`,
-      );
-
-      const successName = `ParallelSuccess-${id}`;
-      const failureName = `ParallelFailure-${id}`;
-      const surface = createTrackedSurface(env, `parallel-wait-all-${id}`);
-      await sleep(1000);
-      startPi(surface, env.dir, [
-        "Make exactly two subagent tool calls in one assistant response. Do not make any other tool calls until both return.",
-        `First: name "${successName}", agent "parallel-success-${id}", task "success".`,
-        `Second: name "${failureName}", agent "parallel-failure-${id}", task "failure".`,
-        `After both results return, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
-        "Then say PARALLEL_WAIT_ALL_COMPLETE and nothing else.",
-      ].join("\n"));
-
-      await waitForFile(parentFile, PI_TIMEOUT, /PARENT_/);
-      assert.equal(existsSync(successDone), true, "successful sibling must finish before parent continues");
-      assert.equal(existsSync(failureDone), true, "failed sibling must settle before parent continues");
-      // Success child sleeps 20s: a sequential launch would start >20s apart, so 10s still catches it.
-      assert.ok(
-        Math.abs(Number(readFileSync(successStart, "utf8")) - Number(readFileSync(failureStart, "utf8"))) < 10_000,
-        "siblings must launch concurrently, not after each other's terminal result",
-      );
-
-      await waitForScreen(surface, /PARALLEL_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
-      assertWaitAllDelivery(surface, successName, ["completed"]);
-      assertWaitAllDelivery(surface, failureName, ["failed"]);
-    });
 
     // ── In-progress activity snapshots ──
 

@@ -4,7 +4,6 @@ export type AssignmentFinalizationEvent =
   | { kind: "abandonment"; reason: "automatic" | "user" };
 
 export interface AssignmentFinalizationState {
-  cli?: string;
   autoExit: boolean;
   abandoned?: boolean;
   delivery: "pending" | "delivered" | "suppressed";
@@ -53,7 +52,7 @@ export function finalizeAssignment(
   }
 
   const abandoned = event.kind === "abandonment" ||
-    (state.cli === "pi" && event.exitCode !== 0 && event.errorMessage !== "cancelled");
+    (event.exitCode !== 0 && event.errorMessage !== "cancelled");
   if (abandoned) {
     return {
       disposition: "abandoned",

@@ -1,5 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { Value } from "@sinclair/typebox/value";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -23,7 +24,7 @@ import {
   type SubagentHandle,
 } from "../pi-extension/subagents/assignment-handles.ts";
 
-import { buildPiContinuationCommand, launchPiContinuation } from "../pi-extension/subagents/harness/drivers/pi.ts";
+import { buildPiContinuationCommand, launchPiContinuation } from "../pi-extension/subagents/pi-launch.ts";
 import { createSubagentPane, runScriptInPane } from "../pi-extension/subagents/terminal.ts";
 import { buildAsyncAcknowledgement, buildSubagentGuidelines, resolveSubagentName } from "../pi-extension/subagents/orchestrator-prompt.ts";
 
@@ -939,7 +940,7 @@ describe("subagent discovery", () => {
   it("resolves auto-exit and interactive behavior for named and bare spawns", () => {
     // Autonomous named agents are not interactive, so the parent gets status pings.
     assert.equal(
-      testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: true }),
+      testApi.resolveEffectiveAutoExit({ autoExit: true }),
       true,
     );
     assert.equal(
@@ -948,13 +949,13 @@ describe("subagent discovery", () => {
     );
 
     // Missing settings are independently false for named and bare spawns.
-    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { }), false);
+    assert.equal(testApi.resolveEffectiveAutoExit({ }), false);
     assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { }), false);
-    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T", fork: true }, null), false);
+    assert.equal(testApi.resolveEffectiveAutoExit(null), false);
     assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", fork: true }, null), false);
 
     // Explicit interactive remains independent from auto-exit.
-    assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T", interactive: true }, null), false);
+    assert.equal(testApi.resolveEffectiveAutoExit(null), false);
     assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", interactive: true }, null), true);
   });
 
@@ -1029,7 +1030,6 @@ describe("subagent discovery", () => {
     assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
       sessionMode: "lineage-only",
       seededSessionMode: "lineage-only",
-      inheritsConversationContext: false,
       taskDelivery: "artifact",
     });
     assert.deepEqual(
@@ -1040,7 +1040,6 @@ describe("subagent discovery", () => {
       {
         sessionMode: "standalone",
         seededSessionMode: null,
-        inheritsConversationContext: false,
         taskDelivery: "artifact",
       },
     );
@@ -1049,7 +1048,6 @@ describe("subagent discovery", () => {
       {
         sessionMode: "lineage-only",
         seededSessionMode: "lineage-only",
-        inheritsConversationContext: false,
         taskDelivery: "artifact",
       },
     );
@@ -1058,7 +1056,6 @@ describe("subagent discovery", () => {
       {
         sessionMode: "fork",
         seededSessionMode: "fork",
-        inheritsConversationContext: true,
         taskDelivery: "direct",
       },
     );
@@ -1070,7 +1067,6 @@ describe("subagent discovery", () => {
       {
         sessionMode: "fork",
         seededSessionMode: "fork",
-        inheritsConversationContext: true,
         taskDelivery: "direct",
       },
     );
@@ -1208,34 +1204,22 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("strips surrounding quotes from a quoted command: frontmatter value", async () => {
+  it("silently ignores obsolete launch frontmatter without changing agent files", async () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
-      writeAgentFile(
-        globalAgentsDir,
-        "quoted-command-test-agent",
-        [
-          "name: quoted-command-test-agent",
-          `command: "aider --model {model} --message {task}"`,
-        ].join("\n"),
-      );
-
-      const loaded = testApi.loadAgentDefaults("quoted-command-test-agent");
-      assert.equal(loaded?.commandTemplate, "aider --model {model} --message {task}");
+      const content = ["name: pi-only", "cli: claude", 'command: "obsolete"', 'command-template: "obsolete-template"'].join("\n");
+      writeAgentFile(globalAgentsDir, "pi-only", content);
+      const file = join(globalAgentsDir, "pi-only.md");
+      const original = readFileSync(file, "utf8");
+      const errors: string[] = [];
+      const agents = testApi.discoverAgentDefinitions((message: string) => errors.push(message));
+      const loaded = agents.find((agent: { name: string }) => agent.name === "pi-only");
+      assert.ok(loaded);
+      for (const field of ["cli", "command", "commandTemplate"]) assert.equal(Object.hasOwn(loaded, field), false);
+      assert.deepEqual(errors, []);
+      assert.equal(readFileSync(file, "utf8"), original);
     });
   });
 
-  it("leaves an unquoted command: frontmatter value untouched", async () => {
-    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
-      writeAgentFile(
-        globalAgentsDir,
-        "unquoted-command-test-agent",
-        ["name: unquoted-command-test-agent", "command: aider --model {model} --message {task}"].join("\n"),
-      );
-
-      const loaded = testApi.loadAgentDefaults("unquoted-command-test-agent");
-      assert.equal(loaded?.commandTemplate, "aider --model {model} --message {task}");
-    });
-  });
 });
 describe("child assignment lifecycle", () => {
   it("appends identity after the existing system append on each fresh Pi turn", () => {
@@ -1826,21 +1810,7 @@ describe("completion.ts", () => {
     assert.deepEqual(result, { reason: "sentinel", exitCode: 17 });
   });
 
-  it("returns when an external sentinel file appears", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "completion-sentinel-"));
-    const sentinelFile = join(dir, "done");
-    writeFileSync(sentinelFile, "complete");
-    try {
-      const result = await waitForCompletion(new AbortController().signal, {
-        intervalMs: 1,
-        sentinelFile,
-        readTerminalTail: async () => "",
-      });
-      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+
 
   it("retries transient terminal read failures and reports ticks", async () => {
     let reads = 0;
@@ -2032,9 +2002,11 @@ describe("tool registration", () => {
       assert.doesNotMatch(guidance, /secret|Hidden one/);
       assert.doesNotMatch(guidance, /"Researches|authenticated|model-id|runtime comes from config/i);
       assert.equal(subagents[0].parameters.additionalProperties, false);
-      for (const removed of ["model", "thinking", "systemPrompt", "skills", "tools"]) {
+      for (const removed of ["model", "thinking", "systemPrompt", "skills", "tools", "resumeSessionId"]) {
         assert.equal(subagents[0].parameters.properties[removed], undefined);
       }
+      assert.equal(Value.Check(subagents[0].parameters, { agent: "researcher", task: "Research" }), true);
+      assert.equal(Value.Check(subagents[0].parameters, { agent: "researcher", task: "Research", resumeSessionId: "obsolete" }), false);
     });
   });
 
@@ -2319,7 +2291,7 @@ describe("tool registration", () => {
         const sessionFile = createSessionFile(dir, [SESSION_HEADER]);
         const handle: SubagentHandle = { id, name: "Worker", sessionFile, surface: "mock-pane", state: "active",
           autoExit: false, interactive: true, createdAt: 1 };
-        const running = { ...handle, task: "OLD_TASK", startTime: 1, cli: "pi", runtimePlan: undefined, orchestrationMode: "async" as const,
+        const running = { ...handle, task: "OLD_TASK", startTime: 1, runtimePlan: undefined, orchestrationMode: "async" as const,
           inputLocked: false, initialToolCallId: "old-call" as string | undefined, lifecycle: createLifecycle(1), abortController: new AbortController(),
           activityFile: join(dir, `${id}.activity`) };
         owner.runningSubagents.set(id, running);
@@ -2425,7 +2397,7 @@ describe("tool registration", () => {
           testApi.subagentHandles.set(id, handle);
           if (branch === "live") testApi.runningSubagents.set(id, {
             id, name: handle.name, agent: handle.agent, cwd: "/live/cwd", agentDir: dir, sessionFile,
-            task: "previous work", surface: "live-pane", cli: "pi", runtimePlan: undefined,
+            task: "previous work", surface: "live-pane", runtimePlan: undefined,
             startTime: 1, orchestrationMode: mode, autoExit: false, interactive: false,
             inputLocked: false, lifecycle: markDelivery(createLifecycle(1), "delivered"),
           });
@@ -2636,43 +2608,38 @@ describe("Assignment finalization policy", () => {
     const cases = [
       {
         name: "normal completion retains pane",
-        state: { cli: "pi", autoExit: false, delivery: "pending" as const },
+        state: { autoExit: false, delivery: "pending" as const },
         event: { kind: "result" as const, exitCode: 0 },
         expected: { disposition: "finalized", lifecycle: "completed", handle: "finalized", parentSubscription: "consume", pane: "retain", delivery: "deliver", haltOrchestrator: false, removeFromRunning: true },
       },
       {
         name: "ask stays live despite auto-exit",
-        state: { cli: "pi", autoExit: true, delivery: "pending" as const },
+        state: { autoExit: true, delivery: "pending" as const },
         event: { kind: "ask" as const },
         expected: { disposition: "awaiting_answer", lifecycle: "unchanged", handle: "awaiting_answer", parentSubscription: "consume", pane: "retain", delivery: "deliver", haltOrchestrator: false, removeFromRunning: false },
       },
       {
         name: "fatal Pi failure abandons only this assignment",
-        state: { cli: "pi", autoExit: false, delivery: "pending" as const },
+        state: { autoExit: false, delivery: "pending" as const },
         event: { kind: "result" as const, exitCode: 1 },
         expected: { disposition: "abandoned", lifecycle: "failed", handle: "abandoned", parentSubscription: "cancel", pane: "close", delivery: "deliver", haltOrchestrator: true, removeFromRunning: true },
       },
-      {
-        name: "non-Pi failure remains ordinary result",
-        state: { cli: "test-shell", autoExit: true, delivery: "pending" as const },
-        event: { kind: "result" as const, exitCode: 1 },
-        expected: { disposition: "finalized", lifecycle: "failed", handle: "finalized", parentSubscription: "consume", pane: "close", delivery: "deliver", haltOrchestrator: false, removeFromRunning: true },
-      },
+
       {
         name: "cancelled Pi failure remains ordinary result",
-        state: { cli: "pi", autoExit: false, delivery: "pending" as const },
+        state: { autoExit: false, delivery: "pending" as const },
         event: { kind: "result" as const, exitCode: 1, errorMessage: "cancelled" },
         expected: { disposition: "finalized", lifecycle: "failed", handle: "finalized", parentSubscription: "consume", pane: "retain", delivery: "deliver", haltOrchestrator: false, removeFromRunning: true },
       },
       {
         name: "user abandonment suppresses later delivery",
-        state: { cli: "pi", autoExit: false, delivery: "pending" as const },
+        state: { autoExit: false, delivery: "pending" as const },
         event: { kind: "abandonment" as const, reason: "user" as const },
         expected: { disposition: "abandoned", lifecycle: "failed", handle: "abandoned", parentSubscription: "cancel", pane: "close", delivery: "suppress", haltOrchestrator: true, removeFromRunning: true },
       },
       {
         name: "duplicate completion is idempotent",
-        state: { cli: "pi", autoExit: false, abandoned: true, delivery: "delivered" as const },
+        state: { autoExit: false, abandoned: true, delivery: "delivered" as const },
         event: { kind: "result" as const, exitCode: 1 },
         expected: { disposition: "suppressed", lifecycle: "unchanged", handle: "unchanged", parentSubscription: "retain", pane: "retain", delivery: "suppress", haltOrchestrator: false, removeFromRunning: true },
       },
@@ -2804,7 +2771,7 @@ describe("subagent parent lifecycle", () => {
       errorMessage?: string;
     };
     type TestApi = {
-      runtime: { pi?: MockApi; halted: boolean };
+      runtime: { pi?: MockApi; halted: boolean; latestCtx?: { abort(): void } };
       deliverInitialCompletion(
         running: Record<string, unknown>,
         completion: Promise<CompletionResult>,
@@ -2816,7 +2783,7 @@ describe("subagent parent lifecycle", () => {
         pi: MockApi,
       ): void;
       completionResultMetadata(
-        running: { cli?: string },
+
         completion: CompletionPayload,
       ): { exitCode: number; errorMessage?: string };
       runningSubagents: Map<string, unknown>;
@@ -2851,6 +2818,8 @@ describe("subagent parent lifecycle", () => {
     ).render(120).join("\n");
     const originalPi = testApi.runtime.pi;
     const originalHalted = testApi.runtime.halted;
+    const originalCtx = testApi.runtime.latestCtx;
+    testApi.runtime.latestCtx = { abort() {} };
     const running = {
       id: "async-initial",
       name: "Worker",
@@ -2859,7 +2828,7 @@ describe("subagent parent lifecycle", () => {
       surface: "pane-async-initial",
       startTime: 1,
       sessionFile: "/tmp/async-initial.jsonl",
-      cli: "pi",
+
       autoExit: false,
       interactive: false,
       cwd: "/work/worker",
@@ -2894,7 +2863,7 @@ describe("subagent parent lifecycle", () => {
         ...running,
         id: "async-initial-failed",
         sessionFile: "/tmp/async-initial-failed.jsonl",
-        cli: "claude",
+
         lifecycle: createLifecycle(1),
       };
       testApi.deliverInitialCompletion(
@@ -2922,7 +2891,7 @@ describe("subagent parent lifecycle", () => {
         ...running,
         id: "continuation-failed",
         sessionFile: "/tmp/continuation-failed.jsonl",
-        cli: "claude",
+
         lifecycle: createLifecycle(1),
       };
       testApi.deliverPromptCompletion(continued, Promise.reject<CompletionResult>("plain rejection"), previousApi);
@@ -2942,7 +2911,7 @@ describe("subagent parent lifecycle", () => {
         ...running,
         id: "watcher-error",
         sessionFile: "/tmp/watcher-error.jsonl",
-        cli: "claude",
+
         lifecycle: createLifecycle(1),
       };
       testApi.deliverInitialCompletion(watcherError, Promise.resolve({
@@ -2950,7 +2919,7 @@ describe("subagent parent lifecycle", () => {
         task: watcherError.task,
         summary: "watcher failed",
         sessionFile: watcherError.sessionFile,
-        ...testApi.completionResultMetadata(watcherError, {
+        ...testApi.completionResultMetadata({
           reason: "error",
           exitCode: 1,
           errorMessage: "Subagent pane disappeared",
@@ -2970,7 +2939,7 @@ describe("subagent parent lifecycle", () => {
         ...running,
         id: "provider-failed",
         sessionFile: "/tmp/provider-failed.jsonl",
-        cli: "claude",
+
         lifecycle: createLifecycle(1),
       };
       testApi.deliverInitialCompletion(providerFailure, Promise.resolve({
@@ -2978,7 +2947,7 @@ describe("subagent parent lifecycle", () => {
         task: providerFailure.task,
         summary: "ignored",
         sessionFile: providerFailure.sessionFile,
-        ...testApi.completionResultMetadata(providerFailure, {
+        ...testApi.completionResultMetadata({
           reason: "error",
           exitCode: 1,
           errorMessage: "rate limited",
@@ -2990,36 +2959,36 @@ describe("subagent parent lifecycle", () => {
       assert.match(providerRendered, /failed/);
       assert.match(providerRendered, /rate limited/);
 
-      const exited = { ...providerFailure, id: "exit-17", lifecycle: createLifecycle(1) };
+      const exited = { ...running, id: "exit-17", lifecycle: createLifecycle(1) };
       testApi.deliverInitialCompletion(exited, Promise.resolve({
         name: exited.name, task: exited.task, summary: "exit", sessionFile: exited.sessionFile, exitCode: 17, elapsed: 6,
       }), previousApi);
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       assert.match(renderPublished(currentMessages[5].message), /Exit code 17/);
 
-      const continuedSuccess = { ...providerFailure, id: "continuation-success", lifecycle: createLifecycle(1) };
+      const continuedSuccess = { ...running, id: "continuation-success", lifecycle: createLifecycle(1) };
       testApi.deliverPromptCompletion(continuedSuccess, Promise.resolve({
         name: continuedSuccess.name, task: continuedSuccess.task, summary: "done", sessionFile: continuedSuccess.sessionFile, exitCode: 0, elapsed: 7,
       }), previousApi);
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       assert.match(renderPublished(currentMessages[6].message), /completed/);
 
-      const continuedProvider = { ...providerFailure, id: "continuation-provider", lifecycle: createLifecycle(1) };
+      const continuedProvider = { ...running, id: "continuation-provider", lifecycle: createLifecycle(1) };
       testApi.deliverPromptCompletion(continuedProvider, Promise.resolve({
         name: continuedProvider.name, task: continuedProvider.task, summary: "ignored", sessionFile: continuedProvider.sessionFile,
-        ...testApi.completionResultMetadata(continuedProvider, { reason: "error", exitCode: 1, errorMessage: "overloaded" }), elapsed: 8,
+        ...testApi.completionResultMetadata({ reason: "error", exitCode: 1, errorMessage: "overloaded" }), elapsed: 8,
       }), previousApi);
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       assert.match(renderPublished(currentMessages[7].message), /failed/);
 
-      const continuedExit = { ...providerFailure, id: "continuation-exit", lifecycle: createLifecycle(1) };
+      const continuedExit = { ...running, id: "continuation-exit", lifecycle: createLifecycle(1) };
       testApi.deliverPromptCompletion(continuedExit, Promise.resolve({
         name: continuedExit.name, task: continuedExit.task, summary: "exit", sessionFile: continuedExit.sessionFile, exitCode: 17, elapsed: 9,
       }), previousApi);
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       assert.match(renderPublished(currentMessages[8].message), /Exit code 17/);
 
-      const whitespace = { ...providerFailure, id: "whitespace-error", lifecycle: createLifecycle(1) };
+      const whitespace = { ...running, id: "whitespace-error", lifecycle: createLifecycle(1) };
       testApi.deliverInitialCompletion(whitespace, Promise.resolve({
         name: whitespace.name, task: whitespace.task, summary: "done", sessionFile: whitespace.sessionFile,
         exitCode: 0, elapsed: 10, errorMessage: " \t\n ",
@@ -3030,12 +2999,13 @@ describe("subagent parent lifecycle", () => {
       assert.equal(currentMessages[9].message.details.errorMessage, undefined);
 
       assert.deepEqual(
-        testApi.completionResultMetadata({ cli: "pi" }, { reason: "sentinel", exitCode: 0 }),
+        testApi.completionResultMetadata({ reason: "sentinel", exitCode: 0 }),
         { exitCode: 1, errorMessage: "Subagent Pi process exited before completion evidence was recorded." },
       );
     } finally {
       testApi.runtime.pi = originalPi;
       testApi.runtime.halted = originalHalted;
+      testApi.runtime.latestCtx = originalCtx;
       testApi.runningSubagents.delete(running.id);
       testApi.subagentHandles.delete(running.id);
     }
@@ -3054,7 +3024,7 @@ describe("subagent parent lifecycle", () => {
       for (const [assignment, asyncMode] of [["initial", true], ["prompt", false]] as const) {
         const running = {
           id: `${assignment}-ask`, name: "Friendly", task: "Work", agent: "implementer", cwd: "/effective/cwd",
-          surface: "recorded-pane", sessionFile: "/saved/child.jsonl", startTime: Date.now(), cli: "pi",
+          surface: "recorded-pane", sessionFile: "/saved/child.jsonl", startTime: Date.now(),
           orchestrationMode: asyncMode ? "async" : "wait-all", autoExit: false, interactive: false,
           lifecycle: createLifecycle(Date.now()), initialToolCallId: assignment === "initial" ? "initial-ask-call" : undefined,
         };
@@ -3106,7 +3076,7 @@ describe("subagent parent lifecycle", () => {
       surface: `pane-${id}`,
       startTime: 1,
       sessionFile: `/tmp/${id}.jsonl`,
-      cli: "pi",
+
       autoExit: false,
       interactive: false,
       abortController: new AbortController(),
@@ -3168,7 +3138,7 @@ describe("subagent parent lifecycle", () => {
     }
   });
 
-  void it("records only accepted user abandonment across harnesses, modes, and assignments", async () => {
+  void it("records only accepted user abandonment across modes and assignments", async () => {
     const { api, sentMessages, sentUserMessages } = createMockExtensionApi();
     const manager = SessionManager.inMemory();
     api.appendEntry = (customType: string, data?: object) => manager.appendCustomEntry(customType, data);
@@ -3179,44 +3149,42 @@ describe("subagent parent lifecycle", () => {
     manager.branch(root);
     const originalHalted = testApi.runtime.halted;
     try {
-      for (const cli of ["pi", "claude", "opencode", "codex", "grok", "custom"]) {
-        for (const mode of ["async", "wait-all"]) {
-          for (const assignment of ["initial", "continuation"]) {
-            const running = {
-              id: `${cli}-${mode}`, name: "Worker", task: assignment, cli, orchestrationMode: mode,
-              surface: "recorded-pane", startTime: Date.now() - 2_000, sessionFile: "/recorded/session.jsonl",
-              cwd: "/effective/cwd", agent: "implementer", autoExit: false, interactive: false,
-              initialToolCallId: assignment === "initial" ? "initial-call" : undefined,
-              lifecycle: createLifecycle(Date.now() - 2_000),
-            };
-            const agents = new Map([[running.id, running]]);
-            const count = manager.getEntryCount();
-            const leaf = manager.getLeafId();
-            testApi.runtime.halted = false;
-            assert.equal(testApi.abandonAllSubagents({ abort() {} }, agents, () => {}), 1);
-            assert.equal(manager.getEntryCount(), count + 1);
-            const entry = manager.getLeafEntry();
-            assert.equal(entry?.type, "custom");
-            if (entry?.type !== "custom") throw new Error("Expected native custom entry");
-            assert.equal(entry.customType, "subagent_outcome");
-            assert.equal(entry.parentId, leaf);
-            assert.deepEqual(entry.data, {
-              id: running.id, name: "Worker", task: assignment, agent: "implementer", cwd: "/effective/cwd",
-              surface: "recorded-pane", async: mode === "async", elapsed: 2,
-              sessionFile: "/recorded/session.jsonl", status: "abandoned", errorMessage: "Abandoned by user.",
-            });
-            assert.equal(running.initialToolCallId, undefined);
-            assert.equal(testApi.abandonAllSubagents({ abort() {} }, agents, () => {}), 0);
-            testApi.deliverPromptCompletion(running, Promise.resolve({
-              name: "Worker", task: assignment, summary: "late", exitCode: 0, elapsed: 2,
-            }), api);
-            await new Promise<void>((resolve) => setTimeout(resolve, 0));
-            assert.equal(manager.getEntryCount(), count + 1, "late result cannot append again");
-          }
+      for (const mode of ["async", "wait-all"]) {
+        for (const assignment of ["initial", "continuation"]) {
+          const running = {
+            id: `pi-${mode}`, name: "Worker", task: assignment, orchestrationMode: mode,
+            surface: "recorded-pane", startTime: Date.now() - 2_000, sessionFile: "/recorded/session.jsonl",
+            cwd: "/effective/cwd", agent: "implementer", autoExit: false, interactive: false,
+            initialToolCallId: assignment === "initial" ? "initial-call" : undefined,
+            lifecycle: createLifecycle(Date.now() - 2_000),
+          };
+          const agents = new Map([[running.id, running]]);
+          const count = manager.getEntryCount();
+          const leaf = manager.getLeafId();
+          testApi.runtime.halted = false;
+          assert.equal(testApi.abandonAllSubagents({ abort() {} }, agents, () => {}), 1);
+          assert.equal(manager.getEntryCount(), count + 1);
+          const entry = manager.getLeafEntry();
+          assert.equal(entry?.type, "custom");
+          if (entry?.type !== "custom") throw new Error("Expected native custom entry");
+          assert.equal(entry.customType, "subagent_outcome");
+          assert.equal(entry.parentId, leaf);
+          assert.deepEqual(entry.data, {
+            id: running.id, name: "Worker", task: assignment, agent: "implementer", cwd: "/effective/cwd",
+            surface: "recorded-pane", async: mode === "async", elapsed: 2,
+            sessionFile: "/recorded/session.jsonl", status: "abandoned", errorMessage: "Abandoned by user.",
+          });
+          assert.equal(running.initialToolCallId, undefined);
+          assert.equal(testApi.abandonAllSubagents({ abort() {} }, agents, () => {}), 0);
+          testApi.deliverPromptCompletion(running, Promise.resolve({
+            name: "Worker", task: assignment, summary: "late", exitCode: 0, elapsed: 2,
+          }), api);
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          assert.equal(manager.getEntryCount(), count + 1, "late result cannot append again");
         }
       }
       for (const delivery of ["delivered", "suppressed"] as const) {
-        const settled = { id: delivery, name: "Worker", task: "asked or delivered", cli: "pi", autoExit: false,
+        const settled = { id: delivery, name: "Worker", task: "asked or delivered", autoExit: false,
           startTime: Date.now(), lifecycle: markDelivery(createLifecycle(Date.now()), delivery) };
         const count = manager.getEntryCount();
         assert.equal(testApi.abandonAllSubagents({ abort() {} }, new Map([[settled.id, settled]]), () => {}), 0);
@@ -3241,7 +3209,7 @@ describe("subagent parent lifecycle", () => {
     const originalHalted = testApi.runtime.halted;
     withTempDir((dir) => {
       const agents = new Map(["first", "second"].map((id) => [id, {
-        id, name: "Worker", task: "work", cli: "pi", surface: `pane-${id}`, startTime: Date.now(),
+        id, name: "Worker", task: "work", surface: `pane-${id}`, startTime: Date.now(),
         sessionFile: join(dir, `${id}.jsonl`), autoExit: false, interactive: false, inputLocked: true,
         initialToolCallId: id, abortController: new AbortController(), lifecycle: createLifecycle(Date.now()),
       }]));
@@ -3300,7 +3268,7 @@ describe("subagent parent lifecycle", () => {
       surface: `pane-${id}`,
       startTime: 1,
       sessionFile: `/tmp/${id}.jsonl`,
-      cli: "pi",
+
       autoExit: false,
       interactive: false,
       lifecycle: markCompletionDetected(createLifecycle(1), { reason: "done", exitCode: 0 }, 2),
@@ -3541,7 +3509,7 @@ describe("status supervision", () => {
     };
     testApi.runningSubagents.set("stall-1", {
       id: "stall-1", name: "Worker", task: "", surface: "s1", startTime: 0,
-      sessionFile: "w.jsonl", interactive: false, cli: "claude", lifecycle,
+      sessionFile: "w.jsonl", interactive: false, lifecycle,
     });
     try {
       eventHandlers.get("session_start")![0]({}, {});
@@ -3971,7 +3939,7 @@ void describe("subagent tool UI adapters", () => {
           const sessionFile = createSessionFile(dir, [SESSION_HEADER]);
           const handle: SubagentHandle = { id, name: "Worker", agent: "implementer", cwd: dir, sessionFile,
             surface: "mock-pane", state: "awaiting_answer", subscribed: false, createdAt: 1, autoExit: false, interactive: false };
-          const running = { ...handle, task: "PRIVATE_OLD_TASK", startTime: 1, cli: "pi", runtimePlan: undefined,
+          const running = { ...handle, task: "PRIVATE_OLD_TASK", startTime: 1, runtimePlan: undefined,
             orchestrationMode: mode, inputLocked: false, lifecycle: markDelivery(createLifecycle(1), "delivered"),
             initialToolCallId: undefined as string | undefined, abortController: new AbortController() };
           owner.subagentHandles.set(id, handle);
@@ -4112,10 +4080,10 @@ void describe("subagent tool UI adapters", () => {
           assert.deepEqual(component.render(80), [], "cached pending call has no active assignment yet");
           let repaints = 0;
           let painted: string[] = [];
-          const ctx = { hasUI: true, sessionManager: { getEntries: () => [], getSessionFile: () => "/parent.jsonl" },
+          const ctx = { hasUI: true, abort() {}, sessionManager: { getEntries: () => [], getSessionFile: () => "/parent.jsonl" },
             ui: { setWidget() { repaints += 1; painted = component.render(80); } } };
           const running = { id, name: "Worker", task: "initial", cwd: "/effective/cwd", surface: "mock-pane",
-            startTime: Date.now(), sessionFile: "/mock-child.jsonl", cli: "claude", autoExit: false, interactive: false,
+            startTime: Date.now(), sessionFile: "/mock-child.jsonl", autoExit: false, interactive: false,
             orchestrationMode: mode, initialToolCallId: id, lifecycle: createLifecycle(Date.now()) };
           testApi.runningSubagents.set("other-active", { ...running, id: "other-active", initialToolCallId: "other-call" });
           eventHandlers.get("session_start")![0]({}, ctx);
@@ -4203,7 +4171,7 @@ void describe("subagent tool UI adapters", () => {
     const ctx = { sessionManager: { getSessionFile: () => "/parent.jsonl" } };
     testApi.setExecutionTestAdapters(async (params: { name: string; task: string }, _ctx: unknown, _thinking: string, options: { toolCallId: string }) => {
       const running = { id: options.toolCallId, name: params.name, task: params.task, cwd: "/work", surface: "mock-pane",
-        sessionFile: "/child.jsonl", cli: "claude", orchestrationMode: "wait-all", autoExit: false, interactive: false,
+        sessionFile: "/child.jsonl", orchestrationMode: "wait-all", autoExit: false, interactive: false,
         startTime: Date.now(), initialToolCallId: options.toolCallId, lifecycle: createLifecycle(Date.now()) };
       testApi.runningSubagents.set(running.id, running);
       return running;
@@ -4257,7 +4225,7 @@ void describe("subagent tool UI adapters", () => {
     const ctx = { hasUI: true, sessionManager: { getEntries: () => [], getSessionFile: () => "/parent.jsonl" },
       ui: { setWidget() { painted = component.render(80); } } };
     const running = { id: "reload-worker", name: "Worker", task: "initial", cwd: "/work", surface: "mock-pane",
-      sessionFile: "/mock-child.jsonl", startTime: 0, cli: "claude", autoExit: false, interactive: false,
+      sessionFile: "/mock-child.jsonl", startTime: 0, autoExit: false, interactive: false,
       orchestrationMode: "async", initialToolCallId: "reload-call", lifecycle: createLifecycle(0) };
     const terminal = { name: "Worker", task: "initial", summary: "PRIVATE_RESPONSE", exitCode: 0, elapsed: 2 };
     let finish!: (result: typeof terminal) => void;
@@ -4487,30 +4455,7 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
-  it("projects Claude agents as running and counts them as active", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const originalNow = Date.now;
-    Date.now = () => 30_000;
-    try {
-      const lines = testApi.renderSubagentWidgetLines([{
-        id: "c1",
-        name: "Claude",
-        task: "",
-        surface: "s1",
-        startTime: 5_000,
-        sessionFile: "sess1",
-        cli: "claude",
-        lifecycle: { ...createLifecycle(5_000), process: { kind: "running", startedAt: 5_000, confirmedAt: 5_000 } },
-        interactive: false,
-      }], 64);
 
-      assert.match(lines[0], /1 active/);
-      assert.ok(lines[0].includes("\x1b[38;2;77;163;255m"));
-      assert.match(lines[1], /running/);
-    } finally {
-      Date.now = originalNow;
-    }
-  });
 
   it("freezes runtime when the subagent reports done", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -4695,7 +4640,7 @@ void describe("subagent transcript activation", () => {
       cwd: "/effective/directory/with/many/segments", errorMessage: "long failure reason wraps too", async: true, elapsed: 8 };
     const lifecycle = createLifecycle(Date.now());
     const running = { ...details, name: "Worker", task: "initial", surface: "live-pane", lifecycle,
-      startTime: Date.now(), initialToolCallId: "mouse-initial", cli: "pi" };
+      startTime: Date.now(), initialToolCallId: "mouse-initial" };
     owner.runningSubagents.set(details.id, running);
     owner.runtime.latestCtx = { mode: "tui", sessionManager: { getSessionId: () => "mouse-parent" }, ui: { notify(text: string) { notifications.push(text); } } };
     owner.setFocusTestAdapter(async (pane) => { focused.push(pane); return { kind: "focused" }; });
@@ -4801,7 +4746,7 @@ void describe("subagent transcript activation", () => {
     const component = renderer({ details }, {}, theme);
     const handle = { id, name: "Duplicate", sessionFile: "/saved.jsonl", surface: "handle-pane", state: "active",
       subscribed: true, autoExit: false, interactive: false, createdAt: 1 };
-    const running = { id, name: "Duplicate", surface: "runtime-pane", cli: "pi", lifecycle: createLifecycle(0) };
+    const running = { id, name: "Duplicate", surface: "runtime-pane", lifecycle: createLifecycle(0) };
     const click = async (expected?: string, target = component) => {
       const priorFocusCount = focused.length;
       target.handleMouse(transcriptClick(0));
@@ -4837,7 +4782,7 @@ void describe("subagent transcript activation", () => {
       await click();
       owner.subagentHandles.delete(id);
       await click("runtime-pane");
-      running.cli = "claude";
+
       running.lifecycle.delivery = "pending";
       owner.subagentHandles.set(id, handle);
       await click("runtime-pane");
@@ -5034,7 +4979,7 @@ void describe("saved-session inspection", () => {
               assert.equal(component.handleMouse(transcriptClick(0))?.handled, true);
               await flush();
             }
-            const currentPane = owner.runningSubagents.get(handle.id)?.surface ?? "conflicting-pane";
+            const currentPane = "conflicting-pane";
             assert.deepEqual(clicked, [currentPane, currentPane], "own result keeps click id and current ownership despite conflicting display metadata");
             assert.equal(JSON.stringify(result), snapshot);
           } finally {
@@ -5123,7 +5068,7 @@ void describe("saved-session inspection", () => {
         const lifecycle = createLifecycle(0);
         lifecycle.delivery = delivery;
         owner.runningSubagents.set(handle.id, { ...handle, surface: "old-pane", task: "old assignment", startTime: 0, lifecycle,
-          interactive: true, cli: "pi", runtimePlan: undefined, orchestrationMode: "async" });
+          interactive: true, runtimePlan: undefined, orchestrationMode: "async" });
         await click();
         assert.deepEqual(created, []);
         assert.equal(hasCompletionChannel(handle.sessionFile), true);
@@ -5940,19 +5885,6 @@ describe("herdr.ts", () => {
   });
 
   describe("herdr response parsing", () => {
-    it("extracts pane id from a pane split response", () => {
-      const output = JSON.stringify({
-        result: {
-          pane: {
-            pane_id: "1-3",
-            tab_id: "1:2",
-            workspace_id: "1",
-          },
-        },
-      });
-      assert.equal(__herdrTest__.extractHerdrPaneId(output, "pane split"), "1-3");
-    });
-
     it("extracts root pane id from a tab create response", () => {
       const output = JSON.stringify({
         result: {
@@ -5961,13 +5893,6 @@ describe("herdr.ts", () => {
         },
       });
       assert.equal(__herdrTest__.extractHerdrRootPaneId(output, "tab create"), "1-2");
-    });
-
-    it("throws on malformed herdr JSON", () => {
-      assert.throws(
-        () => __herdrTest__.extractHerdrPaneId("not json", "pane split"),
-        /Unexpected herdr pane split output/,
-      );
     });
 
     it("parses pane-not-found JSON from stderr-shaped errors", () => {

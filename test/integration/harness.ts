@@ -36,10 +36,9 @@ import {
   shellQuote,
 } from "../../pi-extension/subagents/terminal.ts";
 
-type MuxBackend = "herdr";
-
-// Re-export mux primitives for tests
+// Re-export terminal primitives for tests
 export {
+  isTerminalAvailable,
   createSubagentPane,
   runInPane,
   runScriptInPane,
@@ -50,7 +49,6 @@ export {
   promptPane,
   shellQuote,
 };
-export type { MuxBackend };
 
 // ── Paths ──
 
@@ -88,55 +86,13 @@ export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openrouter/free";
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
-// ── Backend detection ──
-
-/** Detect whether the required herdr backend is available. */
-export function getAvailableBackends(): MuxBackend[] {
-  return isTerminalAvailable() ? ["herdr"] : [];
-}
-
-export function setBackend(_backend: MuxBackend): undefined {
-  return undefined;
-}
-
-export function restoreBackend(_prev: string | undefined): void {}
-
-export function focusSurface(_backend: MuxBackend, surface: string): void {
-  // Focus the tab containing the pane — herdr has no direct "focus pane X"
-  // CLI, but focusing the tab brings it to the foreground.
-  const info = execFileSync("herdr", ["pane", "get", surface], { encoding: "utf8" });
-  const tabId = JSON.parse(info)?.result?.pane?.tab_id;
-  if (tabId) execFileSync("herdr", ["tab", "focus", tabId], { encoding: "utf8" });
-}
-
-export function getFocusedSurface(_backend: MuxBackend): string | null {
+export function getFocusedSurface(): string | null {
   try {
     const info = execFileSync("herdr", ["pane", "current"], { encoding: "utf8" });
     return JSON.parse(info)?.result?.pane?.pane_id ?? null;
   } catch {
     return null;
   }
-}
-
-export function getSurfacePane(_backend: MuxBackend, surface: string): string | null {
-  return surface;
-}
-
-export async function waitForFocusedSurface(
-  backend: MuxBackend,
-  surface: string,
-  timeout: number = PI_TIMEOUT,
-): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    if (getFocusedSurface(backend) === surface) return;
-    await sleep(200);
-  }
-
-  throw new Error(
-    `Timeout (${timeout}ms) waiting for focused ${backend} surface ${surface}; ` +
-      `current focus is ${getFocusedSurface(backend) ?? "unknown"}`,
-  );
 }
 
 // ── Test environment ──
@@ -146,8 +102,6 @@ export interface TestEnv {
   dir: string;
   /** Isolated global Pi configuration directory. */
   agentDir: string;
-  /** Active mux backend for this test run */
-  backend: MuxBackend;
   /** Dedicated workspace owned by this test environment. */
   workspaceId: string;
   /** Parent workspace restored after cleanup. */
@@ -176,7 +130,7 @@ function createTestWorkspace(cwd: string): string {
  * Create an isolated test environment with test agent definitions.
  * Isolated global config contains copies of all test agents.
  */
-export function createTestEnv(backend: MuxBackend): TestEnv {
+export function createTestEnv(): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
   const agentDir = join(dir, "agent");
   const agentsDir = join(agentDir, "agents");
@@ -220,7 +174,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
     }
   }
 
-  return { dir, agentDir, backend, workspaceId, previousWorkspaceId, surfaces: [], tempFiles: [] };
+  return { dir, agentDir, workspaceId, previousWorkspaceId, surfaces: [], tempFiles: [] };
 }
 
 /**

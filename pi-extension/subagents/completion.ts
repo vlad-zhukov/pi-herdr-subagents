@@ -21,7 +21,6 @@ export interface CompletionOptions {
     observedAt: number,
   ) => void;
   sessionFile?: string;
-  sentinelFile?: string;
   onTick?: (elapsedSeconds: number) => void;
 }
 
@@ -136,20 +135,11 @@ function terminalExitCode(screen: string): number | null {
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
-function completionArtifact(options: CompletionOptions): CompletionPayload | null {
-  const sidecar = consumeExitSidecar(options.sessionFile);
-  if (sidecar) return sidecar;
-  if (options.sentinelFile && existsSync(options.sentinelFile)) {
-    return { reason: "sentinel", exitCode: 0 };
-  }
-  return null;
-}
-
 async function waitForDisappearanceArtifacts(
   signal: AbortSignal,
   options: CompletionOptions,
 ): Promise<CompletionPayload | null> {
-  const immediate = completionArtifact(options);
+  const immediate = consumeExitSidecar(options.sessionFile);
   if (immediate) return immediate;
 
   const graceMs = Math.max(0, options.paneDisappearanceGraceMs ?? 500);
@@ -157,7 +147,7 @@ async function waitForDisappearanceArtifacts(
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now();
     await abortableDelay(Math.min(25, remaining), signal);
-    const result = completionArtifact(options);
+    const result = consumeExitSidecar(options.sessionFile);
     if (result) return result;
   }
   return null;
@@ -188,12 +178,8 @@ export async function waitForCompletion(
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = completionArtifact(options);
+    const sidecarResult = consumeExitSidecar(options.sessionFile);
     if (sidecarResult) return sidecarResult;
-
-    if (options.sentinelFile && existsSync(options.sentinelFile)) {
-      return { reason: "sentinel", exitCode: 0 };
-    }
 
     try {
       const exitCode = terminalExitCode(await options.readTerminalTail());

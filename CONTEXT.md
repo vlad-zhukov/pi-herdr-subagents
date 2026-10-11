@@ -42,7 +42,7 @@ _Avoid_: observer, listener
 Pi-specific terminal handling for provider failure after retries, unexpected Pi exit, Pi-pane disappearance, or explicit Pi-pane closure. It abandons failed Assignment regardless of Auto-exit and halts Orchestrator.
 
 **User abandonment**:
-Operator Escape is hard stop: abandons every running Assignment and halts Orchestrator. Herdr pane closure is best-effort for non-Pi Subagents; surviving external processes have no handle or delivery path. Recover by later human input and new Subagent.
+Operator Escape is hard stop: abandons every running Assignment and halts Orchestrator. Herdr pane closure is best-effort; abandoned Pi sessions cannot be continued. Recover by later human input and new Subagent.
 
 **Operator**:
 Human controlling Interactive Subagent in its Herdr pane.

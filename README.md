@@ -38,7 +38,7 @@ PI_TEST_MODEL="deepseek/deepseek-v4-flash" PI_TEST_TIMEOUT=180000 npm run test:i
 
 The full suite launches real Pi sessions and can take several minutes. `PI_TEST_TIMEOUT` is the per-test timeout in milliseconds; use at least `180000` for the lifecycle suite.
 
-`PI_TEST_MODEL` is applied to both parent Pi sessions and test subagents created by the harness.
+`PI_TEST_MODEL` is applied to both parent Pi sessions and test subagents created by the integration suite.
 
 ## Install
 
@@ -96,18 +96,9 @@ with spawning enabled. Children always have `subagent_ask`. `/iterate` and
 
 Named agents load only from `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). Agent names and descriptions are listed in the `subagent` tool guidance when the extension loads (use `/reload` after adding agents). `description` is the only routing signal; phrase it as "Use when …".
 
-### Supported Harness CLIs
+### Subagent Runtime
 
-Agents default to running with `pi`, but can run inside any supported harness CLI or custom CLI configured via agent frontmatter:
-
-| Harness CLI | Frontmatter `cli:` | Model format | Notes |
-| :--- | :--- | :--- | :--- |
-| **Pi** (default) | `pi` (or omitted) | `provider/model` | Full support for thinking levels and live activity snapshots |
-| **OpenCode** | `opencode` | `provider/model` | Runs `opencode run --model <model> <task>` |
-| **Codex** | `codex` | bare model ID | Runs `codex --model <model>` with optional `--reasoning-effort` |
-| **Claude Code** | `claude` | bare model ID | Runs `claude --model <model>` with autonomous completion hook |
-| **Grok** | `grok` | bare model ID | Runs `grok --model <model> <task>` |
-| **Custom / Generic** | any CLI name | bare model ID | Supports custom `command:` template (e.g. `command: "aider --model {model} --message {task}"`) |
+Every subagent runs Pi in Herdr. Model/provider configuration selects its Pi model and thinking level.
 
 ---
 
@@ -138,7 +129,7 @@ Completion messages render with a colored background and are expandable with `Ct
 The widget projects each sub-agent from a **process + turn lifecycle**:
 
 - **Herdr pane inspection** is the coarse authority for whether the child process is present and whether Herdr reports it as idle, working, blocked, or done.
-- **Child activity snapshots** enrich the label with Pi-only detail (tool name, streaming, etc.) when available.
+- **Child activity snapshots** enrich the label with Pi activity detail (tool name, streaming, etc.) when available.
 - Session JSONL is still used for transcript, resume, lineage, and result extraction — not for liveness.
 
 Projected labels include:
@@ -148,7 +139,7 @@ Projected labels include:
 - `blocked` — Herdr reports the child as blocked
 - `waiting` — turn finished; the process is intentionally open for more input or another stage
 - `stalled` — pane inspection is unhealthy long enough that the parent can no longer trust the run
-- `running` — fallback when only coarse process presence is known (e.g. non-Pi backends)
+- `running` — fallback when only coarse process presence is known
 - `finalizing` — completion was observed and delivery is in progress; the process elapsed timer freezes here
 
 The widget header counts **active** vs **open**:
@@ -234,7 +225,7 @@ Runtime and role prompts come from `config.json` and named agent definitions.
 
 ## Continue a Subagent Session
 
-Every Pi-backed `subagent` result includes immutable `id`. Use `subagent_prompt`
+Every `subagent` result includes immutable `id`. Use `subagent_prompt`
 when existing session needs another turn: follow-up work, recovery after an
 interruption or failure, or answer to a child help request. Start unrelated work
 with `subagent` instead.
@@ -289,7 +280,7 @@ spawning: false
 You are a specialized agent that does X...
 ```
 
-When present, the body is the agent identity. Pi receives the absolute path to the selected definition and reads its current body at each child startup, appending it to the system prompt on every turn alongside existing `APPEND_SYSTEM.md` content; it is not attached to the task. Frontmatter-only agents are supported. Missing or unreadable definitions stop the child before a model call. Continuations reuse the saved path, not a new name lookup; older session handles without a saved path cannot resume named agents. There is no prompt-mode frontmatter setting.
+When present, the body is the agent identity. Pi receives the absolute path to the selected definition and reads its current body at each child startup, appending it to the system prompt on every turn alongside existing `APPEND_SYSTEM.md` content; it is not attached to the task. Frontmatter-only agents are supported. Missing or unreadable definitions stop the child before a model call. Continuations reuse the saved definition path rather than looking up the agent by name.
 
 ### Frontmatter Reference
 
@@ -306,7 +297,7 @@ When present, the body is the agent identity. Pi receives the absolute path to t
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from the model-facing catalog. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
-Runtime model selection belongs in `config.json` under `models.agents`; append a thinking suffix to the selected model value when needed. `model` and `thinking` frontmatter fields are ignored.
+Runtime model selection belongs in `config.json` under `models.agents`; append a thinking suffix to the selected model value when needed.
 
 ---
 
@@ -356,13 +347,9 @@ declarations available in both codemode modes (`on` and `only`), while excluding
 them from inline codemode declarations, `ALL_TOOLS`, `searchTools`,
 `describeTool`, and `describeNamespace`. Known-name script calls cannot invoke
 any of these tools.
-Spawning permissions remain unchanged: Orchestrators and children with
-`spawning: true` retain direct delegation access; children with spawning disabled
-have neither delegation tool. `subagent_ask` remains child-only and available
-regardless of spawning permission; question handling and Parent subscriptions
-are unchanged. Async and Wait-all behavior, command workflows, and unrelated
-tools are unchanged. Reload the extension or start a new session to apply this
-restriction.
+Orchestrators and children with `spawning: true` have direct delegation access;
+children with spawning disabled have neither delegation tool. `subagent_ask`
+is child-only and available regardless of spawning permission.
 
 By default, child sessions cannot spawn further sub-agents. Set `spawning: true` when nested delegation is intentional:
 
