@@ -288,7 +288,7 @@ When present, the body is the agent identity. Pi receives the absolute path to t
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Only routing signal in the model-facing catalog; phrase as "Use when …"                                                                                                                                                                                                     |
-| `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
+| `tools`       | string  | Comma-separated allowlist or signed modifiers; supports built-in and extension tools available in the child. |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `lineage-only` when omitted; `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Defaults to `false` for child sessions; set `true` to allow nested subagent-spawning tools                                                                                                                                                                                        |
@@ -296,6 +296,22 @@ When present, the body is the agent identity. Pi receives the absolute path to t
 | `interactive` | boolean | `false` | Keep session open until `/subagent_finalize` runs in its pane. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from the model-facing catalog. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+
+`tools` accepts either:
+
+- A plain allowlist, such as `read, bash`, with duplicates removed.
+- Ordered signed modifiers (`+tool`, `-tool`) applied to the child Pi's configured defaults, not the orchestrator's active tools. Repeated modifiers are preserved.
+
+Both modes append mandatory `subagent_ask`; signed mode adds it last as `+subagent_ask`, overriding any removal.
+
+```yaml
+---
+name: researcher
+tools: +web_search, -bash
+---
+```
+
+Omitted or blank `tools` preserves defaults. Entry whitespace is ignored. Do not mix plain and signed entries; Pi validates and resolves selections.
 
 Runtime model selection belongs in `config.json` under `models.agents`; append a thinking suffix to the selected model value when needed.
 
@@ -428,7 +444,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
-- [Pi 1.0+](https://github.com/badlogic/pi-mono) — the coding agent
+- [Pi 1.1.0+](https://github.com/badlogic/pi-mono) — the coding agent
 - [herdr](https://herdr.dev) — the required terminal workspace
 
 ```bash

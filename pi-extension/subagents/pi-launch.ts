@@ -15,6 +15,11 @@ export function buildSubagentToolAllowlist(effectiveTools?: string): string | nu
 
   if (requested.length === 0) return null;
 
+  if (requested.every((tool) => tool.startsWith("+") || tool.startsWith("-"))) {
+    // Preserve modifier order; final additions override control-tool removals.
+    return [...requested, ...SUBAGENT_CONTROL_TOOLS.map((tool) => `+${tool}`)].join(",");
+  }
+
   const allow = new Set(requested);
   for (const tool of SUBAGENT_CONTROL_TOOLS) {
     allow.add(tool);

@@ -24,7 +24,7 @@ import {
   type SubagentHandle,
 } from "../pi-extension/subagents/assignment-handles.ts";
 
-import { buildPiContinuationCommand, launchPiContinuation } from "../pi-extension/subagents/pi-launch.ts";
+import { buildPiCommand, buildPiContinuationCommand, launchPiContinuation } from "../pi-extension/subagents/pi-launch.ts";
 import { createSubagentPane, runScriptInPane } from "../pi-extension/subagents/terminal.ts";
 import { buildAsyncAcknowledgement, buildSubagentGuidelines, resolveSubagentName } from "../pi-extension/subagents/orchestrator-prompt.ts";
 
@@ -1083,6 +1083,63 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
+
+  const toolSelections = [
+    { name: "signed additions", value: "+web_search", expected: "+web_search,+subagent_ask" },
+    { name: "signed removals", value: "-bash", expected: "-bash,+subagent_ask" },
+    { name: "combined signed modifiers", value: "+web_search,-bash", expected: "+web_search,-bash,+subagent_ask" },
+    { name: "signed whitespace", value: "  +web_search , -bash  ", expected: "+web_search,-bash,+subagent_ask" },
+    { name: "repeated conflicting modifiers", value: "+bash,-bash,+bash", expected: "+bash,-bash,+bash,+subagent_ask" },
+    { name: "mandatory tool removal", value: "-subagent_ask", expected: "-subagent_ask,+subagent_ask" },
+    { name: "conflicting mandatory tool modifiers", value: "+subagent_ask,-subagent_ask", expected: "+subagent_ask,-subagent_ask,+subagent_ask" },
+    { name: "plain allowlist", value: "read,bash,web_search", expected: "read,bash,web_search,subagent_ask" },
+    { name: "plain whitespace and duplicates", value: " read , bash, read , subagent_ask,subagent_ask ", expected: "read,bash,subagent_ask" },
+    { name: "omitted tools", value: undefined, expected: undefined },
+    { name: "empty tools", value: "", expected: undefined },
+    { name: "quoted empty tools", value: "''", expected: undefined },
+    { name: "whitespace-only tools", value: "'   '", expected: undefined },
+    { name: "empty comma-separated entries", value: "' , , '", expected: undefined },
+    { name: "mixed plain and signed entries", value: "read,+web_search", expected: "read,+web_search,subagent_ask" },
+    { name: "mixed signed and plain entries", value: "+web_search,read", expected: "+web_search,read,subagent_ask" },
+  ];
+
+  for (const { name, value, expected } of toolSelections) {
+    it(`forwards ${name} from frontmatter to the child CLI`, async () => {
+      await withIsolatedAgentEnv(({ globalAgentsDir, projectDir }) => {
+        writeAgentFile(
+          globalAgentsDir,
+          "tool-selection-test-agent",
+          [
+            "name: tool-selection-test-agent",
+            ...(value === undefined ? [] : [`tools: ${value}`]),
+          ].join("\n"),
+        );
+        const agentDefs = subagentsModule.__test__.loadAgentDefaults("tool-selection-test-agent");
+        assert.ok(agentDefs, "expected agent to load");
+
+        const { command } = buildPiCommand({
+          params: { id: "tools-test", name: "Tools test", task: "Test tools", agent: agentDefs.name },
+          agentDefs,
+          runtimePlan: { model: "fake/test", thinking: "low" },
+          surface: "test-surface",
+          artifactDir: projectDir,
+          subagentSessionFile: join(projectDir, "test-session.jsonl"),
+          effectiveCwd: null,
+          localAgentDir: null,
+          effectiveAutoExit: false,
+          effectiveInteractive: false,
+          taskDelivery: "direct",
+          spawning: false,
+          modeHint: "",
+          summaryInstruction: "",
+        });
+
+        const toolsArg = / --tools '([^']*)'/.exec(command)?.[1];
+        assert.equal(toolsArg, expected);
+        assert.equal(command.includes(" --tools "), expected !== undefined);
+      });
+    });
+  }
 
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
