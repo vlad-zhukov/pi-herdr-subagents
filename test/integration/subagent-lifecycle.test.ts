@@ -19,7 +19,9 @@ import { describe, it, before, after } from "node:test";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { getSubagentActivityFile, readSubagentActivityFile } from "../../pi-extension/subagents/activity.ts";
+import { restoreSubagentHandles } from "../../pi-extension/subagents/assignment-handles.ts";
 import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import {
   isTerminalAvailable,
@@ -397,23 +399,23 @@ if (!herdrAvailable) {
     });
 
 
-    it("wait-all returns a resumed subagent result through its original tool call", async () => {
+    it("role-counter pane labels and saved-session continuation retain original wait-all identity", async () => {
       const id = uniqueId();
       const firstFile = `/tmp/pi-integ-wait-all-resume-first-${id}.txt`;
       const resumedFile = `/tmp/pi-integ-wait-all-resume-result-${id}.txt`;
       const parentFile = `/tmp/pi-integ-wait-all-resume-parent-${id}.txt`;
-      trackTempFile(env, firstFile);
-      trackTempFile(env, resumedFile);
-      trackTempFile(env, parentFile);
+      const initialPaneFile = `/tmp/pi-integ-initial-pane-${id}.json`;
+      const resumedPaneFile = `/tmp/pi-integ-resumed-pane-${id}.json`;
+      for (const file of [firstFile, resumedFile, parentFile, initialPaneFile, resumedPaneFile]) trackTempFile(env, file);
       configureWaitAll(env);
 
       const firstName = `ResumeSource-${id}`;
       const surface = createTrackedSurface(env, `resume-wait-all-${id}`);
       await sleep(1000);
       startPi(surface, env.dir, [
-        `Call subagent with name "${firstName}", agent "test-echo", and task "Run: echo 'FIRST_${id}' > '${firstFile}'".`,
-        `After its result returns, call subagent_prompt with immutable id from that result,`,
-        `and message "Run bash: echo 'RESUMED_${id}' > '${resumedFile}'".`,
+        `Call subagent exactly once with name "${firstName}", agent "test-echo", and task: Run bash: herdr pane get "$PI_SUBAGENT_SURFACE" > '${initialPaneFile}'; echo 'FIRST_${id}' > '${firstFile}'.`,
+        `After its result returns, call subagent_prompt with id "test-echo-01" from that result,`,
+        `and message: Run bash: herdr pane get "$PI_SUBAGENT_SURFACE" > '${resumedPaneFile}'; echo 'RESUMED_${id}' > '${resumedFile}'.`,
         `Only after subagent_prompt returns, run bash: echo 'PARENT_${id}' > '${parentFile}'.`,
         "Then say RESUME_WAIT_ALL_COMPLETE.",
       ].join("\n"));
@@ -422,8 +424,94 @@ if (!herdrAvailable) {
       assert.match(await waitForFile(resumedFile, PI_TIMEOUT, /RESUMED_/), new RegExp(`RESUMED_${id}`));
       await waitForScreen(surface, /RESUME_WAIT_ALL_COMPLETE/, PI_TIMEOUT);
       assertWaitAllDelivery(surface, firstName, ["completed", "completed"]);
+      const parentSessionFile = paneSessionFile(surface);
+      assert.ok(parentSessionFile);
+      const entries = parseSessionEntries(readFileSync(parentSessionFile, "utf8"));
+      const handle = [...restoreSubagentHandles(entries).values()].find((saved) => saved.name === firstName);
+      assert.ok(handle);
+      assert.equal(handle.id, "test-echo-01");
+      const initialPane = JSON.parse(readFileSync(initialPaneFile, "utf8")).result.pane;
+      const resumedPane = JSON.parse(readFileSync(resumedPaneFile, "utf8")).result.pane;
+      assert.equal(initialPane.label, handle.id);
+      assert.equal(resumedPane.label, handle.id);
+      assert.deepEqual(entries.filter((entry) => entry.type === "custom" && entry.customType === "subagent_counter")
+        .map((entry) => entry.type === "custom" ? entry.data : undefined), [{ version: 1, parentId: null, value: 1 }]);
     });
 
+    it("nested spawning preserves hierarchical labels, activity and counters through ID-based continuation", async () => {
+      const id = uniqueId();
+      const initialPaneFile = `/tmp/pi-integ-nested-initial-${id}.json`;
+      const resumedPaneFile = `/tmp/pi-integ-nested-resumed-${id}.json`;
+      const nextPaneFile = `/tmp/pi-integ-nested-next-${id}.json`;
+      const parentFile = `/tmp/pi-integ-nested-parent-${id}.txt`;
+      for (const file of [initialPaneFile, resumedPaneFile, nextPaneFile, parentFile]) trackTempFile(env, file);
+      configureWaitAll(env);
+      const name = `Nested-${id}`;
+      const parentId = "test-spawner-01";
+      const childId = `${parentId}-test-echo-01`;
+      const nextId = `${parentId}-test-echo-02`;
+      const firstTask = [
+        `Call subagent exactly once with agent test-echo, name Nested description, and task:`,
+        `Run bash: herdr pane get "$PI_SUBAGENT_SURFACE" > '${initialPaneFile}'.`,
+        `After result returns, call subagent_prompt with id ${childId} and message:`,
+        `Run bash: herdr pane get "$PI_SUBAGENT_SURFACE" > '${resumedPaneFile}'.`,
+        `After continuation returns, report NESTED_FIRST_DONE.`,
+      ].join("\n");
+      const nextTask = [
+        `Call subagent exactly once with agent test-echo, name Next description, and task:`,
+        `Run bash: herdr pane get "$PI_SUBAGENT_SURFACE" > '${nextPaneFile}'.`,
+        `After result returns, report NESTED_NEXT_DONE.`,
+      ].join("\n");
+      const surface = createTrackedSurface(env, `nested-${id}`);
+      await sleep(1000);
+      startPi(surface, env.dir, [
+        `Call subagent exactly once with agent test-spawner, name "${name}", and task ${JSON.stringify(firstTask)}.`,
+        `After result returns, call subagent_prompt with id ${parentId} and message ${JSON.stringify(nextTask)}.`,
+        `Only after continuation returns, run bash: echo NESTED_${id} > '${parentFile}'.`,
+        `Then say NESTED_COMPLETE.`,
+      ].join("\n"));
+      await waitForFile(parentFile, PI_TIMEOUT, new RegExp(`NESTED_${id}`));
+      await waitForScreen(surface, /NESTED_COMPLETE/, PI_TIMEOUT);
+      assertWaitAllDelivery(surface, name, ["completed", "completed"]);
+      const rootFile = paneSessionFile(surface);
+      assert.ok(rootFile);
+      const parent = restoreSubagentHandles(parseSessionEntries(readFileSync(rootFile, "utf8"))).get(parentId);
+      assert.ok(parent);
+      assert.equal(parent.spawning, true);
+      const entries = parseSessionEntries(readFileSync(parent.sessionFile, "utf8"));
+      const children = restoreSubagentHandles(entries);
+      const child = children.get(childId);
+      const next = children.get(nextId);
+      assert.ok(child);
+      assert.ok(next);
+      assert.deepEqual([...children.keys()], [childId, nextId]);
+      assert.deepEqual(entries.filter((entry) => entry.type === "custom" && entry.customType === "subagent_counter")
+        .map((entry) => entry.type === "custom" ? entry.data : undefined), [
+          { version: 1, parentId, value: 1 }, { version: 1, parentId, value: 2 },
+        ]);
+      for (const [file, expectedId] of [[initialPaneFile, childId], [resumedPaneFile, childId], [nextPaneFile, nextId]]) {
+        assert.equal(JSON.parse(readFileSync(file, "utf8")).result.pane.label, expectedId);
+      }
+      const messages = entries.flatMap((entry) => entry.type === "message" ? [entry.message] : []);
+      const results = messages.filter((message) => message.role === "toolResult" &&
+        (message.toolName === "subagent" || message.toolName === "subagent_prompt"));
+      assert.deepEqual(results.map((result) => result.details && typeof result.details === "object" ? Reflect.get(result.details, "id") : undefined),
+        [childId, childId, nextId]);
+      const header = JSON.parse(readFileSync(parent.sessionFile, "utf8").split("\n")[0]);
+      const artifactDir = join(dirname(parent.sessionFile), "artifacts", header.id);
+      const activityFile = getSubagentActivityFile(artifactDir, child.sessionFile);
+      const activity = readSubagentActivityFile(activityFile, childId);
+      assert.equal(activity.ok, true, "continued nested child reports full identity at parent's session-keyed activity path");
+      if (activity.ok) assert.equal(activity.activity.runningChildId, childId);
+      const scripts = readdirSync(join(artifactDir, "subagent-scripts"))
+        .filter((file) => file.startsWith(basename(child.sessionFile)));
+      assert.equal(scripts.length, 2, "hierarchical child reopens original saved session");
+      for (const script of scripts) {
+        const command = readFileSync(join(artifactDir, "subagent-scripts", script), "utf8");
+        assert.ok(command.includes(`PI_SUBAGENT_ID='${childId}'`));
+        assert.ok(command.includes(`PI_SUBAGENT_ACTIVITY_FILE='${activityFile}'`));
+      }
+    });
 
     // ── In-progress activity snapshots ──
 
@@ -618,34 +706,37 @@ if (!herdrAvailable) {
     // ── Agent discovery ──
 
     it("unknown agent names are rejected without launching anything", async () => {
-      const id = uniqueId();
-      const surface = createTrackedSurface(env, `unknown-${id}`);
-      const existingPanes = new Set(workspacePaneIds(env));
-      await sleep(1000);
+      // Other tests leave async parents alive; no-launch assertions need their own workspace.
+      const isolated = createTestEnv();
+      try {
+        const id = uniqueId();
+        const surface = createTrackedSurface(isolated, `unknown-${id}`);
+        const existingPanes = new Set(workspacePaneIds(isolated));
+        await sleep(1000);
 
-      startPi(surface, env.dir, [
-        `Call the subagent tool exactly once with name "Typo-${id}", agent "no-such-agent-${id}", and task "anything".`,
-        `Then say UNKNOWN_DONE and do nothing else, even if the call fails.`,
-      ].join("\n"));
+        startPi(surface, isolated.dir, [
+          `Call the subagent tool exactly once with name "Typo-${id}", agent "no-such-agent-${id}", and task "anything".`,
+          `Then say UNKNOWN_DONE and do nothing else, even if the call fails.`,
+        ].join("\n"));
 
-      await waitForScreen(surface, /Unknown agent "no-such-agent/, PI_TIMEOUT, 300);
-      await sleep(1500); // let the session file catch up with the screen
-      assert.ok(
-        toolResultTexts(env).some((text) => text.startsWith(`Unknown agent "no-such-agent-${id}". Available:`)),
-        "the tool result must be the unknown-agent error",
-      );
-      assert.deepEqual(
-        workspacePaneIds(env).filter((pane) => !existingPanes.has(pane)),
-        [],
-        "no child pane may be launched",
-      );
+        await waitForScreen(surface, /UNKNOWN_DONE/, PI_TIMEOUT, 300);
+        await waitForToolResult(isolated, new RegExp(`^Unknown agent "no-such-agent-${id}"\\. Available:`), PI_TIMEOUT);
+        assert.equal(subagentToolCalls(isolated).length, 1, "model must issue exactly the requested rejected call");
+        assert.deepEqual(
+          workspacePaneIds(isolated).filter((pane) => !existingPanes.has(pane)),
+          [],
+          `no child pane may be launched; calls: ${JSON.stringify(subagentToolCalls(isolated))}`,
+        );
+      } finally {
+        cleanupTestEnv(isolated);
+      }
     });
 
     it("subagent finds a visible agent from the prompt catalog", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
       trackTempFile(env, markerFile);
-      const agentName = `marker-writer-${id}`;
+      const agentName = `marker-writer-v${id}`;
       writeFileSync(
         join(env.agentDir, "agents", `${agentName}.md`),
         [

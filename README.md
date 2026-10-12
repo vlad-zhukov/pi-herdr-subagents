@@ -18,7 +18,7 @@ For parallel execution, just call `subagent` multiple times — they all run con
 ```typescript
 subagent({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" });
 subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
-// Both return immediately, results steer back independently
+// IDs and pane labels: scout-01, scout-02. Names remain descriptive.
 ```
 
 ## Development
@@ -212,7 +212,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 
 | Parameter              | Type    | Default        | Description                                                                                       |
 | ---------------------- | ------- | -------------- | ------------------------------------------------------------------------------------------------- |
-| `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
+| `name`                 | string  | agent or `fork` | Optional descriptive name shown in widget                                                     |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load role, tools, skills, and lifecycle defaults from agent definition                           |
 | `fork`                 | boolean | `false`        | Use only for an explicitly requested current-session fork; overrides agent `session-mode`; bare calls without `agent` require `fork: true` |
@@ -220,6 +220,20 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
 
 Runtime and role prompts come from `config.json` and named agent definitions.
+
+IDs and Herdr labels use full role and ancestry, not descriptive `name`:
+root children `scout-01`, `implementer-02`, `scout-03`; with `spawning: true`,
+nested children such as `implementer-02-scout-01`. Each parent shares one
+persistent counter across roles (`01`, …, `99`, `100`, …). Allocations are never
+reused, even after failed launches; continuation/reopening keeps ID and child
+counter. Bare forks use role `fork`; named forks use their agent role.
+Extension-managed forks start fresh child counters despite copied history.
+
+IDs are unique within one rooted tree, treated as one workspace by the user;
+suffix counts parent allocations, not whole-tree agents. Independent roots may
+repeat IDs; no global allocator or workspace ownership enforcement. Concurrent
+copies of the same parent, including manual/native forks retaining identity,
+may duplicate IDs; no locking or duplicate-instance detection/prevention.
 
 ---
 
@@ -231,7 +245,9 @@ interruption or failure, or answer to a child help request. Start unrelated work
 with `subagent` instead.
 
 ```typescript
-subagent_prompt({ id: "child-handle", message: "Use v2 and continue." });
+subagent_prompt({ id: "implementer-02", message: "Use v2 and continue." });
+// Within implementer-02, continue its child by full hierarchical ID:
+subagent_prompt({ id: "implementer-02-scout-01", message: "Check v2 too." });
 ```
 
 Each spawn or `subagent_prompt` observes one child turn. Its next result or
@@ -264,7 +280,11 @@ This always forks the current session into a subagent with full conversation con
 
 ## Custom Agents
 
-Place a `.md` file in `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). Keep filename and frontmatter `name` aligned (for example, `researcher.md` must declare `name: researcher`) so discovery and direct invocation agree:
+Place definitions in `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). Required YAML `name` must exactly match the `.md` filename stem. Use lowercase ASCII letters and digits, separated by `-` or `_` (mixing allowed); every segment starts with a letter. Valid: `scout`, `code_reviewer`, `code_review-v2`. Invalid: `Scout`, `scout-01`, `code__reviewer`.
+
+Invalid definitions, including hidden agents, are skipped with filename-specific warnings and cannot launch.
+
+Save this example as `my-agent.md`:
 
 ```markdown
 ---
@@ -286,14 +306,14 @@ When present, the body is the agent identity. Pi receives the absolute path to t
 
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
+| `name`        | string  | Required matching filename stem; lowercase ASCII letter-led segments (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Only routing signal in the model-facing catalog; phrase as "Use when …"                                                                                                                                                                                                     |
 | `tools`       | string  | Comma-separated allowlist or signed modifiers; supports built-in and extension tools available in the child. |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `lineage-only` when omitted; `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Defaults to `false` for child sessions; set `true` to allow nested subagent-spawning tools                                                                                                                                                                                        |
-| `auto-exit`   | boolean | `false` | Close Pi and its Herdr pane after the result is sent. Independent from `interactive`. |
-| `interactive` | boolean | `false` | Keep session open until `/subagent_finalize` runs in its pane. |
+| `auto-exit`   | boolean | Default `false`. Close Pi and its Herdr pane after the result is sent. Independent from `interactive`. |
+| `interactive` | boolean | Default `false`. Keep session open until `/subagent_finalize` runs in its pane. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from the model-facing catalog. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
@@ -413,8 +433,8 @@ project/
 ```
 
 ```typescript
-subagent({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the combat system" });
-subagent({ name: "SRE", cwd: "agents/sre", task: "Review deployment pipeline" });
+subagent({ name: "Game Designer", agent: "game-designer", cwd: "agents/game-designer", task: "Design the combat system" });
+subagent({ name: "SRE", agent: "sre", cwd: "agents/sre", task: "Review deployment pipeline" });
 ```
 
 Set a default `cwd` in agent frontmatter:

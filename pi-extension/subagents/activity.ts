@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
 export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
@@ -100,8 +100,8 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
 
-export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
-  return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
+export function getSubagentActivityFile(artifactDir: string, sessionFile: string): string {
+  return join(artifactDir, "subagent-activity", `${basename(sessionFile)}.json`);
 }
 
 function requireObject(value: unknown): Record<string, unknown> | null {
@@ -204,7 +204,7 @@ export function readSubagentActivityFile(
 export function writeSubagentActivityFile(activityFile: string, activity: SubagentActivityState): void {
   const dir = dirname(activityFile);
   mkdirSync(dir, { recursive: true });
-  const tempFile = join(dir, `${activity.runningChildId}.json.${process.pid}.${activity.sequence}.tmp`);
+  const tempFile = join(dir, `${basename(activityFile)}.${process.pid}.${activity.sequence}.tmp`);
 
   try {
     writeFileSync(tempFile, `${JSON.stringify(activity)}\n`, "utf8");

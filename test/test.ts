@@ -2,7 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { Value } from "@sinclair/typebox/value";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,7 @@ import {
   type SubagentHandle,
 } from "../pi-extension/subagents/assignment-handles.ts";
 
+import { allocateSubagentId, SUBAGENT_COUNTER_ENTRY } from "../pi-extension/subagents/identity.ts";
 import { buildPiCommand, buildPiContinuationCommand, launchPiContinuation } from "../pi-extension/subagents/pi-launch.ts";
 import { createSubagentPane, runScriptInPane } from "../pi-extension/subagents/terminal.ts";
 import { buildAsyncAcknowledgement, buildSubagentGuidelines, resolveSubagentName } from "../pi-extension/subagents/orchestrator-prompt.ts";
@@ -1206,41 +1207,88 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("resolves loadAgentDefaults by the frontmatter name the catalog advertises, not the filename", async () => {
-    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
-      writeAgentFile(
-        globalAgentsDir,
-        "renamed-file-test-agent",
-        [
-          "name: aliased-test-agent",
-          "description: Frontmatter name differs from filename",
-        ].join("\n"),
-        "You are the aliased agent.",
-      );
-
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
-
-      const guidance = registeredTools.find((tool) => tool.name === "subagent").promptGuidelines.join("\n");
-      assert.match(guidance, /<agent name="aliased-test-agent">/, "catalog should advertise the frontmatter name");
-
-      const loadedByFrontmatterName = testApi.loadAgentDefaults("aliased-test-agent");
-      assert.ok(
-        loadedByFrontmatterName,
-        "loadAgentDefaults must resolve the same name the catalog advertises",
-      );
-      assert.equal(loadedByFrontmatterName.model, undefined);
-      assert.equal(loadedByFrontmatterName.thinking, undefined);
-      assert.equal(loadedByFrontmatterName.file, join(globalAgentsDir, "renamed-file-test-agent.md"));
-
-      const loadedByFilename = testApi.loadAgentDefaults("renamed-file-test-agent");
-      assert.equal(
-        loadedByFilename,
-        null,
-        "the filename alone should not resolve once frontmatter overrides the name",
-      );
+  for (const name of ["scout", "code-reviewer", "code_reviewer", "code_review-v2", "a", "a0-b9"]) {
+    it(`discovers matching role name ${name} without changing it`, async () => {
+      await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+        writeAgentFile(globalAgentsDir, name, `name: "${name}"`);
+        const errors: string[] = [];
+        const agents = testApi.discoverAgentDefinitions((message: string) => errors.push(message));
+        assert.deepEqual(agents.map((agent: { name: string }) => agent.name), [name]);
+        assert.deepEqual(errors, []);
+        assert.equal(testApi.loadAgentDefaults(name).file, join(globalAgentsDir, `${name}.md`));
+      });
     });
-  });
+  }
+
+  const invalidNames = [
+    { stem: "missing", yaml: "description: Missing name", reason: /required.*nonempty string/ },
+    { stem: "empty", yaml: 'name: ""', reason: /required.*nonempty string/ },
+    { stem: "numeric-name", yaml: "name: 123", reason: /required.*nonempty string/ },
+    { stem: "renamed-file-test-agent", yaml: "name: aliased-test-agent", reason: /must exactly match filename stem/ },
+    { stem: "Scout", yaml: "name: Scout", reason: /lowercase ASCII/ },
+    { stem: "code__reviewer", yaml: "name: code__reviewer", reason: /lowercase ASCII/ },
+    { stem: "code_-reviewer", yaml: "name: code_-reviewer", reason: /lowercase ASCII/ },
+    { stem: "scout_", yaml: "name: scout_", reason: /lowercase ASCII/ },
+    { stem: "code reviewer", yaml: "name: code reviewer", reason: /lowercase ASCII/ },
+    { stem: "path-name", yaml: 'name: "../scout"', reason: /lowercase ASCII/ },
+    { stem: "2scout", yaml: "name: 2scout", reason: /lowercase ASCII/ },
+    { stem: "scout-2review", yaml: "name: scout-2review", reason: /lowercase ASCII/ },
+    { stem: "scout-01", yaml: "name: scout-01", reason: /lowercase ASCII/ },
+    { stem: "-scout", yaml: "name: -scout", reason: /lowercase ASCII/ },
+    { stem: "scöut", yaml: "name: scöut", reason: /lowercase ASCII/ },
+    { stem: "scout", yaml: 'name: " scout "', reason: /lowercase ASCII/ },
+  ];
+
+  for (const { stem, yaml, reason } of invalidNames) {
+    it(`rejects invalid definition ${stem} without blocking valid siblings`, async () => {
+      await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+        writeAgentFile(globalAgentsDir, "worker", "name: worker");
+        writeAgentFile(globalAgentsDir, stem, yaml);
+        const errors: string[] = [];
+        const agents = testApi.discoverAgentDefinitions((message: string) => errors.push(message));
+        assert.deepEqual(agents.map((agent: { name: string }) => agent.name), ["worker"]);
+        assert.equal(errors.length, 1);
+        assert.ok(errors[0].startsWith(`${stem}.md: `));
+        assert.match(errors[0], reason);
+        assert.equal(testApi.loadAgentDefaults(stem), null);
+      });
+    });
+  }
+
+  for (const { stem, yaml, selections } of [
+    { stem: "Scout", yaml: "name: Scout", selections: ["Scout"] },
+    { stem: "renamed-file-test-agent", yaml: "name: aliased-test-agent", selections: ["renamed-file-test-agent", "aliased-test-agent"] },
+  ]) {
+    for (const hidden of [false, true]) {
+      it(`excludes invalid definition ${stem}, hidden=${hidden}, from catalog and explicit launches`, async () => {
+        await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+          writeAgentFile(globalAgentsDir, "worker", "name: worker");
+          writeAgentFile(globalAgentsDir, stem, `${yaml}\ndisable-model-invocation: ${hidden}`);
+          const { api, registeredTools, registeredCommands, sentUserMessages, eventHandlers } = createMockExtensionApi();
+          subagentsModule.default(api);
+          const tool = registeredTools.find((entry) => entry.name === "subagent");
+          assert.deepEqual(tool.promptGuidelines.join("\n").match(/<agent name="[^"]*">/g), ['<agent name="worker">']);
+          const warnings: string[] = [];
+          eventHandlers.get("session_start")![0]({}, { ui: { notify: (message: string) => warnings.push(message) } });
+          assert.ok(warnings.some((message) => message.startsWith(`Skipped agent ${stem}.md: `)));
+          for (const agent of selections) {
+            for (const fork of [false, true]) {
+              const result = await tool.execute("invalid-agent", { agent, task: "Never launch", fork }, undefined, undefined, {});
+              assert.equal(result.content[0].text, `Unknown agent "${agent}". Available: worker`);
+              assert.deepEqual(result.details, { errorMessage: result.content[0].text });
+            }
+            const notices: string[] = [];
+            await registeredCommands.find((entry) => entry.name === "subagent").handler(
+              agent, { ui: { notify: (message: string) => notices.push(message) } },
+            );
+            assert.equal(notices.length, 1);
+            assert.match(notices[0], /not found/);
+          }
+          assert.deepEqual(sentUserMessages, []);
+        });
+      });
+    }
+  }
 
   it("discoverAgentDefinitions skips an unreadable entry instead of aborting discovery", async () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
@@ -2093,7 +2141,7 @@ describe("tool registration", () => {
   it("caps the catalog and reports omitted agents", async () => {
     await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
       for (let i = 0; i < 30; i++) {
-        writeAgentFile(globalAgentsDir, `agent-${String(i).padStart(2, "0")}`, `name: agent-${String(i).padStart(2, "0")}\ndescription: d`);
+        writeAgentFile(globalAgentsDir, `agent-v${i}`, `name: agent-v${i}\ndescription: d`);
       }
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
@@ -2455,6 +2503,7 @@ describe("tool registration", () => {
           if (branch === "live") testApi.runningSubagents.set(id, {
             id, name: handle.name, agent: handle.agent, cwd: "/live/cwd", agentDir: dir, sessionFile,
             task: "previous work", surface: "live-pane", runtimePlan: undefined,
+            activityFile: join(dir, "retained-custom-activity.json"),
             startTime: 1, orchestrationMode: mode, autoExit: false, interactive: false,
             inputLocked: false, lifecycle: markDelivery(createLifecycle(1), "delivered"),
           });
@@ -2502,6 +2551,8 @@ describe("tool registration", () => {
             assert.equal(testApi.runningSubagents.get(id).initialToolCallId, mode === "async" ? `prompt-${id}` : undefined);
             assert.equal(testApi.runningSubagents.get(id).abortController.signal.aborted, false);
             assert.equal(testApi.subagentHandles.get(id).subscribed, true);
+            if (branch === "live") assert.equal(testApi.runningSubagents.get(id).activityFile, join(dir, "retained-custom-activity.json"));
+            if (branch === "attached") assert.equal(testApi.runningSubagents.get(id).activityFile, getSubagentActivityFile(join(dir, "artifacts", "parent"), sessionFile));
             if (branch !== "reopened") {
               assert.deepEqual(prompted, [{ surface: "live-pane", message: "Follow up", agentDir: dir }]);
               assert.deepEqual(launches, []);
@@ -2709,15 +2760,11 @@ describe("Assignment finalization policy", () => {
 });
 
 describe("subagent parent lifecycle", () => {
-  it("upgrades reload-persisted runtime objects with durable handles", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningSubagents = new Map();
-    const legacyRuntime = { runningSubagents };
-
-    const runtime = testApi.ensureSubagentRuntime(legacyRuntime);
-    assert.equal(runtime, legacyRuntime);
-    assert.equal(runtime.runningSubagents, runningSubagents);
-    assert.ok(runtime.handles instanceof Map);
+  it("creates fresh runtime with durable handles", () => {
+    const runtime = subagentsModule.__test__.ensureSubagentRuntime(undefined);
+    assert.equal(runtime.runningSubagents.size, 0);
+    assert.equal(runtime.handles.size, 0);
+    assert.equal(runtime.launchGates.size, 0);
   });
 
   it("releases parent wait without aborting subagent completion", async () => {
@@ -3380,6 +3427,320 @@ describe("subagent parent lifecycle", () => {
   });
 });
 
+
+describe("subagent identities", () => {
+  const counter = (value: unknown, version: unknown = 1, parentId: unknown = null) => ({
+    type: "custom", customType: SUBAGENT_COUNTER_ENTRY, data: { version, parentId, value },
+  });
+
+  it("formats one shared role counter without wrapping", () => {
+    for (const value of [1, 9, 10, 99, 100, Number.MAX_SAFE_INTEGER]) {
+      const entries = value === 1 ? [] : [counter(value - 1)];
+      const saved: unknown[] = [];
+      assert.equal(allocateSubagentId(entries, (customType, data) => saved.push({ customType, data }), "code_review-v2", null),
+        `code_review-v2-${String(value).padStart(2, "0")}`);
+      assert.deepEqual(saved, [{ customType: SUBAGENT_COUNTER_ENTRY, data: { version: 1, parentId: null, value } }]);
+    }
+  });
+
+  it("uses maximum matching record, ignoring other namespaces and handles", () => {
+    const entries: unknown[] = [null, {}, { type: "message" }, { type: "custom", customType: SUBAGENT_COUNTER_ENTRY },
+      counter(5), counter(2), counter(999, 1, "implementer-02"), counter("invalid", 99, "other-parent"),
+      { type: "custom", customType: "subagent_handle", data: { id: "scout-99" } }];
+    const append = (customType: string, data: object) => entries.push({ type: "custom", customType, data });
+    assert.equal(allocateSubagentId(entries, append, "scout", null), "scout-06");
+    assert.equal(allocateSubagentId(entries, append, "implementer", null), "implementer-07");
+    assert.equal(allocateSubagentId(entries, append, "scout", null), "scout-08");
+  });
+
+  for (const parentId of [null, "implementer-02-scout-01"]) {
+    it(`persists ${parentId ?? "root"} allocations through real session reopening, navigation and copied history`, () => {
+      withTempDir((dir) => {
+        const prefix = parentId ? `${parentId}-` : "";
+        const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+        const manager = SessionManager.open(file);
+        manager.appendCustomEntry(SUBAGENT_COUNTER_ENTRY, { version: 1, parentId: "implementer-02", value: 99 });
+        const allocate = (session: SessionManager, role: string) => allocateSubagentId(session.getEntries(),
+          (customType, data) => { session.appendCustomEntry(customType, data); }, role, parentId);
+        assert.equal(allocate(manager, "scout"), `${prefix}scout-01`);
+        const first = manager.getLeafId();
+        assert.ok(first);
+        assert.equal(allocate(manager, "implementer"), `${prefix}implementer-02`);
+        manager.branch(first);
+        assert.equal(allocate(manager, "scout"), `${prefix}scout-03`);
+        const reopened = SessionManager.open(file);
+        assert.equal(allocate(reopened, "scout"), `${prefix}scout-04`);
+        assert.equal(restoreSubagentHandles(reopened.getEntries()).size, 0, "no handle reconstruction needed");
+        if (parentId === null) {
+          const copy = join(dir, "copy.jsonl");
+          writeFileSync(copy, readFileSync(file, "utf8"));
+          assert.equal(allocate(SessionManager.open(copy), "scout"), "scout-05");
+          assert.equal(allocate(SessionManager.inMemory(), "scout"), "scout-01");
+        }
+      });
+    });
+  }
+
+  it("rejects invalid current-namespace records, exhaustion and persistence errors", () => {
+    for (const record of [counter(0), counter(1.5), counter("1"),
+      counter(Number.MAX_SAFE_INTEGER + 1), counter(1, 2), counter(undefined)]) {
+      assert.throws(() => allocateSubagentId([record], () => assert.fail("must not append"), "scout", null), /Invalid subagent/);
+    }
+    assert.throws(() => allocateSubagentId([counter(1, 2, "implementer-02")], () => assert.fail("must not append"), "scout", "implementer-02"), /Invalid subagent/);
+    assert.throws(() => allocateSubagentId([counter(Number.MAX_SAFE_INTEGER)], () => assert.fail("must not append"), "scout", null), /safe integer/);
+    assert.throws(() => allocateSubagentId([], () => { throw new Error("disk full"); }, "scout", null), /disk full/);
+  });
+
+  async function withLaunch(run: (fixture: {
+    owner: typeof subagentsModule.__test__;
+    mock: ReturnType<typeof createMockExtensionApi>;
+    ctx: Parameters<typeof subagentsModule.__test__.defaultLaunchSubagent>[1];
+    labels: string[];
+    closed: string[];
+    switchRoot: () => void;
+    dir: string;
+  }) => Promise<void>) {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir, globalAgentsDir }) => {
+      const owner = subagentsModule.__test__;
+      const previousRuntime = { pi: owner.runtime.pi, ctx: owner.runtime.latestCtx, shuttingDown: owner.runtime.shuttingDown };
+      const previousEnv = { PATH: process.env.PATH, HERDR_ENV: process.env.HERDR_ENV,
+        PI_SUBAGENT_SHELL_READY_DELAY_MS: process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS, PI_SUBAGENT_ID: process.env.PI_SUBAGENT_ID };
+      const mock = createMockExtensionApi();
+      const parentSessionFile = createSessionFile(projectDir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      writeFileSync(join(projectDir, "herdr"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      process.env.PATH = `${projectDir}:${previousEnv.PATH ?? ""}`;
+      process.env.HERDR_ENV = "1";
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+      for (const role of ["scout", "implementer", "code_review-v2"]) writeAgentFile(globalAgentsDir, role, `name: ${role}`);
+      const ctx = {
+        cwd: projectDir, model: { provider: "fake", id: "test" },
+        modelRegistry: { find: (provider: string, id: string) => ({ provider, id, reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" } }), hasConfiguredAuth: () => true },
+        sessionManager: { getSessionFile: () => parentSessionFile, getSessionId: () => "parent", getSessionDir: () => globalDir,
+          getEntries: () => mock.appendedEntries.map((entry) => ({ type: "custom", ...entry })) },
+      };
+      owner.runtime.pi = mock.api;
+      Reflect.set(owner.runtime, "latestCtx", ctx);
+      owner.runtime.shuttingDown = false;
+      const labels: string[] = [];
+      const closed: string[] = [];
+      owner.setInspectionTestAdapters({
+        createSubagentPane(label) { labels.push(label); return `pane-${labels.length}`; },
+        closePane(pane) { closed.push(pane); },
+      });
+      try {
+        await run({ owner, mock, ctx, labels, closed, dir: globalDir,
+          switchRoot() { Reflect.set(owner.runtime, "latestCtx", { sessionManager: { getSessionId: () => "new-root" } }); } });
+      } finally {
+        owner.runningSubagents.clear();
+        owner.setInspectionTestAdapters();
+        Object.assign(owner.runtime, { pi: previousRuntime.pi, latestCtx: previousRuntime.ctx, shuttingDown: previousRuntime.shuttingDown });
+        for (const [key, value] of Object.entries(previousEnv)) restoreEnvVar(key, value);
+      }
+    });
+  }
+
+  it("allocates parallel roles and fork modes before yielding; descriptions do not determine identity", async () => {
+    await withLaunch(async ({ owner, ctx, labels, mock }) => {
+      const requests = [
+        { agent: "scout", name: "Friendly" },
+        { agent: "implementer", name: resolveSubagentName(undefined, "implementer") },
+        { agent: "scout", name: resolveSubagentName("  ", "scout") },
+        { fork: true, name: resolveSubagentName(undefined, undefined) },
+        { agent: "code_review-v2", fork: true, name: "Named fork" },
+      ];
+      const launches = requests.map((params) => owner.defaultLaunchSubagent({ ...params, task: "TASK" }, ctx, "off"));
+      assert.deepEqual(mock.appendedEntries.map((entry) => entry.data), [1, 2, 3, 4, 5].map((value) => ({ version: 1, parentId: null, value })));
+      const running = await Promise.all(launches);
+      assert.deepEqual(running.map((child) => child.id), ["scout-01", "implementer-02", "scout-03", "fork-04", "code_review-v2-05"]);
+      assert.deepEqual(labels, running.map((child) => child.id));
+      assert.deepEqual(running.map((child) => child.name), ["Friendly", "implementer", "scout", "fork", "Named fork"]);
+      owner.runningSubagents.clear();
+      assert.equal((await owner.defaultLaunchSubagent({ agent: "scout", name: "After closure", task: "" }, ctx, "off")).id, "scout-06");
+    });
+  });
+
+  it("uses full parent identity with independent sibling counters shared across roles and grandchildren", async () => {
+    await withLaunch(async ({ owner, ctx, mock, labels }) => {
+      process.env.PI_SUBAGENT_ID = "implementer-02";
+      const children = await Promise.all(["scout", "code_review-v2", "scout"].map((agent) =>
+        owner.defaultLaunchSubagent({ agent, name: "Not identity", task: "" }, ctx, "off")));
+      assert.deepEqual(children.map((child) => child.id), ["implementer-02-scout-01", "implementer-02-code_review-v2-02", "implementer-02-scout-03"]);
+      process.env.PI_SUBAGENT_ID = "scout-01";
+      const siblingChild = await owner.defaultLaunchSubagent({ agent: "scout", name: "Sibling", task: "" }, ctx, "off");
+      assert.equal(siblingChild.id, "scout-01-scout-01");
+      process.env.PI_SUBAGENT_ID = children[0].id;
+      const grandchild = await owner.defaultLaunchSubagent({ agent: "implementer", name: "Grandchild", task: "" }, ctx, "off");
+      assert.equal(grandchild.id, "implementer-02-scout-01-implementer-01");
+      assert.deepEqual(labels, [...children, siblingChild, grandchild].map((child) => child.id));
+      assert.deepEqual(mock.appendedEntries.map((entry) => entry.data), [
+        ...[1, 2, 3].map((value) => ({ version: 1, parentId: "implementer-02", value })),
+        { version: 1, parentId: "scout-01", value: 1 },
+        { version: 1, parentId: children[0].id, value: 1 },
+      ]);
+      for (const child of [...children, siblingChild, grandchild]) {
+        assert.ok(readFileSync(child.launchScriptFile!, "utf8").includes(`PI_SUBAGENT_ID='${child.id}'`));
+      }
+    });
+  });
+
+  it("extension-managed bare and named forks keep copied counters in ancestor namespaces", async () => {
+    await withLaunch(async ({ owner, ctx, mock }) => {
+      process.env.PI_SUBAGENT_ID = "implementer-02";
+      const inherited = [counter(50), counter(7, 1, "implementer-02")];
+      writeFileSync(ctx.sessionManager.getSessionFile()!, [SESSION_HEADER, ...inherited, USER_MSG, ASSISTANT_MSG]
+        .map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+      for (const entry of inherited) mock.appendedEntries.push({ customType: entry.customType, data: entry.data });
+      const forks = await Promise.all([
+        { fork: true, name: "Bare fork" }, { agent: "scout", fork: true, name: "Named fork" },
+      ].map((params) => owner.defaultLaunchSubagent({ ...params, task: "" }, ctx, "off", { surface: "owned" })));
+      assert.deepEqual(forks.map((fork) => fork.id), ["implementer-02-fork-08", "implementer-02-scout-09"]);
+      for (const fork of forks) {
+        const childSession = SessionManager.open(fork.sessionFile);
+        const copiedCounters = childSession.getEntries().filter((entry) => entry.type === "custom" && entry.customType === SUBAGENT_COUNTER_ENTRY);
+        assert.deepEqual(copiedCounters.map((entry) => entry.type === "custom" ? entry.data : undefined), inherited.map((entry) => entry.data));
+        process.env.PI_SUBAGENT_ID = fork.id;
+        mock.api.appendEntry = (customType: string, data: object) => { childSession.appendCustomEntry(customType, data); };
+        const childCtx = { ...ctx, sessionManager: childSession };
+        Reflect.set(owner.runtime, "latestCtx", childCtx);
+        const child = await owner.defaultLaunchSubagent({ agent: "scout", name: "Child", task: "" }, childCtx, "off", { surface: "child-owned" });
+        assert.equal(child.id, `${fork.id}-scout-01`);
+      }
+    });
+  });
+
+  it("rejects request, defaults, runtime and missing parent file before allocation; failed persistence creates no pane", async () => {
+    await withLaunch(async ({ owner, ctx, mock, labels }) => {
+      const params = { agent: "scout", name: "Description", task: "" };
+      await assert.rejects(owner.defaultLaunchSubagent({ name: "invalid", task: "" }, ctx, "off"), /Bare subagents/);
+      await assert.rejects(owner.defaultLaunchSubagent({ ...params, agent: "missing" }, ctx, "off"), /disappeared/);
+      await assert.rejects(owner.defaultLaunchSubagent(params, { ...ctx, model: undefined }, "off"), /resolved parent model/);
+      await assert.rejects(owner.defaultLaunchSubagent(params, { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionFile: () => null } }, "off"), /No session file/);
+      await assert.rejects(owner.defaultLaunchSubagent(params, { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionFile: () => "/missing-parent" } }, "off"), /ENOENT/);
+      assert.deepEqual(mock.appendedEntries, []);
+      mock.api.appendEntry = () => { throw new Error("disk full"); };
+      await assert.rejects(owner.defaultLaunchSubagent(params, ctx, "off"), /disk full/);
+      assert.deepEqual(labels, []);
+    });
+  });
+
+  for (const parentId of [null, "implementer-02"]) {
+    it(`consumes ${parentId ?? "root"} allocations when pane creation fails without a saved handle`, async () => {
+      await withLaunch(async ({ owner, ctx, mock }) => {
+        restoreEnvVar("PI_SUBAGENT_ID", parentId ?? undefined);
+        const prefix = parentId ? `${parentId}-` : "";
+        owner.setInspectionTestAdapters({ createSubagentPane() { throw new Error("pane failed"); } });
+        await assert.rejects(owner.defaultLaunchSubagent({ agent: "scout", name: "Failed", task: "" }, ctx, "off"), /pane failed/);
+        assert.deepEqual(mock.appendedEntries, [{ customType: SUBAGENT_COUNTER_ENTRY, data: { version: 1, parentId, value: 1 } }]);
+        assert.equal(owner.subagentHandles.has(`${prefix}scout-01`), false);
+        assert.equal((await owner.defaultLaunchSubagent({ agent: "implementer", name: "Next", task: "" }, ctx, "off", { surface: "owned" })).id, `${prefix}implementer-02`);
+      });
+    });
+  }
+
+  it("session switch during shell delay stops before seeding, dispatch, insertion or handle persistence", async () => {
+    await withLaunch(async ({ owner, ctx, mock, closed, switchRoot, dir }) => {
+      const launch = owner.defaultLaunchSubagent({ fork: true, name: "Old root fork", task: "TASK" }, ctx, "off");
+      switchRoot();
+      const next = await owner.defaultLaunchSubagent({ fork: true, name: "New root", task: "" },
+        { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "new-root", getEntries: () => [] } }, "off", { surface: "new-root-pane" });
+      await assert.rejects(launch, /Parent session changed/);
+      assert.deepEqual(closed, ["pane-1"]);
+      assert.equal(owner.runningSubagents.get("fork-01"), next);
+      assert.equal(existsSync(join(dir, "artifacts", "parent")), false);
+      assert.equal(mock.appendedEntries.length, 2, "both roots retain allocation, old root saves no handle");
+    });
+  });
+
+  it("does not overwrite another running instance occupying allocated ID", async () => {
+    await withLaunch(async ({ owner, ctx, closed }) => {
+      const first = await owner.defaultLaunchSubagent({ agent: "scout", name: "First", task: "" }, ctx, "off", { surface: "first-pane" });
+      const freshCtx = { ...ctx, sessionManager: { ...ctx.sessionManager, getEntries: () => [] } };
+      await assert.rejects(owner.defaultLaunchSubagent({ agent: "scout", name: "Other root", task: "" }, freshCtx, "off"), /running owner/);
+      assert.equal(owner.runningSubagents.get(first.id), first);
+      assert.deepEqual(closed, ["pane-1"]);
+    });
+  });
+
+  it("stale watcher finalization cannot delete or update new root instance with same ID", async () => {
+    await withLaunch(async ({ owner, ctx }) => {
+      const old = await owner.defaultLaunchSubagent({ agent: "scout", name: "Old", task: "" }, ctx, "off", { surface: "old-pane" });
+      owner.runningSubagents.clear();
+      const next = await owner.defaultLaunchSubagent({ agent: "scout", name: "New", task: "" },
+        { ...ctx, sessionManager: { ...ctx.sessionManager, getEntries: () => [] } }, "off", { surface: "new-pane" });
+      const handle: SubagentHandle = { id: next.id, name: next.name, sessionFile: next.sessionFile, state: "active",
+        surface: next.surface, autoExit: false, interactive: false, createdAt: next.startTime };
+      owner.subagentHandles.set(next.id, handle);
+      try {
+        owner.applyAssignmentFinalization(old, { name: old.name, task: old.task, sessionFile: old.sessionFile, summary: "done", exitCode: 0, elapsed: 1 });
+        assert.equal(owner.runningSubagents.get(next.id), next);
+        assert.equal(owner.subagentHandles.get(next.id), handle);
+      } finally { owner.subagentHandles.delete(next.id); }
+    });
+  });
+
+  it("initial standalone, lineage-only and fork launches key every artifact by independent session UUID", async () => {
+    await withLaunch(async ({ owner, ctx, dir }) => {
+      const sessionNames = new Set<string>();
+      for (const sessionMode of ["standalone", "lineage-only", "fork"] as const) {
+        writeAgentFile(join(dir, "agents"), "storage-agent", `name: storage-agent\nsession-mode: ${sessionMode}`);
+        const running = await owner.defaultLaunchSubagent({
+          agent: "storage-agent", name: "Storage", task: "TASK",
+        }, { ...ctx, modelRegistry: { find: () => undefined } }, "off", { surface: "owned-pane" });
+        const storageKey = basename(running.sessionFile);
+        assert.match(storageKey, /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl$/);
+        assert.equal(sessionNames.has(storageKey), false);
+        sessionNames.add(storageKey);
+        assert.equal(basename(running.launchScriptFile!), `${storageKey}.sh`);
+        assert.equal(running.activityFile, getSubagentActivityFile(join(dir, "artifacts", "parent"), running.sessionFile));
+        assert.ok(readFileSync(running.launchScriptFile!, "utf8").includes(`PI_SUBAGENT_ACTIVITY_FILE='${running.activityFile}'`));
+        const contextFile = join(dir, "artifacts", "parent", "context", `${storageKey}.md`);
+        assert.equal(existsSync(contextFile), sessionMode !== "fork");
+        if (sessionMode !== "standalone") {
+          const header = JSON.parse(readFileSync(running.sessionFile, "utf8").split("\n")[0]);
+          assert.notEqual(header.id, running.id, "Pi session identity remains separate");
+          assert.equal(header.parentSession, ctx.sessionManager.getSessionFile());
+        }
+      }
+    });
+  });
+});
+
+describe("subagent storage", () => {
+  it("keeps long identities and descriptions out of direct and artifact handoff filenames", () => {
+    withTempDir((dir) => {
+      const id = "implementer-01-".repeat(40);
+      const name = "descriptive-name-".repeat(40);
+      const sessionFile = join(dir, "2026-10-11T19-00-00-000Z_01234567-89ab-4cde-8fab-0123456789ab.jsonl");
+      for (const taskDelivery of ["direct", "artifact"] as const) {
+        const artifactDir = join(dir, taskDelivery);
+        const { command } = buildPiCommand({
+          params: { id, name, task: "TASK" }, runtimePlan: { model: "fake/test", thinking: "off" },
+          surface: "pane", artifactDir, subagentSessionFile: sessionFile,
+          effectiveCwd: null, localAgentDir: null, effectiveAutoExit: false, effectiveInteractive: false,
+          taskDelivery, spawning: true, modeHint: "HINT", summaryInstruction: "SUMMARY",
+        });
+        assert.ok(command.includes(`PI_SUBAGENT_ID='${id}'`));
+        assert.ok(command.includes(`PI_SUBAGENT_NAME='${name}'`));
+        const activityFile = getSubagentActivityFile(artifactDir, sessionFile);
+        assert.ok(command.includes(`PI_SUBAGENT_ACTIVITY_FILE='${activityFile}'`));
+        const recorder = createSubagentActivityRecorder({ runningChildId: id, activityFile });
+        recorder.sessionStart();
+        recorder.toolExecutionStart("tool-1", "bash");
+        const read = readSubagentActivityFile(activityFile, id);
+        assert.equal(read.ok, true, "atomic activity write also uses bounded storage name");
+        if (read.ok) assert.equal(read.activity.runningChildId, id);
+        assert.ok(Buffer.byteLength(basename(activityFile)) < 255);
+        if (taskDelivery === "artifact") {
+          const contextFile = join(artifactDir, "context", `${basename(sessionFile)}.md`);
+          assert.ok(command.includes(`'@${contextFile}'`));
+          assert.equal(readFileSync(contextFile, "utf8"), "HINT\n\nTASK\n\nSUMMARY");
+          assert.ok(Buffer.byteLength(basename(contextFile)) < 255);
+        } else assert.equal(existsSync(join(artifactDir, "context")), false);
+      }
+    });
+  });
+});
+
 describe("subagent activity snapshots", () => {
   function validActivity(overrides: Record<string, unknown> = {}) {
     return {
@@ -3398,9 +3759,54 @@ describe("subagent activity snapshots", () => {
     };
   }
 
+  it("attaches current session-keyed activity only after full identity validation", () => {
+    withTempDir((dir) => {
+      const ctx = { sessionManager: { getSessionDir: () => dir, getSessionId: () => "parent" } };
+      const handle: SubagentHandle = { id: "child-1", name: "Worker", sessionFile: join(dir, "child-1.jsonl"),
+        surface: "live-pane", state: "finalized", autoExit: false, interactive: true, createdAt: 1 };
+      const running = subagentsModule.__test__.attachLivePiSubagent(handle, "Follow up", ctx);
+      const activityFile = getSubagentActivityFile(join(dir, "artifacts", "parent"), handle.sessionFile);
+      assert.equal(running.activityFile, activityFile);
+      subagentsModule.__test__.observeRunningSubagent(running);
+      assert.deepEqual(running.activityRead, { ok: false, reason: "missing", error: undefined });
+      const recorder = createSubagentActivityRecorder({ runningChildId: "wrong-id", activityFile });
+      recorder.sessionStart();
+      subagentsModule.__test__.observeRunningSubagent(running);
+      assert.equal(running.activity, undefined);
+      assert.equal(running.activityRead?.reason, "wrong-id");
+      const child = createSubagentActivityRecorder({ runningChildId: handle.id, activityFile });
+      child.sessionStart();
+      subagentsModule.__test__.observeRunningSubagent(running);
+      assert.equal(running.activity?.runningChildId, handle.id);
+      assert.equal(running.activityFile, activityFile);
+    });
+  });
+
+  it("preserves current watcher state across reload", () => {
+    withTempDir((dir) => {
+      const running = subagentsModule.__test__.attachLivePiSubagent({
+        id: "child-1", name: "Worker", sessionFile: join(dir, "child-1.jsonl"), surface: "pane",
+        state: "active", autoExit: false, interactive: true, createdAt: 1,
+      }, "TASK", { sessionManager: { getSessionDir: () => dir, getSessionId: () => "parent" } });
+      const activityFile = running.activityFile!;
+      createSubagentActivityRecorder({ runningChildId: running.id, activityFile }).sessionStart();
+      subagentsModule.__test__.observeRunningSubagent(running);
+      const lifecycle = running.lifecycle;
+      const activity = running.activity;
+      const runtime = subagentsModule.__test__.ensureSubagentRuntime(undefined);
+      runtime.runningSubagents.set(running.id, running);
+      const restored = subagentsModule.__test__.ensureSubagentRuntime(runtime);
+      assert.equal(restored, runtime);
+      assert.equal(restored.runningSubagents.get(running.id), running);
+      assert.equal(running.lifecycle, lifecycle);
+      assert.equal(running.activity, activity);
+      assert.equal(running.activityFile, activityFile);
+    });
+  });
+
   it("writes and validates activity files by running child id", () => {
     withTempDir((dir) => {
-      const activityFile = getSubagentActivityFile(dir, "child-1");
+      const activityFile = getSubagentActivityFile(dir, join(dir, "child-1.jsonl"));
       const recorder = createSubagentActivityRecorder({
         runningChildId: "child-1",
         activityFile,
@@ -3426,7 +3832,7 @@ describe("subagent activity snapshots", () => {
   it("records waiting and final done states", () => {
     withTempDir((dir) => {
       let currentNow = 2_000;
-      const activityFile = getSubagentActivityFile(dir, "child-2");
+      const activityFile = getSubagentActivityFile(dir, join(dir, "child-2.jsonl"));
       const recorder = createSubagentActivityRecorder({
         runningChildId: "child-2",
         activityFile,
@@ -3464,7 +3870,7 @@ describe("subagent activity snapshots", () => {
       ];
 
       for (const [index, overrides] of cases.entries()) {
-        const activityFile = getSubagentActivityFile(dir, `child-${index}`);
+        const activityFile = getSubagentActivityFile(dir, join(dir, `child-${index}.jsonl`));
         const activity = validActivity({ runningChildId: `child-${index}`, ...overrides });
         writeFileSync(activityFile, `${JSON.stringify(activity)}\n`);
 
@@ -3478,7 +3884,7 @@ describe("subagent activity snapshots", () => {
   it("does not let tool_result resurrect finished tool activity", () => {
     withTempDir((dir) => {
       let currentNow = 1_000;
-      const activityFile = getSubagentActivityFile(dir, "child-3");
+      const activityFile = getSubagentActivityFile(dir, join(dir, "child-3.jsonl"));
       const recorder = createSubagentActivityRecorder({
         runningChildId: "child-3",
         activityFile,
@@ -3504,7 +3910,7 @@ describe("subagent activity snapshots", () => {
 
   it("does not mark reload shutdown as the final done snapshot", () => {
     withTempDir((dir) => {
-      const activityFile = getSubagentActivityFile(dir, "child-4");
+      const activityFile = getSubagentActivityFile(dir, join(dir, "child-4.jsonl"));
       const recorder = createSubagentActivityRecorder({
         runningChildId: "child-4",
         activityFile,
@@ -3526,7 +3932,7 @@ describe("subagent activity snapshots", () => {
     try {
       await new Promise<void>((resolve) => {
         let currentNow = 1_000;
-        const activityFile = getSubagentActivityFile(dir, "child-5");
+        const activityFile = getSubagentActivityFile(dir, join(dir, "child-5.jsonl"));
         const recorder = createSubagentActivityRecorder({
           runningChildId: "child-5",
           activityFile,
@@ -4949,7 +5355,7 @@ void describe("saved-session inspection", () => {
     subagentsModule.default(mock.api);
     const previous = { ctx: owner.runtime.latestCtx, shuttingDown: owner.runtime.shuttingDown, halted: owner.runtime.halted };
     const dir = createTestDir();
-    const handle: SubagentHandle = { id: "inspection-worker", name: "Saved worker", agent: "implementer", agentFile: "/original/implementer.md", agentDir: dir,
+    const handle: SubagentHandle = { id: "implementer-02-scout-01", name: "Saved worker", agent: "implementer", agentFile: "/original/implementer.md", agentDir: dir,
       cwd: dir, sessionFile: join(dir, "child.jsonl"), surface: "old-pane", state: "finalized", subscribed: false, autoExit: false, interactive: true,
       spawning: true, createdAt: 17 };
     writeFileSync(handle.sessionFile, JSON.stringify({ ...SESSION_HEADER, id: "native-child-not-handle", cwd: dir }) + "\n");
@@ -4972,7 +5378,8 @@ void describe("saved-session inspection", () => {
     let finishWatch: (() => void) | undefined;
     owner.setInspectionTestAdapters({
       inspectPaneStrict: async (pane) => panes.get(pane) ?? { kind: "present" },
-      createSubagentPane(_name, focus = false) {
+      createSubagentPane(label, focus = false) {
+        assert.equal(label, handle.id);
         creationFocus.push(focus);
         const pane = `new-pane-${created.length + 1}`;
         created.push(pane);
@@ -5675,6 +6082,10 @@ void describe("inspection continuation launch", () => {
     environment.PI_SUBAGENT_AUTO_EXIT = "1";
     try {
       for (const message of [undefined, "OUTGOING_WORK"]) {
+        if (message !== undefined) {
+          handle.id = "implementer-01-".repeat(40);
+          handle.name = "descriptive-name-".repeat(40);
+        }
         const artifactDir = join(dir, message === undefined ? "inspection" : "prompted");
         let beforeSend = 0;
         const result = await launchPiContinuation({ handle, message, surface: "caller-owned-pane", artifactDir, shellReadyDelayMs: 0,
@@ -5688,8 +6099,9 @@ void describe("inspection continuation launch", () => {
             assert.match(command, /PI_SUBAGENT_SPAWNING=1/);
             assert.match(command, /PI_SUBAGENT_SURFACE='caller-owned-pane'/);
             assert.match(command, /PI_SUBAGENT_AGENT_FILE='\/original\/agent.md'/);
-            assert.match(command, /PI_SUBAGENT_ID='original-handle'/);
-            assert.match(command, /PI_SUBAGENT_ACTIVITY_FILE=/);
+            assert.ok(command.includes(`PI_SUBAGENT_ID='${handle.id}'`));
+            assert.ok(command.includes(`PI_SUBAGENT_NAME='${handle.name}'`));
+            assert.ok(command.includes(`PI_SUBAGENT_ACTIVITY_FILE='${getSubagentActivityFile(artifactDir, handle.sessionFile)}'`));
             assert.match(command, /^#!\/bin\/bash\ncd /);
             assert.match(command, /pi --session /);
             if (message === undefined) {
@@ -5700,6 +6112,8 @@ void describe("inspection continuation launch", () => {
               assert.match(command, /'@/);
               const files = readdirSync(join(artifactDir, "subagent-prompts"));
               assert.equal(files.length, 1);
+              assert.ok(files[0].startsWith(`${basename(handle.sessionFile)}-`));
+              assert.ok(Buffer.byteLength(files[0]) < 255);
               assert.equal(readFileSync(join(artifactDir, "subagent-prompts", files[0]), "utf8"), message);
             }
           },
@@ -5707,6 +6121,10 @@ void describe("inspection continuation launch", () => {
         assert.equal(beforeSend, 1);
         assert.equal(result.surface, "caller-owned-pane");
         assert.equal(existsSync(result.launchScriptFile), true);
+        assert.equal(result.activityFile, getSubagentActivityFile(artifactDir, handle.sessionFile));
+        assert.ok(basename(result.launchScriptFile).startsWith(`${basename(handle.sessionFile)}-continue-`));
+        assert.ok(Buffer.byteLength(basename(result.launchScriptFile)) < 255);
+        assert.equal(handle.sessionFile, join(dir, "saved.jsonl"), "saved session path never migrates");
         const commands = readFileSync(log, "utf8");
         assert.doesNotMatch(commands, /tab create|pane split/);
         assert.equal(commands.split("\n").filter((line) => line.startsWith("pane run caller-owned-pane bash")).length, message === undefined ? 1 : 2);

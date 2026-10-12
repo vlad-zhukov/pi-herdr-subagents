@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import type { SubagentHandle } from "./assignment-handles.ts";
 import { getSubagentActivityFile } from "./activity.ts";
@@ -85,16 +85,17 @@ export async function launchPiContinuation(params: {
   if (message !== undefined) setPaneTask(surface, message);
   await new Promise<void>((resolve) => setTimeout(resolve, shellReadyDelayMs));
 
-  const activityFile = getSubagentActivityFile(artifactDir, handle.id);
+  const storageKey = basename(handle.sessionFile);
+  const activityFile = getSubagentActivityFile(artifactDir, handle.sessionFile);
   let messageFile: string | undefined;
   mkdirSync(dirname(activityFile), { recursive: true });
   if (message !== undefined) {
-    messageFile = join(artifactDir, "subagent-prompts", `${handle.id}-${Date.now()}.md`);
+    messageFile = join(artifactDir, "subagent-prompts", `${storageKey}-${Date.now()}.md`);
     mkdirSync(dirname(messageFile), { recursive: true });
     writeFileSync(messageFile, message, "utf8");
   }
 
-  const launchScriptFile = join(artifactDir, "subagent-scripts", `${handle.id}-continue-${Date.now()}.sh`);
+  const launchScriptFile = join(artifactDir, "subagent-scripts", `${storageKey}-continue-${Date.now()}.sh`);
   runScriptInPane(
     surface,
     buildPiContinuationCommand({ handle, surface, activityFile, messageFile }),
@@ -172,7 +173,7 @@ export function buildPiCommand(context: PiLaunchContext): {
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
   envParts.push(`PI_SUBAGENT_AGENT_FILE=${shellQuote(agentDefs?.file ?? "")}`);
-  const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
+  const activityFile = getSubagentActivityFile(artifactDir, subagentSessionFile);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
 
@@ -184,15 +185,7 @@ export function buildPiCommand(context: PiLaunchContext): {
   if (taskDelivery === "direct") {
     taskArg = fullTask;
   } else {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
-    const artifactPath = join(artifactDir, artifactName);
+    const artifactPath = join(artifactDir, "context", `${basename(subagentSessionFile)}.md`);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
     taskArg = `@${artifactPath}`;

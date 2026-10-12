@@ -2,7 +2,9 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { allocateSubagentId } from "./identity.ts";
 import {
   readdirSync,
   readFileSync,
@@ -230,13 +232,23 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
   return undefined;
 }
 
-function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
+function parseAgentDefinition(content: string, filenameStem: string): AgentDefinition | null {
   const parsed = parseAgentMarkdown(content);
   if (!parsed) return null;
   const { frontmatter, body } = parsed;
+  const name = frontmatter.name;
+  if (typeof name !== "string" || !name) {
+    throw new Error("frontmatter name is required and must be a nonempty string");
+  }
+  if (!/^[a-z][a-z0-9]*(?:[-_][a-z][a-z0-9]*)*$/.test(name)) {
+    throw new Error("name must use lowercase ASCII hyphen/underscore-separated segments, each starting with a letter and containing only letters or digits");
+  }
+  if (name !== filenameStem) {
+    throw new Error(`frontmatter name ${JSON.stringify(name)} must exactly match filename stem ${JSON.stringify(filenameStem)}`);
+  }
 
   return {
-    name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
+    name,
     description: getFrontmatterValue(frontmatter, "description"),
     tools: getFrontmatterValue(frontmatter, "tools"),
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
@@ -372,10 +384,7 @@ function resolveEffectiveInteractive(
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  // Resolve through the same name-keyed map discoverAgentDefinitions() builds
-  // for the tool-guidance catalog, so a name advertised there always resolves
-  // to the same definition here — even when an agent's frontmatter `name`
-  // differs from its filename.
+  // Direct selection uses the same validated definitions as the catalog.
   return discoverAgentDefinitions().find((agent) => agent.name === agentName) ?? null;
 }
 
@@ -542,15 +551,9 @@ function createSubagentRuntime(): SubagentRuntime {
   return { runningSubagents: new Map<string, RunningSubagent>(), handles: new Map(), launchGates: new Map() };
 }
 
-/** Upgrade reload-persisted runtime objects without replacing old watcher references. */
-function ensureSubagentRuntime(value: Partial<SubagentRuntime> | undefined): SubagentRuntime {
-  const runtime = value ?? createSubagentRuntime();
-  runtime.runningSubagents ??= new Map<string, RunningSubagent>();
-  runtime.handles ??= new Map<string, SubagentHandle>();
-  runtime.halted ??= false;
-  runtime.launchGates ??= new Map();
-  runtime.shuttingDown ??= false;
-  return runtime as SubagentRuntime;
+/** Reuse current runtime without replacing live watcher references on reload. */
+function ensureSubagentRuntime(value: SubagentRuntime | undefined): SubagentRuntime {
+  return value ?? createSubagentRuntime();
 }
 
 /** Runtime state preserved across /reload. */
@@ -593,7 +596,7 @@ function updateHandle(
   subscribed = false,
 ): void {
   const handle = subagentHandles.get(running.id);
-  if (handle && handle.state !== "abandoned") {
+  if (handle && handle.sessionFile === running.sessionFile && handle.state !== "abandoned") {
     saveHandle({ ...handle, surface: running.surface, state, subscribed });
   }
 }
@@ -964,6 +967,8 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   observeRunningSubagent,
+  attachLivePiSubagent,
+  defaultLaunchSubagent,
   resolveSpawning,
   resolveResultPresentation,
   resolveWaitAllResultPresentation,
@@ -1033,7 +1038,7 @@ type LaunchParams = Static<typeof SubagentParams> & { name: string };
 async function defaultLaunchSubagent(
   params: LaunchParams,
   ctx: {
-    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string; getEntries(): unknown[] };
     cwd: string;
     model?: { provider: string; id: string };
     modelRegistry: {
@@ -1047,7 +1052,8 @@ async function defaultLaunchSubagent(
   options?: { surface?: string; toolCallId?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
-  const id = Math.random().toString(16).slice(2, 10);
+  const validationError = validateSubagentRequest(params);
+  if (validationError) throw new Error(validationError);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   if (params.agent && !agentDefs) throw new Error(`Agent definition disappeared: ${params.agent}`);
@@ -1064,112 +1070,117 @@ async function defaultLaunchSubagent(
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
-  if (!sessionFile) throw new Error("No session file");
+  if (!sessionFile || !statSync(sessionFile).isFile()) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
+  requireParentSession(sessionId);
+  if (!runtime.pi?.appendEntry) throw new Error("Cannot persist subagent allocation.");
+  const id = allocateSubagentId(
+    ctx.sessionManager.getEntries(), runtime.pi.appendEntry.bind(runtime.pi), params.agent || "fork", process.env.PI_SUBAGENT_ID || null,
+  );
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
-  // Generate a deterministic session file path for this subagent.
-  // This eliminates race conditions when multiple agents launch simultaneously —
-  // each agent knows exactly which file is theirs.
+  // Session storage must stay bounded independently of child identity and description.
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
-  const uuid = [
-    id,
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 6),
-  ].join("-");
-  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const subagentSessionFile = join(sessionDir, `${timestamp}_${randomUUID()}.jsonl`);
 
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSubagentPane(params.name);
-  if (params.task) {
-    setPaneTask(surface, params.task);
-  }
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  const surface = options?.surface ?? createSubagentPane(id);
+  let dispatchAttempted = false;
+  try {
+    if (params.task) {
+      setPaneTask(surface, params.task);
+    }
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+    requireParentSession(sessionId);
+    if (runningSubagents.has(id)) throw new Error("Subagent still has a running owner.");
 
-  if (launchBehavior.seededSessionMode) {
-    seedSubagentSessionFile({
-      mode: launchBehavior.seededSessionMode,
-      parentSessionFile: sessionFile,
-      childSessionFile: subagentSessionFile,
-      childCwd: targetCwdForSession,
+    const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+
+    if (launchBehavior.seededSessionMode) {
+      seedSubagentSessionFile({
+        mode: launchBehavior.seededSessionMode,
+        parentSessionFile: sessionFile,
+        childSessionFile: subagentSessionFile,
+        childCwd: targetCwdForSession,
+      });
+    }
+
+    const activityFile = getSubagentActivityFile(artifactDir, subagentSessionFile);
+    mkdirSync(dirname(activityFile), { recursive: true });
+
+    // Build the task message
+    // Only full-context fork mode inherits prior conversation state.
+    // Blank-session modes need the wrapper instructions and artifact-backed handoff.
+    const { modeHint, summaryInstruction } = buildTaskHints(effectiveInteractive);
+    const spawning = resolveSpawning(agentDefs);
+
+    const built = buildPiCommand({
+      params: { ...params, id },
+      agentDefs,
+      runtimePlan,
+      surface,
+      artifactDir,
+      subagentSessionFile,
+      effectiveCwd,
+      localAgentDir,
+      effectiveAutoExit,
+      effectiveInteractive,
+      taskDelivery: launchBehavior.taskDelivery,
+      spawning,
+      modeHint,
+      summaryInstruction,
     });
+
+    const launchScriptName = `${basename(subagentSessionFile)}.sh`;
+    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+
+    beginCompletionChannel(subagentSessionFile);
+    dispatchAttempted = true;
+    runScriptInPane(surface, built.command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: built.launchScriptPreamble.join("\n"),
+    });
+
+    const running: RunningSubagent = {
+      id,
+      name: params.name,
+      task: params.task,
+      agent: params.agent,
+      agentFile: agentDefs?.file,
+      surface,
+      startTime,
+      sessionFile: subagentSessionFile,
+      launchScriptFile,
+      interactive: effectiveInteractive,
+      autoExit: effectiveAutoExit,
+      cwd: targetCwdForSession,
+      agentDir: effectiveAgentDir,
+      spawning,
+      runtimePlan,
+      orchestrationMode: orchestrationConfig.mode,
+      activityFile,
+      lifecycle: createLifecycle(startTime),
+      // Initial task already owns child input until Pi reports settlement.
+      inputLocked: true,
+      ...(options?.toolCallId ? { initialToolCallId: options.toolCallId } : {}),
+    };
+
+    runningSubagents.set(id, running);
+    return running;
+  } catch (cause) {
+    if (!dispatchAttempted) {
+      if (!surfacePreCreated) closeOwnedEmptyPane(surface);
+      cancelOwnedCompletionChannel(subagentSessionFile);
+    }
+    throw cause;
   }
-
-  const activityFile = getSubagentActivityFile(artifactDir, id);
-  mkdirSync(dirname(activityFile), { recursive: true });
-
-  // Build the task message
-  // Only full-context fork mode inherits prior conversation state.
-  // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const { modeHint, summaryInstruction } = buildTaskHints(effectiveInteractive);
-  const spawning = resolveSpawning(agentDefs);
-
-  const built = buildPiCommand({
-    params: { ...params, id },
-    agentDefs,
-    runtimePlan,
-    surface,
-    artifactDir,
-    subagentSessionFile,
-    effectiveCwd,
-    localAgentDir,
-    effectiveAutoExit,
-    effectiveInteractive,
-    taskDelivery: launchBehavior.taskDelivery,
-    spawning,
-    modeHint,
-    summaryInstruction,
-  });
-
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-  const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-  beginCompletionChannel(subagentSessionFile);
-  runScriptInPane(surface, built.command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: built.launchScriptPreamble.join("\n"),
-  });
-
-  const running: RunningSubagent = {
-    id,
-    name: params.name,
-    task: params.task,
-    agent: params.agent,
-    agentFile: agentDefs?.file,
-    surface,
-    startTime,
-    sessionFile: subagentSessionFile,
-    launchScriptFile,
-    interactive: effectiveInteractive,
-    autoExit: effectiveAutoExit,
-    cwd: targetCwdForSession,
-    agentDir: effectiveAgentDir,
-    spawning,
-    runtimePlan,
-    orchestrationMode: orchestrationConfig.mode,
-    activityFile,
-    lifecycle: createLifecycle(startTime),
-    // Initial task already owns child input until Pi reports settlement.
-    inputLocked: true,
-    ...(options?.toolCallId ? { initialToolCallId: options.toolCallId } : {}),
-  };
-
-  runningSubagents.set(id, running);
-  return running;
 }
 
 /**
@@ -1344,7 +1355,7 @@ function applyAssignmentOutcome(
     }
   }
   if (outcome.haltOrchestrator) haltOrchestrator(ctx);
-  if (outcome.removeFromRunning) agents.delete(running.id);
+  if (outcome.removeFromRunning && agents.get(running.id) === running) agents.delete(running.id);
   if (outcome.disposition === "awaiting_answer") running.inputLocked = false;
   updateWidget();
   return outcome;
@@ -1561,7 +1572,7 @@ async function launchSavedPiSession(
     if (runningSubagents.has(handle.id)) throw new Error("Subagent still has a running owner.");
     validateSavedPiSession(handle);
     if (message === undefined) removeEmptyCompletionChannel(handle.sessionFile);
-    surface = createSubagentPane(handle.name, message === undefined);
+    surface = createSubagentPane(handle.id, message === undefined);
     requireParentSession(parentId);
     const fresh = subagentHandles.get(handle.id);
     if (!fresh || fresh.sessionFile !== handle.sessionFile || fresh.cwd !== handle.cwd || fresh.surface !== handle.surface || runningSubagents.has(handle.id)) {
@@ -1658,7 +1669,7 @@ function attachLivePiSubagent(
     surface: handle.surface!,
     startTime,
     sessionFile: handle.sessionFile,
-    activityFile: getSubagentActivityFile(artifactDir, handle.id),
+    activityFile: getSubagentActivityFile(artifactDir, handle.sessionFile),
     interactive: handle.interactive,
     autoExit: handle.autoExit,
     ...(handle.cwd ? { cwd: handle.cwd } : {}),
